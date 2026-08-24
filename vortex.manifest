@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Forces the process ANSI code page to UTF-8 (Windows 10 1903+).
+
+  Without this the CRT decodes narrow strings using the system ACP (CP1252 on a
+  default install). The engine carries game names as UTF-8 bytes in std::string,
+  so building an std::filesystem::path from one produced mojibake directories:
+  the three UTF-8 bytes of a character such as U+300A were read as three
+  separate CP1252 characters, and the artwork folder for a game whose title
+  contains non-ASCII was created under a name nothing else could resolve.
+
+  With activeCodePage set, every narrow<->wide conversion in the CRT, the Win32
+  API and std::filesystem agrees with the UTF-8 the engine already uses.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2019="http://schemas.microsoft.com/SMI/2019/WindowsSettings">
+      <ws2019:activeCodePage>UTF-8</ws2019:activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

@@ -1,0 +1,168 @@
+# =========================
+# Visual Studio folders
+# =========================
+.vs/
+
+# =========================
+# Build output folders
+# =========================
+x64/
+Debug/
+source/Vortex/
+source/Release/
+source/build/
+source/*.txt
+
+# =========================
+# User-specific files
+# =========================
+*.vcxproj.user
+*.vcxproj.filters
+*.vcxproj
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.sln
+
+# =========================
+# Logs and temporary files
+# =========================
+*.log
+client-crashlog
+
+# =========================
+# Compiled binaries
+# =========================
+*.exe
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.lib
+
+# =========================
+# Visual Studio cache
+# =========================
+ipch/
+*.tlog
+*.lastbuildstate
+*.cache
+*.idb
+
+# =========================
+# Secrets
+# =========================
+.env
+analytics/.env
+analytics/.igdb_token.json
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+
+# =========================
+# Runtime state written by the launcher
+# =========================
+installed_games.txt
+wishlist.json
+favorite_snapshots.json
+CandidateImages/
+
+# =========================
+# Analytics database (SQLite)
+# =========================
+# Derived entirely from the flat-file caches by sync_local_data.py, plus the
+# IGDB catalog which igdb_catalog.py re-fetches. Nothing here is original.
+analytics/vortex.sqlite3
+analytics/vortex.sqlite3-wal
+analytics/vortex.sqlite3-shm
+
+# =========================
+# Generated ML artifacts
+# =========================
+# Kept out of the source tree so CMake's copy_directory can never overwrite
+# the build output with a stale committed model or recommendation set.
+analytics/model/*.pkl
+analytics/model/model_manifest.json
+analytics/recommendations*.json
+
+
+# =========================
+# CMake / Ninja build tree
+# =========================
+# CMakeUserPresets.json points binaryDir at out/build/{debug,release}, so this
+# is where every build actually lands. The older source/build/ rule above is
+# kept only for trees configured before the move.
+out/
+
+# =========================
+# Packaging output
+# =========================
+# dist/ holds the staged payload and the compiled installer -- hundreds of MB,
+# and rebuilt from scratch by scripts/package_release.ps1. The installer is
+# published as a GitHub Release asset, never committed.
+dist/
+
+# =========================
+# Downloaded game artwork
+# =========================
+# Grid/hero/logo art fetched from SteamGridDB and IGDB. Third-party material,
+# specific to one person's library, and re-downloadable at runtime with an API
+# key. Never belongs in the repository.
+Images/
+
+# =========================
+# Runtime state written beside the executable
+# =========================
+# Every Vortex data file resolves against the exe directory (see app_paths.h),
+# so a developer's personal library state lands in the source tree. The
+# source/*.txt rule above predates these paths and does not cover them.
+/exe_cache.txt
+/local_game_dirs.txt
+/game_metadata.txt
+/igdb_cache.txt
+/playtime_stats.txt
+/preferences.json
+/settings.json
+
+# =========================
+# User-specific CMake configuration
+# =========================
+# Hardcodes a local QTDIR and Qt Creator checksums. User-specific by CMake
+# convention -- CMakePresets.json is the shared file.
+CMakeUserPresets.json
+
+# =========================
+# Editor and language-server caches
+# =========================
+.contextProperties.ini
+.cache/
+
+# =========================
+# Academic write-up (not part of the application)
+# =========================
+report_artifacts/
+build_academic_report.py
+vortex_review.txt
+
+# =========================
+# Stale per-editor configuration
+# =========================
+# Left over from the pre-CMake "C/C++ Runner" setup; launch.json still points
+# at a d:/Projects/Minor path that no longer exists.
+source/.vscode/
+
+# =========================
+# Local tooling configuration
+# =========================
+# Per-developer assistant and editor workspace state. Machine-specific, and
+# not part of the project.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.claude-*
+*.claude
