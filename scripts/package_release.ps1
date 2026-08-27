@@ -248,6 +248,67 @@ if ($vcRedistRoot) {
 
 
 # ---------------------------------------------------------------------------
+# The ._pth file, and why it is rewritten rather than appended to
+# ---------------------------------------------------------------------------
+# The embeddable distribution ships with site-packages disabled: its ._pth has
+# "import site" commented out and does not list Lib\site-packages. Without that
+# edit pip installs successfully and then every import of numpy fails at
+# runtime -- the classic silent failure of this approach.
+#
+# A ._pth file also REPLACES sys.path entirely, including the rule that normally
+# puts a script's own directory on it. Without the analytics hop every analytics
+# script dies on "No module named 'db'", and only ever on the recipient's
+# machine: a developer running the same script with a normal Python install has
+# the script directory added for them.
+#
+# The entry is rewritten, not appended. A shipped v1.1.0 build carried
+# "..<BEL>nalytics" in its ._pth -- a literal 0x07 byte where an escaped
+# backslash belonged -- which put a nonexistent directory on sys.path and killed
+# Sync, Recommendations, Catalog and Explain on every install. Appending the
+# correct line would have left the corrupt one sitting beside it.
+#
+# The hop uses a forward slash deliberately: Windows accepts it, and it leaves
+# no backslash escape for a future editor or generator to eat the same way.
+function Repair-PythonPth {
+    param([Parameter(Mandatory)] [string] $PythonDir)
+
+    $pthFile = Get-ChildItem -Path $PythonDir -Filter 'python*._pth' | Select-Object -First 1
+    if (-not $pthFile) { throw "No python*._pth in the embeddable distribution -- layout changed." }
+
+    $analyticsEntry = '../analytics'
+    $sitePackages   = 'Lib' + [char]0x5C + 'site-packages'
+
+    $pth = @(@(Get-Content $pthFile.FullName) |
+        ForEach-Object { if ($_ -match '^\s*#\s*import\s+site\s*$') { 'import site' } else { $_ } } |
+        Where-Object { $_ -notmatch 'nalytics\s*$' })
+
+    if ($pth -notcontains $sitePackages) { $pth += $sitePackages }
+    if ($pth -notcontains 'import site') { $pth += 'import site' }
+    $pth += $analyticsEntry
+
+    Set-Content -Path $pthFile.FullName -Value $pth -Encoding ascii
+
+    # Assert what the old code merely assumed. A control byte is precisely the
+    # defect described above; an analytics hop that resolves nowhere is the
+    # symptom it produced on the recipient's machine.
+    $written = @(Get-Content $pthFile.FullName)
+
+    foreach ($line in $written) {
+        if ($line -match '[\x00-\x08\x0B\x0C\x0E-\x1F]') {
+            throw "$($pthFile.Name) contains a control character in '$line'.`nThat is a corrupted escape sequence -- refusing to ship a broken sys.path."
+        }
+    }
+
+    $resolved = Join-Path $PythonDir $analyticsEntry
+    if (-not (Test-Path $resolved)) {
+        throw "$($pthFile.Name) puts '$analyticsEntry' on sys.path, but that resolves to '$resolved', which does not exist.`nThe analytics scripts would fail with ModuleNotFoundError on every install."
+    }
+
+    Write-Note "patched $($pthFile.Name): site-packages + analytics on sys.path"
+}
+
+
+# ---------------------------------------------------------------------------
 # 5. Bundled Python
 # ---------------------------------------------------------------------------
 $PythonDir = Join-Path $StageDir 'python'
@@ -255,6 +316,10 @@ $PythonDir = Join-Path $StageDir 'python'
 if ($pythonBackup) {
     Move-Item $pythonBackup $PythonDir
     Write-Step 'Reusing existing Python bundle (-ReusePython)'
+    # A reused tree keeps whatever ._pth it was built with, which is how a
+    # corrupt analytics hop survived into a shipped installer. Repair it here
+    # too -- the rewrite is idempotent and costs nothing.
+    Repair-PythonPth -PythonDir $PythonDir
 } else {
     Write-Step "Building the Python $PythonVersion bundle"
     New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
@@ -276,32 +341,7 @@ if ($pythonBackup) {
     New-Item -ItemType Directory -Force -Path $PythonDir | Out-Null
     Expand-Archive -Path $zipPath -DestinationPath $PythonDir -Force
 
-    # The embeddable distribution ships with site-packages disabled: its
-    # ._pth file has "import site" commented out and does not list Lib\
-    # site-packages. Without this edit pip installs successfully and then
-    # every import of numpy fails at runtime -- the classic silent failure of
-    # this approach.
-    $pthFile = Get-ChildItem -Path $PythonDir -Filter 'python*._pth' | Select-Object -First 1
-    if (-not $pthFile) { throw "No python*._pth in the embeddable distribution -- layout changed." }
-
-    $pth = Get-Content $pthFile.FullName
-    $pth = $pth | ForEach-Object { if ($_ -match '^\s*#\s*import\s+site\s*$') { 'import site' } else { $_ } }
-    if ($pth -notcontains 'Lib\site-packages') { $pth += 'Lib\site-packages' }
-    if ($pth -notcontains 'import site')       { $pth += 'import site' }
-
-    # A ._pth file REPLACES sys.path entirely -- including the rule that
-    # normally puts a script's own directory on it. Without this line every
-    # analytics script dies on "No module named 'db'", and only ever on the
-    # recipient's machine: a developer running the same script with a normal
-    # Python install has the script directory added for them.
-    #
-    # Paths in ._pth resolve against the directory holding python.exe, and the
-    # installer always lays the payload out as <app>\python\ and
-    # <app>nalytics\, so this relative hop is stable.
-    if ($pth -notcontains '..nalytics') { $pth += '..nalytics' }
-
-    Set-Content -Path $pthFile.FullName -Value $pth -Encoding ascii
-    Write-Note "patched $($pthFile.Name): site-packages + analytics on sys.path"
+    Repair-PythonPth -PythonDir $PythonDir
 
     $pythonExe = Join-Path $PythonDir 'python.exe'
     Write-Note 'bootstrapping pip'
@@ -332,7 +372,7 @@ if ($pythonBackup) {
 # that cannot import sklearn is the single most likely packaging defect, and
 # it would otherwise surface only on the recipient's machine.
 Write-Step 'Verifying the Python bundle'
-$check = & (Join-Path $PythonDir 'python.exe') -c "import sklearn, pandas, numpy, sqlite3, joblib, requests, dotenv; print(sklearn.__version__)" 2>&1
+$check = & (Join-Path $PythonDir 'python.exe') -c "import sklearn, pandas, numpy, sqlite3, joblib, requests, dotenv, db, config, model; print(sklearn.__version__)" 2>&1
 if ($LASTEXITCODE -ne 0) {
     throw "The bundled interpreter cannot import the analytics dependencies:`n$check"
 }
