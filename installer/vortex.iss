@@ -25,7 +25,7 @@
 #endif
 
 #define AppName        "Vortex"
-#define AppVersion     "1.0.0"
+#define AppVersion     "1.1.0"
 #define AppPublisher   "Vortex"
 #define AppExeName     "VortexLauncher.exe"
 
@@ -120,6 +120,7 @@ begin
   DeleteFile(AppDir + '\settings.json');
   DeleteFile(AppDir + '\wishlist.json');
   DeleteFile(AppDir + '\favorite_snapshots.json');
+  DeleteFile(AppDir + '\played_games.json');
   DeleteFile(AppDir + '\installed_games.txt');
   DeleteFile(AppDir + '\local_game_dirs.txt');
   DeleteFile(AppDir + '\igdb_cache.txt');

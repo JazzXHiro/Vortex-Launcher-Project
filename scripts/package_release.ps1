@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Stage a clean, secret-free payload from a Release build and compile the installer.
 
@@ -139,6 +139,9 @@ $ArtifactFiles = @(
 $PersonalDirs  = @('Images', 'CandidateImages')
 $PersonalFiles = @(
     'installed_games.txt', 'wishlist.json', 'favorite_snapshots.json',
+    # The played-games ledger: every game the developer has ever launched,
+    # with hours and artwork paths. Same class of data as wishlist.json.
+    'played_games.json',
     'playtime_sessions.log', 'playtime_stats.txt',
     'preferences.json', 'settings.json',
     'igdb_cache.txt', 'exe_cache.txt', 'game_metadata.txt',
