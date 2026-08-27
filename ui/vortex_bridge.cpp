@@ -1476,14 +1476,31 @@ QVariantList VortexBridge::favoriteGames() const {
     // Owned wins on a name clash: once a game is actually installed, the live
     // library entry is better than the snapshot taken when it was hearted.
     for (const QVariant &entry : m_favoriteSnapshots) {
-        const QVariantMap snapshot = entry.toMap();
+        QVariantMap snapshot = entry.toMap();
         const QString name = snapshot.value("name").toString();
         if (name.isEmpty() || seen.contains(name.toLower()))
             continue;
         // The preference file remains the source of truth; a snapshot whose
         // heart was removed elsewhere must not linger.
-        if (get_game_preference(name.toStdString()) > 0.0)
-            list << snapshot;
+        if (get_game_preference(name.toStdString()) <= 0.0)
+            continue;
+
+        // A game that was played and then uninstalled already has a full row in
+        // the played ledger -- artwork, playtime, developer and genres. That row
+        // is both richer and fresher than a snapshot frozen at the moment of the
+        // heart click, so it wins here for the same reason the live library row
+        // wins above. Without this, hearting from the Played tab replaced the
+        // page with the bare snapshot and the art and metadata vanished.
+        QVariantMap played = findGameByName(m_playedLedger, name);
+        if (!played.isEmpty()) {
+            played["installed"] = false;
+            played["matched"]   = false;
+            played["status"]    = 1.0;
+            list << played;
+            continue;
+        }
+
+        list << snapshot;
     }
     return list;
 }
@@ -1539,6 +1556,11 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     QVariantMap snapshot = findGameByName(m_recommendationList, name);
     if (snapshot.isEmpty())
         snapshot = findGameByName(m_wishlist, name);
+    // The played ledger last: a game hearted from the Played tab is in none of
+    // the lists above, and a snapshot holding nothing but a name is not
+    // renderable -- which is exactly what emptied the details page.
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(m_playedLedger, name);
     if (snapshot.isEmpty())
         snapshot["name"] = name;
 
