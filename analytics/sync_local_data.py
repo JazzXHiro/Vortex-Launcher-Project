@@ -428,6 +428,11 @@ def sync_data():
     # Canonical names of games matched through their IGDB id, so the backfill
     # loop below does not insert a second row for one that is already handled.
     matched_canonicals = set()
+    # Every canonical_name this run marks installed=1, so the sweep below can
+    # clear the rest. Not the same set as `installed`: a game matched through
+    # its IGDB id is stored under the cache's spelling of the name, not the
+    # launcher's.
+    installed_canonicals = set()
     id_matches = []
 
     for gid, g in games.items():
@@ -493,6 +498,9 @@ def sync_data():
               encode_list(g["themes"]), encode_list(g["game_modes"]),
               g["external_id"]))
 
+        if is_installed:
+            installed_canonicals.add(canonical)
+
     # A game the launcher reports as installed but that never appeared in
     # igdb_cache.txt (metadata lookup failed, or it was added since) would
     # otherwise be silently missing from the library section entirely.
@@ -515,6 +523,24 @@ def sync_data():
                     name      = EXCLUDED.name,
                     source    = EXCLUDED.source
             """, (game_uuid(name), source, name, canonical))
+            installed_canonicals.add(canonical)
+
+    # installed_games.txt is the whole truth about what is on the machine, so
+    # anything still flagged installed that this run did not see has been
+    # uninstalled or deleted. Without this sweep such a row keeps its flag
+    # forever and keeps taking slots in the "from your library" section: the
+    # loop above only ever visits games igdb_cache.txt still knows about, and
+    # a game that has dropped out of both files is visited by neither.
+    if installed_canonicals:
+        placeholders = ",".join("?" * len(installed_canonicals))
+        cur.execute(f"""
+            UPDATE games SET installed = 0
+             WHERE installed = 1
+               AND canonical_name NOT IN ({placeholders})
+        """, tuple(installed_canonicals))
+        if cur.rowcount:
+            print(f"  cleared installed flag on {cur.rowcount} game(s) that are "
+                  f"no longer on disk")
 
     if id_matches:
         # Worth naming: this is the case that silently failed before, and
@@ -526,9 +552,25 @@ def sync_data():
     # metadata-free row whenever IGDB had renamed a game. Only rows with no
     # labels at all are touched, and only when the same game exists elsewhere
     # with real metadata, so nothing carrying information can be deleted.
+    #
+    # The history attached to a duplicate is re-pointed at the surviving row
+    # rather than deleted with it. That is not tidiness: sessions,
+    # recommendations_cache and recommendation_events all carry a foreign key
+    # into games, so deleting a referenced row raised "FOREIGN KEY constraint
+    # failed" and took the WHOLE sync down with it -- every `installed` flag
+    # this function had just written rolled back with the transaction. The
+    # visible symptom was games the user had uninstalled still holding slots in
+    # the "from your library" section, because the flag that would have
+    # retired them never reached disk. One stray impression row was enough.
     if installed_by_id:
-        cur.execute("""
-            DELETE FROM games AS dup
+        duplicates = cur.execute("""
+            SELECT dup.game_id,
+                   (SELECT keep.game_id FROM games keep
+                     WHERE keep.canonical_name <> dup.canonical_name
+                       AND keep.name = dup.name
+                       AND json_array_length(COALESCE(keep.genres, '[]')) > 0
+                     ORDER BY keep.game_id LIMIT 1)
+              FROM games AS dup
              WHERE json_array_length(COALESCE(dup.genres, '[]')) = 0
                AND json_array_length(COALESCE(dup.themes, '[]')) = 0
                AND EXISTS (
@@ -537,9 +579,22 @@ def sync_data():
                       AND keep.name = dup.name
                       AND json_array_length(COALESCE(keep.genres, '[]')) > 0
                  )
-        """)
-        if cur.rowcount:
-            print(f"  removed {cur.rowcount} duplicate row(s) left by earlier syncs")
+        """).fetchall()
+
+        removed = 0
+        for dup_id, keep_id in duplicates:
+            if not keep_id:
+                continue
+            cur.execute("UPDATE sessions SET game_id = ? WHERE game_id = ?",
+                        (keep_id, dup_id))
+            cur.execute("UPDATE recommendations_cache SET recommended_game = ? "
+                        "WHERE recommended_game = ?", (keep_id, dup_id))
+            cur.execute("UPDATE recommendation_events SET game_id = ? "
+                        "WHERE game_id = ?", (keep_id, dup_id))
+            cur.execute("DELETE FROM games WHERE game_id = ?", (dup_id,))
+            removed += 1
+        if removed:
+            print(f"  removed {removed} duplicate row(s) left by earlier syncs")
 
     # Games Vortex actually watched. Observed play always wins: once there is
     # real history for a game, derived rows must not compete with it.

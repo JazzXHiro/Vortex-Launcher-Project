@@ -864,6 +864,19 @@ static QVariantList readRecommendationJson(const fs::path &jsonPath, const QVari
             continue;
         }
 
+        // The mirror of the guard above: a "from your library" pick that
+        // matches nothing in the library is not a library pick. It used to be
+        // drawn as a grey "NOT IN LIBRARY" placeholder sitting in the library
+        // grid -- games the user had since uninstalled or deleted, kept alive
+        // by a stale `installed` flag in the analytics database. Nothing here
+        // can rescue such an entry: there is no cover, no playtime and no
+        // install path to show, and the section it claims promises all three.
+        if (section == "library") {
+            vlog::item("Recommend", name.toStdString(), vlog::Status::Skipped,
+                       "listed as library but it is not installed");
+            continue;
+        }
+
         // Unowned discovery candidate: everything the details page needs
         // travels with the item, because there is no library entry to read.
         QVariantMap item;
