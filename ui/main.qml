@@ -93,7 +93,9 @@ Window {
         }
         if (root.activeTab === "Wishlist")
             return wishlistGrid
-        // Library and Favorites are the same grid with a different model.
+        // Library, Favorites and Played are the same grid with a different
+        // model. Played reuses it rather than declaring its own so the cards
+        // cannot drift out of step with the library's size.
         return gameGrid
     }
 
@@ -252,7 +254,7 @@ Window {
     // Select button — step through the tabs. This used to be a two-way toggle
     // between Library and Recommendations; with four tabs a toggle would leave
     // Favorites and Wishlist unreachable from the pad entirely.
-    readonly property var tabs: ["Library", "Recommendations", "Favorites", "Wishlist"]
+    readonly property var tabs: ["Library", "Recommendations", "Favorites", "Wishlist", "Played"]
 
     function toggleRecommendations() {
         root.padActive = true
@@ -354,7 +356,7 @@ Window {
                 Layout.alignment: Qt.AlignLeft
 
                 Repeater {
-                    model: ["Library", "Recommendations", "Favorites", "Wishlist"]
+                    model: ["Library", "Recommendations", "Favorites", "Wishlist", "Played"]
                     delegate: Rectangle {
                         id: tabButton
                         required property string modelData
@@ -707,6 +709,17 @@ Window {
                     font.letterSpacing: 2
                 }
 
+                Text {
+                    anchors.centerIn: parent
+                    visible: gameGrid.count === 0 && root.activeTab === "Played"
+                    text: "NOTHING PLAYED YET\nLaunch a game and it lands here for good"
+                    horizontalAlignment: Text.AlignHCenter
+                    color: "#444"
+                    font.pixelSize: 16
+                    font.bold: true
+                    font.letterSpacing: 2
+                }
+
                 onCountChanged: {
                     if (!root.padActive || gameGrid.count === 0)
                         gameGrid.currentIndex = -1
@@ -720,6 +733,11 @@ Window {
                     if (!root.api) return [];
                     if (root.activeTab === "Favorites")
                         return root.api.favoriteGames || [];
+                    // Everything ever played, installed or not. Comes from the
+                    // bridge already ordered and de-duplicated -- see
+                    // VortexBridge::playedGames().
+                    if (root.activeTab === "Played")
+                        return root.api.playedGames || [];
                     if (!root.api.gameList) return [];
                     if (root.activeFilter === "All") return root.api.gameList;
                     return root.api.gameList.filter(function(game) {
@@ -806,6 +824,65 @@ Window {
                                 Text { text: "NO ART"; color: "#333"; font.bold: true }
                             }
 
+                            // ── Played tab markers ──────────────────────────
+                            //
+                            // Both sit ON the art rather than under the title.
+                            // A fourth caption line would push the card past
+                            // the 400px the library lays out with, and the
+                            // whole point is that the two tabs' grids are the
+                            // same size.
+                            Rectangle {
+                                visible: root.activeTab === "Played"
+                                anchors.left: parent.left
+                                anchors.bottom: parent.bottom
+                                anchors.margins: 10
+                                width: playtimePill.implicitWidth + 18
+                                height: 24
+                                radius: 12
+                                color: "#D9000000"
+                                border.color: "#3a3a3a"
+
+                                Text {
+                                    id: playtimePill
+                                    anchors.centerIn: parent
+                                    // The live row when the game is still
+                                    // installed, so a session that just ended
+                                    // shows its new total without a rescan.
+                                    text: (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
+                                          ? gameDelegate.liveDetails.playtime
+                                          : (gameDelegate.modelData.playtime || "0 Hours")
+                                    color: "#ddd"
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                }
+                            }
+
+                            // Marks what is still on the disk. The uninstalled
+                            // ones are the majority of an old library, so the
+                            // badge goes on the exception.
+                            Rectangle {
+                                visible: root.activeTab === "Played"
+                                         && gameDelegate.modelData.installed === true
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 10
+                                width: installedTag.implicitWidth + 16
+                                height: 22
+                                radius: 11
+                                color: "#D91e4d2f"
+                                border.color: "#27ae60"
+
+                                Text {
+                                    id: installedTag
+                                    anchors.centerIn: parent
+                                    text: "INSTALLED"
+                                    color: "#7fe0a0"
+                                    font.pixelSize: 9
+                                    font.bold: true
+                                    font.letterSpacing: 1
+                                }
+                            }
+
                             scale: gameDelegate.highlighted ? 1.04 : 1.0
                             Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
                         }
@@ -828,7 +905,9 @@ Window {
                             // Keep the pad's place in sync when both are in use.
                             if (root.padActive)
                                 gameGrid.currentIndex = gameDelegate.index
-                            detailPopup.launchOrigin = root.activeTab === "Favorites" ? "Favorites" : "Library"
+                            detailPopup.launchOrigin =
+                                (root.activeTab === "Favorites" || root.activeTab === "Played")
+                                    ? root.activeTab : "Library"
                             detailPopup.selectedGameName = gameDelegate.liveName
                             detailPopup.open()
                         }

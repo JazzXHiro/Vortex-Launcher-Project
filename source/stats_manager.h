@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <ctime>
 
 // Initialize the stats manager with the base directory to locate stats files.
@@ -12,3 +13,16 @@ void record_play_session(const std::string& game_key, const std::string& game_na
 // Retrieves the total playtime in seconds for the given game_key.
 // Returns 0 if no playtime has been recorded.
 long long get_playtime(const std::string& game_key);
+
+// One row of the stats file.
+struct PlayStat {
+    std::string key;
+    std::string name;
+    long long   seconds = 0;
+};
+
+// Every game the stats file has ever recorded a session for, including ones that
+// are no longer installed -- the file is only ever added to. get_playtime() can
+// only answer for a key the caller already knows, so it cannot enumerate the
+// history; the Played tab needs exactly that.
+std::vector<PlayStat> get_all_play_stats();

@@ -40,6 +40,10 @@ class VortexBridge : public QObject {
     // refreshGameList().
     Q_PROPERTY(QVariantList favoriteGames READ favoriteGames NOTIFY gameListChanged)
     Q_PROPERTY(QVariantList wishlistGames READ wishlistGames NOTIFY wishlistChanged)
+    // Everything ever played, whether or not it is still on the machine. Backed
+    // by a ledger rather than by gameList, because the whole point is the games
+    // that are no longer there -- see loadPlayedLedger().
+    Q_PROPERTY(QVariantList playedGames READ playedGames NOTIFY playedGamesChanged)
     // "Only well-known games" in Settings. Restricts the DISCOVER section to
     // titles that are popular, very well rated or newly released; the library
     // section is untouched, because owned rows carry no rating counts at all.
@@ -94,6 +98,7 @@ public:
     QVariantList recommendationList() const { return m_recommendationList; }
     QVariantList favoriteGames() const;
     QVariantList wishlistGames() const { return m_wishlist; }
+    QVariantList playedGames() const;
     bool         isLoading()   const { return m_isLoading;   }
     bool         isRecommendationLoading() const { return m_isRecommendationLoading; }
     int          currentMood() const { return m_currentMood; }
@@ -231,6 +236,7 @@ public:
 
 signals:
     void wishlistChanged();
+    void playedGamesChanged();
     void gameListChanged();
     void recommendationListChanged();
     void loadingChanged();
@@ -261,6 +267,9 @@ private:
     QVariantList            m_recommendationList;
     QVariantList            m_wishlist;
     QVariantList            m_favoriteSnapshots;
+    // Persisted play history. Keyed by the same playtime key stats_manager uses,
+    // and only ever added to, so an uninstalled game keeps its row.
+    QVariantList            m_playedLedger;
     std::vector<BridgeGame> m_internalGames;
     bool                    m_isLoading   = false;
     bool                    m_rescanQueued = false;  // scan requested while one was running
@@ -332,6 +341,26 @@ private:
     void        loadWishlist();
     void        saveWishlist() const;
     fs::path    wishlistPath() const;
+
+    // ---- Played ledger ----------------------------------------------------
+    // Same reasoning as the wishlist and the favourite snapshots: an entry with
+    // no row in gameList has nothing to draw a card or a details page from, so
+    // each one carries a renderable copy of its metadata.
+    void        loadPlayedLedger();
+    void        savePlayedLedger() const;
+    fs::path    playedLedgerPath() const;
+
+    // Backfills the ledger from playtime_stats.txt, which has been accumulating
+    // since long before this tab existed. Without it a first run shows only the
+    // games that happen to be installed right now, which is the opposite of the
+    // point.
+    void        seedPlayedLedgerFromStats();
+
+    // Upserts a snapshot for every live row with playtime on it. This is also
+    // the only path that captures a Steam game played entirely outside Vortex:
+    // its total comes from localconfig.vdf while it is installed, and the ledger
+    // is what keeps it afterwards.
+    void        syncPlayedLedger();
 
     // General app settings, so later toggles have somewhere to live rather
     // than each growing its own file.

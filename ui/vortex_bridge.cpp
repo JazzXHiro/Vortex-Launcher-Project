@@ -67,6 +67,8 @@ VortexBridge::VortexBridge(QObject *parent) : QObject(parent),
     init_stats_manager(m_baseDir.string());
     loadWishlist();
     loadFavoriteSnapshots();
+    loadPlayedLedger();
+    seedPlayedLedgerFromStats();
     loadSettings();
 }
 
@@ -345,16 +347,47 @@ static QString getLastPlayedDate(const std::string &gameKey,
                                  const fs::path &baseDir) {
     std::ifstream file(baseDir / "playtime_sessions.log");
     if (!file.is_open()) return "Never";
+    // The key is the first field of "KEY | NAME | SECONDS | START | END", so it
+    // is matched as a prefix rather than searched for anywhere in the line -- a
+    // plain find() makes "igdb_1877" match every "igdb_18770" session too.
+    const std::string prefix = gameKey + " |";
     std::string line, lastDate = "Never";
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') continue;
-        if (line.find(gameKey) != std::string::npos) {
+        if (line.compare(0, prefix.size(), prefix) == 0) {
             size_t lastPipe = line.find_last_of('|');
             if (lastPipe != std::string::npos)
                 lastDate = line.substr(lastPipe + 2, 10);
         }
     }
     return QString::fromStdString(lastDate);
+}
+
+// "YYYY-MM-DD" (what getLastPlayedDate returns) as a Unix timestamp, or 0 for
+// "Never" and anything unparseable.
+//
+// Day granularity, deliberately: the sessions log stores formatted local time
+// and the only consumer is the Played tab's ordering, where the total playtime
+// breaks same-day ties. Reconstructing the exact second would mean parsing the
+// log's "%Y-%m-%d %a %H:%M:%S" back through the locale it was written in.
+static long long parseDateToEpoch(const QString &date) {
+    const QDate parsed = QDate::fromString(date, QStringLiteral("yyyy-MM-dd"));
+    if (!parsed.isValid())
+        return 0;
+    return QDateTime(parsed, QTime(0, 0)).toSecsSinceEpoch();
+}
+
+// Human-readable total, shared by the live rows and by the ledger entries seeded
+// straight out of playtime_stats.txt -- two spellings of the same figure on the
+// same screen is exactly the kind of thing that reads as a bug.
+static QString formatPlaytimeLabel(long long seconds) {
+    if (seconds <= 0)
+        return QStringLiteral("0 Hours");
+    if (seconds < 3600) {
+        const long long mins = std::max(1LL, seconds / 60);
+        return QString::number(mins) + (mins == 1 ? " Minute" : " Minutes");
+    }
+    return QString::number(seconds / 3600.0, 'f', 1) + " Hours";
 }
 
 // Builds the playtime key string the same way the CLI does.
@@ -937,17 +970,24 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     if (ptSec <= 0)
         ptSec = get_playtime(ptKey);
 
-    if (ptSec > 0) {
-        if (ptSec < 3600) {
-            long long mins = std::max(1LL, ptSec / 60);
-            game["playtime"] = QString::number(mins) + (mins == 1 ? " Minute" : " Minutes");
-        } else {
-            game["playtime"] = QString::number(ptSec / 3600.0, 'f', 1) + " Hours";
-        }
-    } else {
-        game["playtime"] = "0 Hours";
-    }
+    game["playtime"]   = formatPlaytimeLabel(ptSec);
     game["lastPlayed"] = getLastPlayedDate(ptKey, m_baseDir);
+
+    // The same three facts in a form something other than a label can use: the
+    // Played tab keys its ledger on playKey, sorts on lastPlayedAt and sums
+    // playtimeSeconds. Derived here rather than recomputed there, so the tab and
+    // the details page can never disagree about how long you played something.
+    game["playKey"]         = QString::fromStdString(ptKey);
+    game["playtimeSeconds"] = static_cast<qlonglong>(ptSec);
+
+    // Steam knows the exact second; everything else is pinned to the day its
+    // last session ended.
+    long long lastPlayedAt = 0;
+    if (bg.source == "Steam")
+        lastPlayedAt = get_steam_last_played(bg.appid);
+    if (lastPlayedAt <= 0)
+        lastPlayedAt = parseDateToEpoch(game["lastPlayed"].toString());
+    game["lastPlayedAt"] = static_cast<qlonglong>(lastPlayedAt);
 
     if (bg.igdb_id > 0) {
         GameMetadata meta = get_game_metadata(bg.igdb_id);
@@ -992,6 +1032,7 @@ void VortexBridge::refreshGameList() {
     for (const BridgeGame &bg : m_internalGames)
         list << buildGameMap(bg);
     m_gameList = list;
+    syncPlayedLedger();
     emit gameListChanged();
 }
 
@@ -1234,6 +1275,8 @@ void VortexBridge::ensureArtwork(QString name) {
         item = findGameByName(m_wishlist, name);
     if (item.isEmpty())
         item = findGameByName(m_favoriteSnapshots, name);
+    if (item.isEmpty())
+        item = findGameByName(m_playedLedger, name);
     if (item.isEmpty() || item.value("matched").toBool())
         return;
 
@@ -1390,6 +1433,10 @@ void VortexBridge::rebindArtwork(const QString &name) {
         saveFavoriteSnapshots();
         emit gameListChanged();   // favoriteGames is notified by this one
     }
+    if (apply(m_playedLedger)) {
+        savePlayedLedger();
+        emit playedGamesChanged();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1521,6 +1568,290 @@ void VortexBridge::saveWishlist() const {
     QFile file(pathToQString(wishlistPath()));
     if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
         file.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Played history
+//
+// playtime_stats.txt has always held every game that was ever played, including
+// ones long since uninstalled -- it is only ever added to. Nothing displayed it:
+// the details page reads a total for a game you are already looking at, and you
+// can only look at games that still exist. The ledger below is what turns that
+// file into something renderable, following wishlist.json and
+// favorite_snapshots.json exactly -- an entry with no row in gameList has no
+// artwork, no developer and no genres to draw a card from otherwise.
+// ─────────────────────────────────────────────────────────────────────────────
+fs::path VortexBridge::playedLedgerPath() const {
+    return m_baseDir / "played_games.json";
+}
+
+// The three artwork slots, and the Images/ subfolder each one lives in.
+static const std::pair<const char *, const char *> kPlayedArtSlots[] = {
+    { "coverPath", "grid" }, { "heroPath", "hero" }, { "logoPath", "logo" }
+};
+
+void VortexBridge::loadPlayedLedger() {
+    m_playedLedger.clear();
+
+    QFile file(pathToQString(playedLedgerPath()));
+    if (!file.open(QIODevice::ReadOnly)) return;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isArray()) return;
+
+    const fs::path imageRoot = m_baseDir / "Images";
+
+    for (const QJsonValue &value : doc.array()) {
+        if (!value.isObject()) continue;
+
+        QVariantMap entry = value.toObject().toVariantMap();
+        const QString name = entry.value("name").toString();
+        if (entry.value("key").toString().isEmpty() || name.isEmpty())
+            continue;
+
+        // Artwork is re-resolved rather than trusted: the stored value is an
+        // absolute file:// URL, so it stops working the moment the app is moved
+        // to another folder. What is actually on disk wins, and the stored path
+        // is the fallback for the case where Images/ no longer has it --
+        // uninstallGame() leaves artwork alone, but removeLocalGameDirectory()
+        // deletes it.
+        const fs::path gameDir =
+            imageRoot / steamgriddb_image_folder_name(name.toStdString());
+        for (const auto &slot : kPlayedArtSlots) {
+            const QString found = findImagePath(gameDir, slot.second);
+            if (!found.isEmpty())
+                entry[slot.first] = found;
+        }
+
+        m_playedLedger << entry;
+    }
+}
+
+void VortexBridge::savePlayedLedger() const {
+    QJsonArray array;
+    for (const QVariant &entry : m_playedLedger)
+        array.append(QJsonObject::fromVariantMap(entry.toMap()));
+
+    QFile file(pathToQString(playedLedgerPath()));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
+}
+
+// Backfill from playtime_stats.txt for keys the ledger has never seen. Runs on
+// every start, not just the first: the stats file is also written by the CLI,
+// and a session recorded there while the launcher was closed would otherwise
+// never reach the tab.
+//
+// These entries carry only what the stats file knows -- a name, a total and a
+// date. Everything else fills itself in the first time the game is installed
+// and scanned, which is when syncPlayedLedger() overwrites the row.
+void VortexBridge::seedPlayedLedgerFromStats() {
+    QSet<QString> known;
+    for (const QVariant &entry : m_playedLedger)
+        known.insert(entry.toMap().value("key").toString());
+
+    const fs::path imageRoot = m_baseDir / "Images";
+    bool changed = false;
+
+    for (const PlayStat &stat : get_all_play_stats()) {
+        if (stat.key.empty() || stat.seconds <= 0)
+            continue;
+
+        const QString key = QString::fromStdString(stat.key);
+        if (known.contains(key))
+            continue;
+
+        // A stats row with no name is unrenderable as anything but its key; that
+        // is still better than dropping the history on the floor.
+        const QString name =
+            QString::fromStdString(stat.name.empty() ? stat.key : stat.name);
+
+        QVariantMap entry;
+        entry["key"]  = key;
+        entry["name"] = name;
+
+        // The key encodes where the game came from, which is all that is left to
+        // go on once it is gone from the disk. An igdb_ key says nothing about
+        // its origin -- it is the identity Vortex resolved, not a store.
+        if (key.startsWith("steam_")) {
+            const int appid = key.mid(6).toInt();
+            entry["source"]     = QStringLiteral("Steam");
+            entry["appid"]      = appid;
+            entry["steamAppId"] = appid;
+        } else {
+            entry["source"] = key.startsWith("local_") ? QStringLiteral("Local")
+                                                       : QStringLiteral("Unknown");
+            entry["appid"]      = 0;
+            entry["steamAppId"] = 0;
+        }
+
+        entry["playtimeSeconds"] = static_cast<qlonglong>(stat.seconds);
+        entry["playtime"]        = formatPlaytimeLabel(stat.seconds);
+
+        const QString lastPlayed = getLastPlayedDate(stat.key, m_baseDir);
+        entry["lastPlayed"]   = lastPlayed;
+        entry["lastPlayedAt"] = static_cast<qlonglong>(parseDateToEpoch(lastPlayed));
+
+        const fs::path gameDir =
+            imageRoot / steamgriddb_image_folder_name(name.toStdString());
+        for (const auto &slot : kPlayedArtSlots)
+            entry[slot.first] = findImagePath(gameDir, slot.second);
+
+        entry["developer"]  = QStringLiteral("Unknown");
+        entry["genres"]     = QStringLiteral("Unknown");
+        entry["tags"]       = QStringLiteral("Unknown");
+        entry["rating"]     = 0.0;
+        entry["timeToBeat"] = QStringLiteral("N/A");
+        entry["installDir"] = QString();
+        entry["status"]     = 0.0;
+        entry["matched"]    = false;
+
+        m_playedLedger << entry;
+        known.insert(key);
+        changed = true;
+    }
+
+    if (changed)
+        savePlayedLedger();
+}
+
+void VortexBridge::syncPlayedLedger() {
+    QHash<QString, int> at;
+    for (int i = 0; i < m_playedLedger.size(); ++i)
+        at.insert(m_playedLedger[i].toMap().value("key").toString(), i);
+
+    bool changed = false;
+
+    for (const QVariant &entry : m_gameList) {
+        const QVariantMap game = entry.toMap();
+        const QString key = game.value("playKey").toString();
+        if (key.isEmpty() || game.value("playtimeSeconds").toLongLong() <= 0)
+            continue;
+
+        QVariantMap snapshot = game;
+        snapshot["key"] = key;
+        // Stored as the game will look once it is gone: no install path, and not
+        // matched to anything in the library. playedGames() puts the live values
+        // back for as long as the game is actually installed.
+        snapshot["installDir"] = QString();
+        snapshot["matched"]    = false;
+        // Not the live preference. Whether a game is hearted is answered from
+        // preferences.json every time the details page asks, and carrying a copy
+        // here would rewrite the file on every heart click for no gain.
+        snapshot["status"] = 0.0;
+        if (game.value("source").toString() == "Steam")
+            snapshot["steamAppId"] = game.value("appid");
+
+        const auto found = at.constFind(key);
+        if (found == at.constEnd()) {
+            at.insert(key, m_playedLedger.size());
+            m_playedLedger << snapshot;
+            changed = true;
+        } else if (m_playedLedger[*found].toMap() != snapshot) {
+            m_playedLedger[*found] = snapshot;
+            changed = true;
+        }
+    }
+
+    if (changed)
+        savePlayedLedger();
+
+    // Emitted either way: a game that was uninstalled since the last scan adds
+    // nothing to the ledger, but it does change what the tab has to draw --
+    // its row loses the INSTALLED badge and stops being launchable.
+    emit playedGamesChanged();
+}
+
+// Everything ever played, live rows first so an installed game keeps its real
+// install path and a working Play button. Computed on demand for the same
+// reason favoriteGames() is: the alternative is a cached list that goes stale
+// the moment a scan updates a row in place.
+QVariantList VortexBridge::playedGames() const {
+    QVariantList merged;
+    QHash<QString, int> byName;   // canonical name -> index in merged
+    QSet<QString> liveKeys;
+
+    // One title, one card. playtime_stats.txt really does hold the same game
+    // under two keys -- "Dungeon Village" is both igdb_27038 and igdb_19814,
+    // from the title resolving differently on two different scans -- and two
+    // identical cards side by side reads as a bug rather than as history.
+    auto fold = [&](const QVariantMap &item) {
+        const QString canonical = QString::fromStdString(
+            make_canonical(item.value("name").toString().toStdString()));
+
+        const auto found = byName.constFind(canonical);
+        if (found == byName.constEnd()) {
+            byName.insert(canonical, merged.size());
+            merged << item;
+            return;
+        }
+
+        const QVariantMap kept = merged[*found].toMap();
+
+        // The installed copy owns the metadata -- it has the current artwork and
+        // the resolved IGDB details -- but the totals are the sum of both, and
+        // the date is whichever is later.
+        QVariantMap winner = kept.value("installed").toBool() ? kept : item;
+        winner["playtimeSeconds"] =
+            kept.value("playtimeSeconds").toLongLong()
+            + item.value("playtimeSeconds").toLongLong();
+        winner["playtime"] = formatPlaytimeLabel(
+            winner.value("playtimeSeconds").toLongLong());
+        winner["installed"] = kept.value("installed").toBool()
+                              || item.value("installed").toBool();
+
+        const QVariantMap &later =
+            item.value("lastPlayedAt").toLongLong()
+                > kept.value("lastPlayedAt").toLongLong() ? item : kept;
+        winner["lastPlayedAt"] = later.value("lastPlayedAt");
+        winner["lastPlayed"]   = later.value("lastPlayed");
+
+        merged[*found] = winner;
+    };
+
+    for (const QVariant &entry : m_gameList) {
+        QVariantMap game = entry.toMap();
+        if (game.value("playtimeSeconds").toLongLong() <= 0)
+            continue;
+        liveKeys.insert(game.value("playKey").toString());
+        game["installed"] = true;
+        fold(game);
+    }
+
+    for (const QVariant &entry : m_playedLedger) {
+        QVariantMap item = entry.toMap();
+        if (liveKeys.contains(item.value("key").toString()))
+            continue;
+        item["installed"] = false;
+        // Uninstalled, so the details page must not offer Play or Uninstall --
+        // launchGameFrom() and uninstallGame() both search m_internalGames and
+        // would return without a word. isOwned reads this.
+        item["matched"] = false;
+        fold(item);
+    }
+
+    // Most recently played first, then the biggest total, then the title. The
+    // date alone is not enough to order by: everything that is not a Steam game
+    // only knows the DAY it was last played (see parseDateToEpoch).
+    std::sort(merged.begin(), merged.end(),
+              [](const QVariant &a, const QVariant &b) {
+        const QVariantMap x = a.toMap();
+        const QVariantMap y = b.toMap();
+
+        const qlonglong xAt = x.value("lastPlayedAt").toLongLong();
+        const qlonglong yAt = y.value("lastPlayedAt").toLongLong();
+        if (xAt != yAt) return xAt > yAt;
+
+        const qlonglong xSec = x.value("playtimeSeconds").toLongLong();
+        const qlonglong ySec = y.value("playtimeSeconds").toLongLong();
+        if (xSec != ySec) return xSec > ySec;
+
+        return QString::compare(x.value("name").toString(),
+                                y.value("name").toString(),
+                                Qt::CaseInsensitive) < 0;
+    });
+
+    return merged;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1780,6 +2111,10 @@ void VortexBridge::loadGames() {
             QMetaObject::invokeMethod(this, [this, list, internalGames]() mutable {
                 m_internalGames = internalGames;
                 m_gameList      = list;
+                // Steam totals are already on these rows, so a game played
+                // outside Vortex enters the ledger here -- before the details
+                // pass has had a chance to rename anything.
+                syncPlayedLedger();
                 emit gameListChanged();
             }, Qt::QueuedConnection);
         }
@@ -1898,6 +2233,11 @@ void VortexBridge::loadGames() {
             m_internalGames = std::move(internalGames);
             setScanProgress(false, QString(), 0, 0);
             setLoading(false);
+
+            // Again now that the rows are final: pass 2 resolves IGDB ids (which
+            // changes the playtime key) and renames local games, and pass 3 fills
+            // in the artwork the ledger keeps its own copy of.
+            syncPlayedLedger();
 
             if (m_rescanQueued) {
                 m_rescanQueued = false;

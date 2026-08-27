@@ -6,6 +6,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <filesystem>
 #include <ctime>
 
@@ -133,6 +134,13 @@ void record_play_session(const std::string& game_key, const std::string& game_na
                  << format_time(start_time) << " | "
                  << format_time(end_time) << "\n";
     }
+}
+
+std::vector<PlayStat> get_all_play_stats() {
+    std::vector<PlayStat> out;
+    for (const auto& [key, entry] : load_stats())
+        out.push_back({ key, entry.name, entry.time });
+    return out;
 }
 
 long long get_playtime(const std::string& game_key) {

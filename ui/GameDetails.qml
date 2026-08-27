@@ -199,9 +199,12 @@ Popup {
         // Then discovery picks and saved wishlist entries. Without these an
         // unowned game resolved to null and the whole page rendered blank,
         // since it has no row in the launcher's game list to read.
+        // playedGames last: a game that is both played and installed was
+        // already found above, so this only ever resolves the uninstalled ones.
         return detailsRoot.findIn(detailsRoot.api.recommendationList)
             || detailsRoot.findIn(detailsRoot.api.wishlistGames)
-            || detailsRoot.findIn(detailsRoot.api.favoriteGames);
+            || detailsRoot.findIn(detailsRoot.api.favoriteGames)
+            || detailsRoot.findIn(detailsRoot.api.playedGames);
     }
 
     Connections {
@@ -212,6 +215,7 @@ Popup {
             detailsRoot.gameData = detailsRoot.findGameData();
             detailsRoot.wishlistRevision++;
         }
+        function onPlayedGamesChanged() { detailsRoot.gameData = detailsRoot.findGameData(); }
     }
 
     // Never carry an armed confirm across games or across an open/close cycle.
