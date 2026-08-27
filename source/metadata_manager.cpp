@@ -1,11 +1,13 @@
 #include "metadata_manager.h"
 #include "app_paths.h"
 #include "game_manager.h"
+#include "json_text.h"
 #include <unordered_map>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
 #include <algorithm>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -84,7 +86,25 @@ static std::vector<std::string> derive_main_genres(const std::vector<std::string
     return main_genres;
 }
 
-static std::unordered_map<long long, GameMetadata> load_metadata() {
+static std::vector<std::string> repair_all(std::vector<std::string> values, bool* repaired) {
+    for (std::string& value : values) {
+        std::string fixed = json_repair_dropped_escapes(value);
+        if (repaired && fixed != value) *repaired = true;
+        value = std::move(fixed);
+    }
+    return values;
+}
+
+static std::string repair_one(const std::string& value, bool* repaired) {
+    std::string fixed = json_repair_dropped_escapes(value);
+    if (repaired && fixed != value) *repaired = true;
+    return fixed;
+}
+
+// repaired, when given, is set if any value on disk still carried a dropped
+// escape -- which is what tells repair_metadata_cache_file() there is a file
+// worth rewriting.
+static std::unordered_map<long long, GameMetadata> load_metadata(bool* repaired = nullptr) {
     std::unordered_map<long long, GameMetadata> cache;
     if (!fs::exists(METADATA_FILE_PATH)) return cache;
 
@@ -121,13 +141,17 @@ static std::unordered_map<long long, GameMetadata> load_metadata() {
             };
 
             if (fields.size() >= 2) {
-                data.developer = field(0);
+                // Repaired on the way in, so no caller has to know that lines
+                // written before json_read_string() existed hold "Beat u0027em
+                // up" where IGDB sent an apostrophe. What is on disk is put
+                // right separately, by repair_metadata_cache_file().
+                data.developer = repair_one(field(0), repaired);
                 if (!field(1).empty()) data.rating = std::stod(field(1));
                 if (!field(2).empty()) data.time_to_beat_seconds = std::stoll(field(2));
-                data.all_genres  = split_str(field(3), ',');
-                data.main_genres = split_str(field(4), ',');
-                data.themes      = split_str(field(5), ',');
-                data.game_modes  = split_str(field(6), ',');
+                data.all_genres  = repair_all(split_str(field(3), ','), repaired);
+                data.main_genres = repair_all(split_str(field(4), ','), repaired);
+                data.themes      = repair_all(split_str(field(5), ','), repaired);
+                data.game_modes  = repair_all(split_str(field(6), ','), repaired);
             }
             cache[id] = data;
         } catch (...) {
@@ -160,6 +184,17 @@ void save_game_metadata(const GameMetadata& data) {
     
     cache[copy.igdb_id] = copy;
     save_metadata_cache(cache);
+}
+
+bool repair_metadata_cache_file() {
+    bool repaired = false;
+    auto cache = load_metadata(&repaired);
+    // Rewriting is not only cosmetic: analytics/sync_local_data.py reads this
+    // file straight off disk, and "Beat u0027em up" is a different label to it
+    // than "Beat 'em up", so the recommender was grouping the same genre under
+    // two names. One rewrite fixes every line, since the whole cache is dumped.
+    if (repaired) save_metadata_cache(cache);
+    return repaired;
 }
 
 GameMetadata get_game_metadata(long long igdb_id) {

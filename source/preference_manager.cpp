@@ -1,6 +1,8 @@
 #include "preference_manager.h"
 #include "app_paths.h"
+#include "game_manager.h"
 #include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -101,9 +103,45 @@ static void save_preferences(const std::unordered_map<std::string, double>& pref
     file << "}\n";
 }
 
+// The stored key a name refers to, or end() if the file has never seen it.
+//
+// Exact first, then the canonical form -- the same rule the launcher already
+// uses to line a game up with its library row. One title reaches this file
+// under more than one spelling: the played history keeps the name the game was
+// resolved under, the library keeps the one IGDB returned, and "Stick Fight The
+// Game" against "Stick Fight: The Game" is a difference of punctuation only.
+// Matching exactly meant a game hearted from one surface read as unhearted on
+// another, and hearting it there wrote a second entry rather than clearing the
+// first -- so it could not be unliked from the surface that showed it lit.
+static std::unordered_map<std::string, double>::iterator
+find_preference(std::unordered_map<std::string, double>& prefs,
+                const std::string& game_name) {
+    auto exact = prefs.find(game_name);
+    if (exact != prefs.end())
+        return exact;
+
+    const std::string wanted = make_canonical(game_name);
+    if (wanted.empty())
+        return prefs.end();
+
+    // A favourited entry wins over a neutral one, and the smallest key breaks
+    // any remaining tie: unordered_map iteration order is arbitrary, and an
+    // answer that changes between runs is worse than either choice.
+    auto best = prefs.end();
+    for (auto it = prefs.begin(); it != prefs.end(); ++it) {
+        if (make_canonical(it->first) != wanted)
+            continue;
+        if (best == prefs.end()
+            || (it->second > 0.0 && best->second <= 0.0)
+            || (((it->second > 0.0) == (best->second > 0.0)) && it->first < best->first))
+            best = it;
+    }
+    return best;
+}
+
 double get_game_preference(const std::string& game_name) {
     auto prefs = load_preferences();
-    auto it = prefs.find(game_name);
+    auto it = find_preference(prefs, game_name);
     if (it != prefs.end()) {
         return it->second;
     }
@@ -112,19 +150,32 @@ double get_game_preference(const std::string& game_name) {
 
 double toggle_game_preference(const std::string& game_name, double target_score) {
     auto prefs = load_preferences();
-    
-    double current = 0.0;
-    auto it = prefs.find(game_name);
-    if (it != prefs.end()) {
-        current = it->second;
-    }
+
+    auto it = find_preference(prefs, game_name);
+    const double current = it != prefs.end() ? it->second : 0.0;
 
     double new_score = target_score;
     if (current == target_score) {
         new_score = 0.0; // Toggle off
     }
 
-    prefs[game_name] = new_score;
+    // Write back to the key that is already there rather than adding the
+    // caller's spelling beside it, so a file that has held one game since the
+    // first heart keeps holding one entry for it.
+    const std::string key = it != prefs.end() ? it->first : game_name;
+
+    // Duplicates an older build left behind go with it. Without this, turning a
+    // game off would clear one spelling and leave the other reading 1.0, and
+    // the heart would light straight back up on the next lookup.
+    const std::string wanted = make_canonical(key);
+    if (!wanted.empty()) {
+        for (auto dup = prefs.begin(); dup != prefs.end(); ) {
+            dup = (dup->first != key && make_canonical(dup->first) == wanted)
+                  ? prefs.erase(dup) : std::next(dup);
+        }
+    }
+
+    prefs[key] = new_score;
     save_preferences(prefs);
     return new_score;
 }

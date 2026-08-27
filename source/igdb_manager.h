@@ -33,6 +33,12 @@ IgdbGameInfo igdb_resolve_game(const std::string &folderName,
                                bool interactive = true,
                                long long steamAppId = 0);
 
+// The IGDB id already known for a name, or 0 if the cache has never resolved
+// one. Offline and side-effect free -- unlike igdb_resolve_game(), a miss costs
+// nothing and never reaches the network, which is what makes it usable while
+// rebuilding history for games that are no longer installed.
+long long igdb_cached_id_for(const std::string &name);
+
 // Result of checking a credential pair against the live provider.
 //
 // `rejected` separates "the provider said no" from "we could not ask". They

@@ -18,4 +18,9 @@ struct GameMetadata {
 };
 
 void save_game_metadata(const GameMetadata& data);
+
+// Rewrites game_metadata.txt once if any line still holds a value mangled by
+// the escape-dropping JSON scan this codebase used to have. Returns whether it
+// wrote anything. Cheap and idempotent: a clean file is read and left alone.
+bool repair_metadata_cache_file();
 GameMetadata get_game_metadata(long long igdb_id);

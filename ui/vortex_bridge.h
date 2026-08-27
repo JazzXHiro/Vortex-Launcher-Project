@@ -355,6 +355,7 @@ private:
     // games that happen to be installed right now, which is the opposite of the
     // point.
     void        seedPlayedLedgerFromStats();
+    void        backfillPlayedLedgerMetadata();
 
     // Upserts a snapshot for every live row with playtime on it. This is also
     // the only path that captures a Steam game played entirely outside Vortex:

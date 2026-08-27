@@ -2,6 +2,7 @@
 #include "app_paths.h"
 #include "game_manager.h"
 #include "igdb_manager.h"
+#include "json_text.h"
 #include "metadata_manager.h"
 #include "preference_manager.h"
 #include "stats_manager.h"
@@ -65,10 +66,12 @@ static fs::path resolveBaseDir() {
 VortexBridge::VortexBridge(QObject *parent) : QObject(parent),
     m_baseDir(resolveBaseDir()) {
     init_stats_manager(m_baseDir.string());
+    repair_metadata_cache_file();
     loadWishlist();
     loadFavoriteSnapshots();
     loadPlayedLedger();
     seedPlayedLedgerFromStats();
+    backfillPlayedLedgerMetadata();
     loadSettings();
 }
 
@@ -733,6 +736,43 @@ static QVariantMap findGameByName(const QVariantList &games, const QString &name
     return {};
 }
 
+// The IGDB half of a game row: developer, rating, time to beat, genres. Shared
+// so a game that is no longer installed describes itself exactly as it did when
+// it was -- the played ledger used to hardcode "Unknown" in all five slots and a
+// game hearted out of the Played tab looked like it had lost its metadata.
+//
+// Every slot is written on both paths, so calling this on a row that already
+// carries stale placeholders replaces them.
+static void applyGameMetadata(QVariantMap &game, long long igdbId) {
+    if (igdbId <= 0) {
+        game["developer"]  = QString("Unknown");
+        game["rating"]     = 0.0;
+        game["timeToBeat"] = QString("N/A");
+        game["genres"]     = QString("Unknown");
+        game["tags"]       = QString("Unknown");
+        return;
+    }
+
+    const GameMetadata meta = get_game_metadata(igdbId);
+    game["developer"]  = QString::fromStdString(meta.developer);
+    game["rating"]     = meta.rating;
+    game["timeToBeat"] = (meta.time_to_beat_seconds > 0)
+                         ? QString::number(meta.time_to_beat_seconds / 3600) + " Hours"
+                         : "N/A";
+
+    const auto join = [](const std::vector<std::string> &values) {
+        QStringList parts;
+        for (const std::string &value : values)
+            parts << QString::fromStdString(value);
+        return parts.join(", ");
+    };
+
+    const QString genres = join(meta.main_genres);
+    const QString tags   = join(meta.all_genres);
+    game["genres"] = genres.isEmpty() ? QString("Unknown") : genres;
+    game["tags"]   = tags.isEmpty()   ? QString("Unknown") : tags;
+}
+
 // The set of games that exist on this machine right now, with the exact names
 // the UI shows. The analytics side cannot work either of those out for itself:
 // igdb_cache.txt is append-only and is never pruned on uninstall, and it is
@@ -1002,34 +1042,7 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
         lastPlayedAt = parseDateToEpoch(game["lastPlayed"].toString());
     game["lastPlayedAt"] = static_cast<qlonglong>(lastPlayedAt);
 
-    if (bg.igdb_id > 0) {
-        GameMetadata meta = get_game_metadata(bg.igdb_id);
-        game["developer"]  = QString::fromStdString(meta.developer);
-        game["rating"]     = meta.rating;
-        game["timeToBeat"] = (meta.time_to_beat_seconds > 0)
-                             ? QString::number(meta.time_to_beat_seconds / 3600) + " Hours"
-                             : "N/A";
-        
-        QString genresStr = "";
-        for (size_t i = 0; i < meta.main_genres.size(); ++i) {
-            genresStr += QString::fromStdString(meta.main_genres[i]);
-            if (i < meta.main_genres.size() - 1) genresStr += ", ";
-        }
-        game["genres"] = genresStr.isEmpty() ? "Unknown" : genresStr;
-
-        QString tagsStr = "";
-        for (size_t i = 0; i < meta.all_genres.size(); ++i) {
-            tagsStr += QString::fromStdString(meta.all_genres[i]);
-            if (i < meta.all_genres.size() - 1) tagsStr += ", ";
-        }
-        game["tags"] = tagsStr.isEmpty() ? "Unknown" : tagsStr;
-    } else {
-        game["developer"]  = QString("Unknown");
-        game["rating"]     = 0.0;
-        game["timeToBeat"] = QString("N/A");
-        game["genres"]     = QString("Unknown");
-        game["tags"]       = QString("Unknown");
-    }
+    applyGameMetadata(game, bg.igdb_id);
 
     game["status"] = get_game_preference(bg.name);
     return game;
@@ -1475,6 +1488,9 @@ QVariantList VortexBridge::favoriteGames() const {
     //
     // Owned wins on a name clash: once a game is actually installed, the live
     // library entry is better than the snapshot taken when it was hearted.
+    // Built on first use only: most favourites are owned and never reach it.
+    QVariantList playedByName;
+
     for (const QVariant &entry : m_favoriteSnapshots) {
         QVariantMap snapshot = entry.toMap();
         const QString name = snapshot.value("name").toString();
@@ -1486,16 +1502,32 @@ QVariantList VortexBridge::favoriteGames() const {
             continue;
 
         // A game that was played and then uninstalled already has a full row in
-        // the played ledger -- artwork, playtime, developer and genres. That row
-        // is both richer and fresher than a snapshot frozen at the moment of the
-        // heart click, so it wins here for the same reason the live library row
-        // wins above. Without this, hearting from the Played tab replaced the
-        // page with the bare snapshot and the art and metadata vanished.
-        QVariantMap played = findGameByName(m_playedLedger, name);
+        // the played history -- artwork, playtime, developer and genres. That
+        // row is both richer and fresher than a snapshot frozen at the moment of
+        // the heart click, so it wins here for the same reason the live library
+        // row wins above. Without this, hearting from the Played tab replaced
+        // the page with the bare snapshot and the art and metadata vanished.
+        //
+        // playedGames() rather than m_playedLedger: one title can hold several
+        // ledger rows (Stellar Blade is both igdb_117170 and local_stellarblade)
+        // and only the folded row carries the summed playtime and the source the
+        // Played tab itself shows. Reading the ledger directly picked whichever
+        // row came first and the totals changed under the heart.
+        if (playedByName.isEmpty())
+            playedByName = playedGames();
+
+        QVariantMap played = findGameByName(playedByName, name);
         if (!played.isEmpty()) {
-            played["installed"] = false;
-            played["matched"]   = false;
-            played["status"]    = 1.0;
+            // Presentation from the played row, identity from the snapshot.
+            // findGameByName() matches canonically, so the two can spell the
+            // title differently ("Stick Fight The Game" against "Stick Fight:
+            // The Game"), and preferences.json is keyed on the exact string
+            // that was hearted. Carrying the other spelling into the card would
+            // send the next heart click to toggle_game_preference() under a
+            // name it has never seen, which writes a second entry instead of
+            // clearing the first -- the game would refuse to unlike.
+            played["name"]   = name;
+            played["status"] = 1.0;
             list << played;
             continue;
         }
@@ -1556,11 +1588,12 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     QVariantMap snapshot = findGameByName(m_recommendationList, name);
     if (snapshot.isEmpty())
         snapshot = findGameByName(m_wishlist, name);
-    // The played ledger last: a game hearted from the Played tab is in none of
-    // the lists above, and a snapshot holding nothing but a name is not
-    // renderable -- which is exactly what emptied the details page.
+    // Played history last: a game hearted from the Played tab is in none of the
+    // lists above, and a snapshot holding nothing but a name is not renderable
+    // -- which is exactly what emptied the details page. Folded rows, not raw
+    // ledger rows, so a title split across two play keys keeps its full total.
     if (snapshot.isEmpty())
-        snapshot = findGameByName(m_playedLedger, name);
+        snapshot = findGameByName(playedGames(), name);
     if (snapshot.isEmpty())
         snapshot["name"] = name;
 
@@ -1569,6 +1602,7 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     snapshot.remove("inspiredBy");
     snapshot.remove("section");
     snapshot.remove("similarity");
+    snapshot.remove("installed");   // a played row's momentary install state
     snapshot["status"] = 1.0;
     snapshot["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
 
@@ -1672,6 +1706,71 @@ void VortexBridge::savePlayedLedger() const {
         file.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
 }
 
+// The IGDB id behind a ledger row. An igdb_ key carries it outright; anything
+// else has to go through the resolution cache, which is offline and is the same
+// mapping the scan used when the game was still installed.
+static long long playedIgdbId(const QString &key, const QString &name) {
+    if (key.startsWith("igdb_")) {
+        const long long id = key.mid(5).toLongLong();
+        if (id > 0)
+            return id;
+    }
+    return igdb_cached_id_for(name.toStdString());
+}
+
+// One pass over the history for rows written by an older build.
+//
+// Two things are wrong with them. Rows the stats file seeded carry "Unknown" in
+// every metadata slot -- that is all playtime_stats.txt knows -- and nothing
+// ever went back over them, so a game uninstalled long ago showed a blank
+// details page forever. And rows of any age can carry the dropped-escape
+// spelling of a name or a genre. Rows that already hold real metadata keep it:
+// those came from a live scan, which knows more than the caches do.
+void VortexBridge::backfillPlayedLedgerMetadata() {
+    bool changed = false;
+
+    for (int i = 0; i < m_playedLedger.size(); ++i) {
+        QVariantMap entry = m_playedLedger[i].toMap();
+        const QVariantMap before = entry;
+
+        // The ledger holds its own copy of the metadata, taken when the row was
+        // written, so a row saved before json_read_string() existed keeps the
+        // dropped-escape spelling ("Beat u0027em up") even though the caches it
+        // came from now read back clean.
+        for (const char *key : { "name", "developer", "genres", "tags" }) {
+            const QString value = entry.value(key).toString();
+            if (value.isEmpty())
+                continue;
+            const QString repaired = QString::fromStdString(
+                json_repair_dropped_escapes(value.toStdString()));
+            if (repaired != value)
+                entry[key] = repaired;
+        }
+
+        const QString developer = entry.value("developer").toString();
+        const QString genres    = entry.value("genres").toString();
+        const bool blank =
+            (developer.isEmpty() || developer == "Unknown") &&
+            (genres.isEmpty()    || genres    == "Unknown");
+
+        if (blank) {
+            const long long id = playedIgdbId(entry.value("key").toString(),
+                                              entry.value("name").toString());
+            if (id > 0)
+                applyGameMetadata(entry, id);
+        }
+
+        if (entry == before)
+            continue;
+
+        m_playedLedger[i] = entry;
+        changed = true;
+    }
+
+    if (changed)
+        savePlayedLedger();
+}
+
 // Backfill from playtime_stats.txt for keys the ledger has never seen. Runs on
 // every start, not just the first: the stats file is also written by the CLI,
 // and a session recorded there while the launcher was closed would otherwise
@@ -1732,11 +1831,7 @@ void VortexBridge::seedPlayedLedgerFromStats() {
         for (const auto &slot : kPlayedArtSlots)
             entry[slot.first] = findImagePath(gameDir, slot.second);
 
-        entry["developer"]  = QStringLiteral("Unknown");
-        entry["genres"]     = QStringLiteral("Unknown");
-        entry["tags"]       = QStringLiteral("Unknown");
-        entry["rating"]     = 0.0;
-        entry["timeToBeat"] = QStringLiteral("N/A");
+        applyGameMetadata(entry, playedIgdbId(key, name));
         entry["installDir"] = QString();
         entry["status"]     = 0.0;
         entry["matched"]    = false;
@@ -2010,6 +2105,7 @@ bool VortexBridge::toggleWishlist(QString name) {
     snapshot.remove("inspiredBy");
     snapshot.remove("section");
     snapshot.remove("similarity");
+    snapshot.remove("installed");   // a played row's momentary install state
     snapshot["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
 
     m_wishlist << snapshot;

@@ -3,6 +3,7 @@
 #include "igdb_manager.h"
 #include "app_paths.h"
 #include "game_manager.h"
+#include "json_text.h"
 #include "metadata_manager.h"
 
 #include "secrets.h"
@@ -349,23 +350,8 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
     while (name_pos < root_obj.size() &&
            (root_obj[name_pos] == ' ' || root_obj[name_pos] == ':'))
       name_pos++;
-    if (name_pos < root_obj.size() && root_obj[name_pos] == '"') {
-      name_pos++;
-      bool escaped = false;
-      for (; name_pos < root_obj.size(); ++name_pos) {
-        char c = root_obj[name_pos];
-        if (escaped) {
-          info.name += c;
-          escaped = false;
-        } else if (c == '\\') {
-          escaped = true;
-        } else if (c == '"') {
-          break;
-        } else {
-          info.name += c;
-        }
-      }
-    }
+    if (name_pos < root_obj.size() && root_obj[name_pos] == '"')
+      info.name = json_read_string(root_obj, name_pos);
   }
 
   // Extract "rating"
@@ -400,16 +386,7 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
               size_t val_pos = colon + 1;
               while (val_pos < obj.size() && obj[val_pos] == ' ') val_pos++;
               if (val_pos < obj.size() && obj[val_pos] == '"') {
-                  val_pos++;
-                  bool escaped = false;
-                  std::string genre_name = "";
-                  for (; val_pos < obj.size(); ++val_pos) {
-                      char c = obj[val_pos];
-                      if (escaped) { genre_name += c; escaped = false; }
-                      else if (c == '\\') { escaped = true; }
-                      else if (c == '"') { break; }
-                      else { genre_name += c; }
-                  }
+                  const std::string genre_name = json_read_string(obj, val_pos);
                   if (!genre_name.empty()) {
                       info.genres.push_back(genre_name);
                   }
@@ -436,16 +413,7 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
               size_t val_pos = colon + 1;
               while (val_pos < obj.size() && obj[val_pos] == ' ') val_pos++;
               if (val_pos < obj.size() && obj[val_pos] == '"') {
-                  val_pos++;
-                  bool escaped = false;
-                  std::string theme_name = "";
-                  for (; val_pos < obj.size(); ++val_pos) {
-                      char c = obj[val_pos];
-                      if (escaped) { theme_name += c; escaped = false; }
-                      else if (c == '\\') { escaped = true; }
-                      else if (c == '"') { break; }
-                      else { theme_name += c; }
-                  }
+                  const std::string theme_name = json_read_string(obj, val_pos);
                   if (!theme_name.empty()) {
                       info.themes.push_back(theme_name);
                   }
@@ -469,16 +437,7 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
               size_t val_pos = colon + 1;
               while (val_pos < obj.size() && obj[val_pos] == ' ') val_pos++;
               if (val_pos < obj.size() && obj[val_pos] == '"') {
-                  val_pos++;
-                  bool escaped = false;
-                  std::string mode_name = "";
-                  for (; val_pos < obj.size(); ++val_pos) {
-                      char c = obj[val_pos];
-                      if (escaped) { mode_name += c; escaped = false; }
-                      else if (c == '\\') { escaped = true; }
-                      else if (c == '"') { break; }
-                      else { mode_name += c; }
-                  }
+                  const std::string mode_name = json_read_string(obj, val_pos);
                   if (!mode_name.empty()) {
                       info.game_modes.push_back(mode_name);
                   }
@@ -527,16 +486,7 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
                           comp_name = colon + 1;
                           while (comp_name < obj.size() && obj[comp_name] == ' ') comp_name++;
                           if (comp_name < obj.size() && obj[comp_name] == '"') {
-                              comp_name++;
-                              bool escaped = false;
-                              info.developer = "";
-                              for (; comp_name < obj.size(); ++comp_name) {
-                                  char c = obj[comp_name];
-                                  if (escaped) { info.developer += c; escaped = false; }
-                                  else if (c == '\\') { escaped = true; }
-                                  else if (c == '"') { break; }
-                                  else { info.developer += c; }
-                              }
+                              info.developer = json_read_string(obj, comp_name);
                               break;
                           }
                       }
@@ -633,7 +583,9 @@ static void load_igdb_cache() {
         try {
           IgdbGameInfo info;
           info.id = std::stoll(rest.substr(0, pipe_pos));
-          info.name = rest.substr(pipe_pos + 1);
+          // Same repair as game_metadata.txt: names cached before
+          // json_read_string() existed carry the dropped-escape spelling.
+          info.name = json_repair_dropped_escapes(rest.substr(pipe_pos + 1));
           // id 0 is a remembered miss, not a corrupt line. Loading it is what
           // stops a game IGDB does not have from costing a lookup every launch.
           //
@@ -791,6 +743,31 @@ CredentialCheck igdb_probe_credentials(const std::string &clientId,
   result.ok = true;
   result.detail = "Credentials accepted.";
   return result;
+}
+
+long long igdb_cached_id_for(const std::string &name) {
+  load_igdb_cache();
+
+  auto it = s_igdb_cache.find(name);
+  if (it != s_igdb_cache.end() && it->second.id > 0)
+    return it->second.id;
+
+  // The cache is keyed by whatever string was searched -- a folder name for a
+  // local game, a store name for a Steam one -- so an exact hit is the lucky
+  // case. Match on the canonical form as well, against both the key and the
+  // resolved name, exactly as findGameByName() does in the bridge.
+  const string canon = make_canonical(name);
+  if (canon.empty())
+    return 0;
+
+  for (const auto &entry : s_igdb_cache) {
+    if (entry.second.id <= 0)
+      continue;
+    if (make_canonical(entry.first) == canon ||
+        make_canonical(entry.second.name) == canon)
+      return entry.second.id;
+  }
+  return 0;
 }
 
 IgdbGameInfo igdb_resolve_game(const std::string &folderName,

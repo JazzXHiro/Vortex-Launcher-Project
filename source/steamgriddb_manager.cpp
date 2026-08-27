@@ -1,4 +1,5 @@
 #include "steamgriddb_manager.h"
+#include "json_text.h"
 #include "game_manager.h"
 
 #include <cctype>
@@ -161,33 +162,9 @@ static string extract_json_value(const string &json, const string &key,
     return json.substr(pos, end - pos);
   } else {
     if (pos < json.size() && json[pos] == '"') {
-      pos++; // skip quote
-      size_t end = pos;
-      bool escaped = false;
-      string val;
-      while (end < json.size()) {
-        if (escaped) {
-          val += json[end];
-          escaped = false;
-        } else if (json[end] == '\\') {
-          escaped = true;
-        } else if (json[end] == '"') {
-          break;
-        } else {
-          val += json[end];
-        }
-        end++;
-      }
-      string unescaped;
-      for (size_t i = 0; i < val.size(); ++i) {
-        if (val[i] == '\\' && i + 1 < val.size() && val[i + 1] == '/') {
-          unescaped += '/';
-          ++i;
-        } else {
-          unescaped += val[i];
-        }
-      }
-      return unescaped;
+      // Every path separator in an image URL arrives as \/ , and a \u in a game
+      // name used to reach the folder this result names.
+      return json_read_string(json, pos);
     }
   }
   return "";
