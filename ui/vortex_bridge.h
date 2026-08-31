@@ -58,6 +58,17 @@ class VortexBridge : public QObject {
     // played and survives this one; both settings together leave the mood
     // alone to rank with.
     Q_PROPERTY(bool         ignoreLikedGames READ ignoreLikedGames NOTIFY ignoreLikedGamesChanged)
+    // "Use Steam's own playtime" in Settings. Off, Vortex shows the total it
+    // keeps itself: Steam's lifetime figure imported once when a game is first
+    // seen, plus every session since, with idle time deducted. On, Steam games
+    // fall back to Steam's live figure, which counts play outside the launcher
+    // but can carry no idle breakdown -- so it is shown exactly as Steam
+    // reports it, with nothing taken out.
+    //
+    // Display only. The import and the session tracking run either way, or
+    // turning this off later would show a total missing everything that
+    // happened while it was on.
+    Q_PROPERTY(bool         useSteamPlaytime READ useSteamPlaytime NOTIFY useSteamPlaytimeChanged)
 
     // ---- Scan progress ---------------------------------------------------
     // The library scan used to hide behind a full-screen modal overlay with an
@@ -105,6 +116,7 @@ public:
     bool         curatedOnly() const { return m_curatedOnly; }
     bool         ignorePlayedGames() const { return m_ignorePlayedGames; }
     bool         ignoreLikedGames() const { return m_ignoreLikedGames; }
+    bool         useSteamPlaytime() const { return m_useSteamPlaytime; }
     QString      recommendationStatus() const { return m_recommendationStatus; }
 
     bool         scanActive() const { return m_scanActive; }
@@ -153,6 +165,11 @@ public:
 
     // Toggles "ignore games you've liked". Same contract again.
     Q_INVOKABLE void   setIgnoreLikedGames(bool enabled);
+
+    // Switches where Steam games' playtime is read from. Persists and rebuilds
+    // the list; unlike the three above it does not re-rank, because it changes
+    // which number is displayed, not what the recommender was given.
+    Q_INVOKABLE void   setUseSteamPlaytime(bool enabled);
 
     // Full scan: Steam + local dirs + SteamGridDB artwork. Runs on a background thread.
     Q_INVOKABLE void   loadGames();
@@ -245,6 +262,7 @@ signals:
     void curatedOnlyChanged();
     void ignorePlayedGamesChanged();
     void ignoreLikedGamesChanged();
+    void useSteamPlaytimeChanged();
     void recommendationStatusChanged();
     void localDirectoriesChanged();
     void directoryRemoved(QString folder, int gamesRemoved, int artworkDeleted);
@@ -308,6 +326,7 @@ private:
     bool                    m_curatedOnly = false;
     bool                    m_ignorePlayedGames = false;
     bool                    m_ignoreLikedGames = false;
+    bool                    m_useSteamPlaytime = false;
     QString                 m_recommendationStatus = "Recommendations not loaded";
     fs::path                m_baseDir;    // resolved project root (contains Images/)
 

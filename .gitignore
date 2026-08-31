@@ -71,6 +71,11 @@ wishlist.json
 favorite_snapshots.json
 CandidateImages/
 
+# Recommendation feedback, appended by the launcher and truncated by
+# sync_local_data.py once ingested. Never worth committing: it is a record of
+# what one developer was shown and clicked.
+analytics/feedback_events.log
+
 # =========================
 # Analytics database (SQLite)
 # =========================

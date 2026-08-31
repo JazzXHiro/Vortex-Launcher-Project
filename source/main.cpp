@@ -9,6 +9,7 @@
 
 #include "app_paths.h"
 #include "game_manager.h"
+#include "idle_tracker.h"
 #include "igdb_manager.h"
 #include "metadata_manager.h"
 #include "preference_manager.h"
@@ -368,6 +369,19 @@ static std::vector<UnifiedGame> get_local_games() {
   return games;
 }
 
+// The key a game's playtime is filed under. Was spelled out at each of the three
+// places that needed it; it has to be one function now, because importing a
+// Steam baseline under a key that differs by so much as a prefix from the one
+// record_play_session() writes would strand the imported hours where nothing
+// looks for them.
+static std::string playtime_key(const UnifiedGame &game) {
+  if (game.igdb_id != 0)
+    return "igdb_" + std::to_string(game.igdb_id);
+  if (game.source == GameSource::Steam)
+    return "steam_" + std::to_string(game.appid);
+  return "local_" + make_canonical(game.name);
+}
+
 static std::vector<UnifiedGame> get_steam_games() {
   std::vector<SteamGame> steamGames = read_installed_steam_games();
   std::vector<UnifiedGame> games;
@@ -381,18 +395,46 @@ static std::vector<UnifiedGame> get_steam_games() {
       ug.appid = g.appid;
       games.push_back(std::move(ug));
   }
+
+  // Take Steam's lifetime total for anything Vortex has not accounted for yet,
+  // before any of these games can be launched. import_steam_baseline() is a
+  // no-op once a game has a baseline, so this costs one stats read per scan and
+  // never double counts.
+  for (const UnifiedGame &game : games)
+      import_steam_baseline(playtime_key(game), game.name,
+                            get_steam_playtime_seconds(game.appid));
+
   return games;
 }
 
-// Steam's own total is authoritative for Steam games: it counts sessions started
-// outside Vortex too, which our log never sees. Our record is the fallback for
-// anything Steam has no figure for, and the only source for local games.
+// Vortex's own record is the total for every game. For Steam titles it starts
+// from Steam's lifetime figure, imported once when the game is first seen, and
+// grows from there -- so the history is kept without Vortex having to defer to
+// a number it can attribute no idle time to.
+//
+// The exception is the "use Steam's own total" setting, which hands Steam games
+// back to Steam's live figure for anyone who plays outside the launcher.
 static long long display_playtime_seconds(const UnifiedGame &game, const std::string &key) {
-    if (game.source == GameSource::Steam) {
+    if (game.source == GameSource::Steam && use_steam_playtime()) {
         long long steamSeconds = get_steam_playtime_seconds(game.appid);
         if (steamSeconds > 0) return steamSeconds;
     }
     return get_playtime(key);
+}
+
+// Reports a finished session: the wall clock it actually took, the part of it
+// nobody was at the controls for, and where that leaves the game's running idle
+// total. The duration is printed unaltered on purpose -- it is what the log
+// stores, and a figure quietly missing its idle would not match what is on disk.
+static void report_session(const std::string &key, long long duration,
+                           long long idle_seconds) {
+  cout << "Recorded " << duration << " seconds of playtime";
+  if (idle_seconds > 0)
+    cout << " (idle " << idle_seconds << "s, active "
+         << (duration - idle_seconds) << "s)";
+  cout << ".\n";
+  cout << "Total idle for this game: " << get_idle_time(key)
+       << " seconds.\n";
 }
 
 static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& menu_title) {
@@ -419,9 +461,7 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
           cout << " [favorite]";
       }
 
-      std::string key = (games[i].igdb_id != 0)
-                            ? "igdb_" + std::to_string(games[i].igdb_id)
-                            : (games[i].source == GameSource::Steam ? "steam_" + std::to_string(games[i].appid) : "local_" + make_canonical(games[i].name));
+      std::string key = playtime_key(games[i]);
       long long pt = display_playtime_seconds(games[i], key);
       if (pt > 0)
         cout << " (Playtime: " << (pt / 60) << " min played)";
@@ -458,15 +498,17 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
       if (selected.source == GameSource::Steam) cout << " (AppID: " << selected.appid << ")\n";
       else cout << "\n";
 
-      std::string key = (selected.igdb_id != 0)
-                            ? "igdb_" + std::to_string(selected.igdb_id)
-                            : (selected.source == GameSource::Steam ? "steam_" + std::to_string(selected.appid) : "local_" + make_canonical(selected.name));
+      std::string key = playtime_key(selected);
       long long pt = display_playtime_seconds(selected, key);
       cout << "Total Playtime: ";
       if (pt > 0) {
         cout << (pt / 60) << " minutes (" << pt << " seconds)";
-        if (selected.source == GameSource::Steam && get_steam_playtime_seconds(selected.appid) > 0)
-          cout << " [from Steam]";
+        if (selected.source == GameSource::Steam) {
+          if (use_steam_playtime() && get_steam_playtime_seconds(selected.appid) > 0)
+            cout << " [from Steam]";
+          else if (long long imported = get_baseline_playtime(key))
+            cout << " [incl. " << (imported / 3600) << "h imported from Steam]";
+        }
         cout << "\n";
       } else {
         cout << "Never played\n";
@@ -580,18 +622,26 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
             }
             cout << "Waiting for the game to start...\n";
             std::time_t session_start = 0, session_end = 0;
+            long long idle_seconds = 0;
             if (monitor_steam_session(selected.appid, selected.installDir,
-                                      &session_start, &session_end)) {
+                                      &session_start, &session_end, &idle_seconds)) {
               long long duration = session_end - session_start;
-              record_play_session(key, selected.name, session_start, session_end);
+              record_play_session(key, selected.name, session_start, session_end,
+                                  idle_seconds);
               refresh_steam_playtime();   // Steam writes its own total on exit
-              cout << "Game closed. Recorded " << duration << " seconds of playtime.\n";
+              cout << "Game closed. ";
+              report_session(key, duration, idle_seconds);
             } else {
               cout << "[INFO] The game did not start within 2 minutes. No playtime recorded.\n";
             }
         } else {
+            // launchGame() blocks until the process exits, so the tracker
+            // running its own thread is what makes sampling possible here.
+            IdleTracker idle;
+            idle.start();
             int code = launchGame(selected.gamePath);
             auto end_time = std::time(nullptr);
+            const long long idle_seconds = idle.stop();
             
             if (code != 0) {
               cout << "[INFO] Process exited with code: " << code << "\n";
@@ -599,8 +649,9 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
             
             if (end_time > start_time) {
               long long duration = end_time - start_time;
-              record_play_session(key, selected.name, start_time, end_time);
-              cout << "Recorded " << duration << " seconds of playtime.\n";
+              record_play_session(key, selected.name, start_time, end_time,
+                                  idle_seconds);
+              report_session(key, duration, idle_seconds);
             }
         }
         break; // Return to the main game list after game closes

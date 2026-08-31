@@ -850,7 +850,7 @@ Window {
                                     // shows its new total without a rescan.
                                     text: (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
                                           ? gameDelegate.liveDetails.playtime
-                                          : (gameDelegate.modelData.playtime || "0 Hours")
+                                          : (gameDelegate.modelData.playtime || "0m")
                                     color: "#ddd"
                                     font.pixelSize: 11
                                     font.bold: true

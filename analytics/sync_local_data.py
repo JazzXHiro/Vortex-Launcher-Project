@@ -346,6 +346,17 @@ def collect_games_and_sessions():
                 except ValueError:
                     continue
 
+                # Field 5 is idle seconds, appended after the dates so the four
+                # fields above keep their indices. Rows written before idle was
+                # measured simply do not have it, and stay unattributed rather
+                # than being credited as fully active -- nobody looked.
+                idle = None
+                if len(parts) >= 6:
+                    try:
+                        idle = max(0, min(int(parts[5]), duration))
+                    except ValueError:
+                        idle = None
+
                 try:
                     # "2026-05-01 Mon 10:00:00" -> "2026-05-01 10:00:00"
                     start_dt = datetime.strptime(
@@ -362,6 +373,7 @@ def collect_games_and_sessions():
                     "session_id": session_uuid(game_key, start_dt, end_dt, duration),
                     "game_id": gid,
                     "duration": duration,
+                    "idle": idle,
                     "start": start_dt,
                     "end": end_dt,
                 })
@@ -616,14 +628,28 @@ def sync_data():
     # for the user and reinserting on each game exit.
     added = []
     for s in sessions + derived:
+        # active_seconds / idle_seconds / activity_ratio have been in the schema
+        # all along and were never written; the launcher measures idle now, so
+        # they carry a real figure. They stay NULL for anything with no idle
+        # reading -- synthetic sessions, and rows logged before the measurement
+        # existed -- which is why a reader wanting a number for every row has to
+        # COALESCE onto duration_seconds rather than assume these are populated.
+        idle = s.get("idle")
+        active = None if idle is None else s["duration"] - idle
+        ratio = None
+        if active is not None and s["duration"] > 0:
+            ratio = active / s["duration"]
+
         cur.execute("""
             INSERT INTO sessions
                 (session_id, user_id, game_id, started_at, ended_at,
-                 duration_seconds, synthetic)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 duration_seconds, active_seconds, idle_seconds, activity_ratio,
+                 synthetic)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (session_id) DO NOTHING
         """, (s["session_id"], user_id, s["game_id"], s["start"], s["end"],
-              s["duration"], 1 if s.get("synthetic") else 0))
+              s["duration"], active, idle, ratio,
+              1 if s.get("synthetic") else 0))
         if cur.rowcount:
             added.append(s)
 

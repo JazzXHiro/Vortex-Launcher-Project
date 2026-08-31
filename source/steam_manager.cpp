@@ -1,5 +1,7 @@
 #include "steam_manager.h"
 
+#include "idle_tracker.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -388,7 +390,8 @@ static bool steam_app_active(int appid, const fs::path &installDir) {
 }
 
 bool monitor_steam_session(int appid, const fs::path &installDir,
-                           std::time_t *outStart, std::time_t *outEnd) {
+                           std::time_t *outStart, std::time_t *outEnd,
+                           long long *outIdleSeconds) {
     const int  kStartupTimeoutSeconds = 120;
     const auto kPollInterval          = std::chrono::seconds(2);
 
@@ -412,13 +415,22 @@ bool monitor_steam_session(int appid, const fs::path &installDir,
 
     const std::time_t start = std::time(nullptr);
 
-    // Phase 2 — wait for it to go away.
+    // Phase 2 — wait for it to go away, sampling input the whole time. The
+    // tracker runs its own thread rather than riding this loop so that the
+    // local-game path, which blocks inside WaitForSingleObject and has no loop
+    // at all, can measure idle exactly the same way.
+    IdleTracker idle;
+    idle.start();
+
     while (steam_app_active(appid, installDir))
         std::this_thread::sleep_for(kPollInterval);
 
     const std::time_t end = std::time(nullptr);
+    const long long idleSeconds = idle.stop();
+
     if (outStart) *outStart = start;
     if (outEnd)   *outEnd   = end;
+    if (outIdleSeconds) *outIdleSeconds = idleSeconds;
     return end > start;
 }
 

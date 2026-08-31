@@ -801,6 +801,102 @@ Popup {
                             }
                         }
 
+                        Text {
+                            Layout.topMargin: 8
+                            text: "PLAYTIME"
+                            color: "#666"; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                        }
+
+                        // Which figure a Steam game's playtime comes from.
+                        //
+                        // Off, Vortex uses the total it keeps itself: Steam's
+                        // lifetime figure taken once when the game is first
+                        // seen, plus every session since, with idle time taken
+                        // out. On, Steam games show Steam's own live figure,
+                        // untouched -- it counts play started outside the
+                        // launcher, but nothing measured how much of it was
+                        // spent at a pause menu, so nothing is deducted from it.
+                        //
+                        // Either way Vortex keeps recording, so this can be
+                        // switched back without having lost anything.
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.maximumWidth: 420
+                            spacing: 14
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 3
+
+                                Text {
+                                    text: "Use Steam's own playtime"
+                                    color: "#ddd"; font.pixelSize: 14
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "Steam games show the total Steam reports, exactly as it reports it. "
+                                          + "It counts sessions you started outside Vortex, but none of it can be "
+                                          + "broken down into time played and time idle. Leave this off and Vortex "
+                                          + "tracks them itself, starting from the hours Steam already had."
+                                    color: "#777"; font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
+
+                            Switch {
+                                id: steamPlaytimeSwitch
+
+                                Layout.alignment: Qt.AlignTop
+                                padding: 0
+                                implicitWidth: 52
+                                implicitHeight: 30
+
+                                // Same reason the switches above use a Binding
+                                // element: flicking the switch writes `checked`
+                                // itself, clobbering a plain binding.
+                                Binding {
+                                    target: steamPlaytimeSwitch
+                                    property: "checked"
+                                    value: settingsRoot.api ? settingsRoot.api.useSteamPlaytime : false
+                                }
+
+                                onToggled: {
+                                    if (settingsRoot.api)
+                                        settingsRoot.api.setUseSteamPlaytime(steamPlaytimeSwitch.checked);
+                                }
+
+                                indicator: Rectangle {
+                                    implicitWidth: 52
+                                    implicitHeight: 30
+                                    radius: height / 2
+                                    color: steamPlaytimeSwitch.checked ? "#1e4d2f" : "#141414"
+                                    border.width: 1
+                                    border.color: steamPlaytimeSwitch.checked
+                                                  ? "#27ae60"
+                                                  : (steamPlaytimeSwitch.hovered ? "#3a3a3a" : "#2a2a2a")
+
+                                    Behavior on color { ColorAnimation { duration: 150 } }
+                                    Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                    Rectangle {
+                                        width: 22; height: 22
+                                        radius: height / 2
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        x: steamPlaytimeSwitch.checked ? parent.width - width - 4 : 4
+                                        color: steamPlaytimeSwitch.checked ? "#27ae60" : "#555"
+
+                                        Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                    }
+                                }
+
+                                // The label lives in the RowLayout above, so the
+                                // control itself contributes no extra text.
+                                contentItem: Item {}
+                            }
+                        }
+
                         Item { Layout.fillHeight: true }
                     }
                 }

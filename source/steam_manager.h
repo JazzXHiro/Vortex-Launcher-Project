@@ -61,5 +61,11 @@ bool is_steam_game_running(int appid);
 // Returns false if the game never started within the startup timeout, so a
 // launch that failed or a game stuck behind a large update records nothing
 // rather than a few seconds of noise.
+//
+// outIdleSeconds, when given, receives how much of the session went by with no
+// input. Sampling belongs in here rather than at the call site because it must
+// not begin until the game is actually up -- the wait in phase 1 can run for
+// two minutes, and none of it is time the player was idle in a game.
 bool monitor_steam_session(int appid, const fs::path& installDir,
-                           std::time_t* outStart, std::time_t* outEnd);
+                           std::time_t* outStart, std::time_t* outEnd,
+                           long long* outIdleSeconds = nullptr);

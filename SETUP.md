@@ -1,7 +1,8 @@
 # Vortex
 
 A game launcher for Windows. It finds your Steam and local games, pulls artwork
-and metadata, tracks playtime, and recommends what to play next.
+and metadata, tracks how long you actually play, and recommends what to play
+next.
 
 ## Install
 
@@ -66,6 +67,21 @@ you can keep using Vortex while it works.
 
 Settings → Directories → add a folder. Vortex scans it for game executables.
 Steam games are found automatically and don't need to be added.
+
+## Playtime
+
+Vortex times your sessions itself and takes out the stretches where you were not
+touching anything, so a game left sitting on a pause menu for an hour does not
+add an hour. It waits five minutes of stillness before it stops counting —
+cutscenes, reading a quest log and a slow turn in a turn-based game all still
+count as playing.
+
+Steam games start from the hours Steam already had and add every session since.
+If you would rather see Steam's own figure, there is a switch for it:
+Settings → Playtime → **Use Steam's own playtime**. That number includes
+sessions you started outside Vortex, but nothing measured how much of it was
+idle, so nothing is taken off it. Vortex keeps recording either way, so you can
+switch back without having lost anything.
 
 ## Troubleshooting
 

@@ -25,7 +25,7 @@
 #endif
 
 #define AppName        "Vortex"
-#define AppVersion     "1.1.0"
+#define AppVersion     "1.2.0"
 #define AppPublisher   "Vortex"
 #define AppExeName     "VortexLauncher.exe"
 
@@ -109,6 +109,11 @@ begin
   DeleteFile(AppDir + '\analytics\recommendations_meta.json');
   DeleteFile(AppDir + '\analytics\.igdb_token.json');
   DelTree(AppDir + '\analytics\model\*.pkl', False, True, False);
+
+  { Which recommendations were shown, clicked and launched. sync_local_data.py
+    truncates this once it has folded the events into the database rather than
+    deleting it, so an install always has one sitting there to clean up. }
+  DeleteFile(AppDir + '\analytics\feedback_events.log');
 
   { Credentials. }
   DeleteFile(AppDir + '\analytics\.env');

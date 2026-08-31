@@ -20,6 +20,7 @@ option(VORTEX_DEPLOY_QT "Run windeployqt after building VortexLauncher" ON)
 set(VORTEX_ENGINE_SOURCES
     source/app_paths.cpp
     source/game_manager.cpp
+    source/idle_tracker.cpp
     source/igdb_manager.cpp
     source/json_text.cpp
     source/metadata_manager.cpp

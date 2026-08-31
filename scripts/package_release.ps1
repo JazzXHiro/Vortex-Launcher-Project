@@ -157,11 +157,15 @@ $PersonalFiles = @(
 # a Postgres password. .igdb_token.json is a cached OAuth bearer token. The
 # database and the model files are rebuilt on the recipient's machine --
 # and recommendations.json describes the developer's taste.
+# feedback_events.log is the same class of thing: a line per recommendation the
+# developer was shown, clicked or launched, sitting there until sync_local_data.py
+# folds it into the database.
 $AnalyticsSecretFiles = @(
     'analytics\.env',
     'analytics\.igdb_token.json',
     'analytics\recommendations.json',
     'analytics\recommendations_meta.json',
+    'analytics\feedback_events.log',
     'analytics\model\model_manifest.json',
     'analytics\vortex.sqlite3',
     'analytics\vortex.sqlite3-wal',
@@ -420,6 +424,7 @@ $leaks = @(Get-ChildItem -Path $StageDir -Recurse -File -Force -ErrorAction Sile
         $_.Extension -eq '.pdb' -or
         $_.Name -like '*token*' -or
         $_.Name -eq 'recommendations.json' -or
+        $_.Name -eq 'feedback_events.log' -or
         $_.Name -like 'vortex.sqlite3*' -or
         # .pkl anywhere except inside the bundled interpreter, where joblib and
         # sklearn legitimately ship sample data.

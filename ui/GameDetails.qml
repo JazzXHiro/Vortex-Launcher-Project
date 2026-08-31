@@ -628,8 +628,29 @@ Popup {
                 Column {
                     spacing: 5
                     // Fix 3: Font scale up for readability
+                    //
+                    // The headline is time actually played -- the session total
+                    // with idle taken out -- except for a Steam game showing
+                    // Steam's own figure, which arrives with nothing deducted.
+                    // The caption below says which of the two this is rather
+                    // than leaving the reader to guess why the numbers do not
+                    // subtract.
                     Text { text: "playtime"; color: "#888"; font.pixelSize: 18; font.letterSpacing: 1 }
-                    Text { text: detailsRoot.gameData ? detailsRoot.gameData.playtime : "0 Hours"; color: "white"; font.pixelSize: 32; font.bold: true }
+                    Text { text: detailsRoot.gameData ? detailsRoot.gameData.playtime : "0m"; color: "white"; font.pixelSize: 32; font.bold: true }
+
+                    Text {
+                        visible: detailsRoot.gameData !== null
+                                 && detailsRoot.gameData.idleSeconds !== undefined
+                                 && detailsRoot.gameData.idleSeconds > 0
+                        text: detailsRoot.gameData
+                              ? (detailsRoot.gameData.idleDeducted
+                                     ? detailsRoot.gameData.idleTime + " idle, taken out of "
+                                       + detailsRoot.gameData.totalPlaytime + " total"
+                                     : detailsRoot.gameData.idleTime + " idle observed by Vortex")
+                              : ""
+                        color: "#888"; font.pixelSize: 14
+                    }
+
                     // Fix 5: Brighter color for Last Played
                     Text { text: "Last Played: " + (detailsRoot.gameData ? detailsRoot.gameData.lastPlayed : "Never"); color: "#aaa"; font.pixelSize: 15 }
                 }

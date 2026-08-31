@@ -1,6 +1,7 @@
 #include "vortex_bridge.h"
 #include "app_paths.h"
 #include "game_manager.h"
+#include "idle_tracker.h"
 #include "igdb_manager.h"
 #include "json_text.h"
 #include "metadata_manager.h"
@@ -346,22 +347,62 @@ static QString findImagePath(const fs::path &gameDir, const std::string &type) {
     return "";
 }
 
+// Leading and trailing spaces off one pipe-separated field.
+static std::string trimmed(const std::string &text) {
+    const size_t first = text.find_first_not_of(" \t");
+    if (first == std::string::npos) return std::string();
+    const size_t last = text.find_last_not_of(" \t");
+    return text.substr(first, last - first + 1);
+}
+
 static QString getLastPlayedDate(const std::string &gameKey,
                                  const fs::path &baseDir) {
     std::ifstream file(baseDir / "playtime_sessions.log");
     if (!file.is_open()) return "Never";
-    // The key is the first field of "KEY | NAME | SECONDS | START | END", so it
-    // is matched as a prefix rather than searched for anywhere in the line -- a
-    // plain find() makes "igdb_1877" match every "igdb_18770" session too.
+    // The key is the first field of
+    // "KEY | NAME | SECONDS | START | END | IDLE", so it is matched as a prefix
+    // rather than searched for anywhere in the line -- a plain find() makes
+    // "igdb_1877" match every "igdb_18770" session too.
+    //
+    // The end date is found by counting from the END of the line, not from the
+    // start and not by taking the last pipe outright.
+    //
+    // Taking the last pipe was right until idle was appended behind the dates,
+    // after which it returned the idle seconds -- which parseDateToEpoch scores
+    // as "Never", and the Played tab then sorts on. Counting from the start
+    // instead would have traded that for a different break: a game whose NAME
+    // contains a pipe shifts every field along, and the old reading was immune
+    // to that.
+    //
+    // So: the trailing field is idle when it is a plain integer, and the end
+    // date sits one before it; otherwise the line predates idle and the end
+    // date is last. Dates always carry '-' and ':', so the two never look alike.
     const std::string prefix = gameKey + " |";
     std::string line, lastDate = "Never";
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') continue;
-        if (line.compare(0, prefix.size(), prefix) == 0) {
-            size_t lastPipe = line.find_last_of('|');
-            if (lastPipe != std::string::npos)
-                lastDate = line.substr(lastPipe + 2, 10);
+        if (line.compare(0, prefix.size(), prefix) != 0) continue;
+
+        std::vector<std::string> fields;
+        for (size_t start = 0; start <= line.size();) {
+            const size_t pipe = line.find('|', start);
+            const size_t end  = pipe == std::string::npos ? line.size() : pipe;
+            fields.push_back(trimmed(line.substr(start, end - start)));
+            if (pipe == std::string::npos) break;
+            start = pipe + 1;
         }
+        if (fields.size() < 5) continue;
+
+        const std::string &last = fields.back();
+        const bool trailingIdle =
+            !last.empty() && last.find_first_not_of("0123456789") == std::string::npos;
+
+        const size_t dateAt = fields.size() - (trailingIdle ? 2 : 1);
+        if (dateAt < 4) continue;   // not enough fields ahead of it to be a session
+
+        // "2026-04-28 Tue 19:40:00" -> "2026-04-28"
+        if (fields[dateAt].size() >= 10)
+            lastDate = fields[dateAt].substr(0, 10);
     }
     return QString::fromStdString(lastDate);
 }
@@ -383,14 +424,15 @@ static long long parseDateToEpoch(const QString &date) {
 // Human-readable total, shared by the live rows and by the ledger entries seeded
 // straight out of playtime_stats.txt -- two spellings of the same figure on the
 // same screen is exactly the kind of thing that reads as a bug.
+// Hours and minutes rather than decimal hours -- "15.7 Hours" reads like a
+// broken clock at a glance, even though the .7 was only ever seven tenths.
 static QString formatPlaytimeLabel(long long seconds) {
     if (seconds <= 0)
-        return QStringLiteral("0 Hours");
-    if (seconds < 3600) {
-        const long long mins = std::max(1LL, seconds / 60);
-        return QString::number(mins) + (mins == 1 ? " Minute" : " Minutes");
-    }
-    return QString::number(seconds / 3600.0, 'f', 1) + " Hours";
+        return QStringLiteral("0m");
+    const long long mins = std::max(1LL, seconds / 60);
+    if (mins < 60)
+        return QString::number(mins) + "m";
+    return QString::number(mins / 60) + "h " + QString::number(mins % 60) + "m";
 }
 
 // Builds the playtime key string the same way the CLI does.
@@ -803,10 +845,22 @@ static void writeInstalledGames(const fs::path &baseDir,
         //
         // 0 for local games: there is no external record of those, and
         // any play Vortex saw is already in playtime_sessions.log.
+        //
+        // Only the IMPORTED part is exported while Vortex owns the total.
+        // synthesize_steam_sessions() turns this figure into synthetic
+        // sessions, and playtime_sessions.log already carries every session
+        // Vortex recorded -- exporting Steam's live total, which contains those
+        // same sessions, would have the recommender count them twice. The
+        // baseline is exactly the history the log does not have.
+        //
+        // In "use Steam's own playtime" mode none of the total is Vortex's to
+        // begin with, so Steam's live figure is still what to send.
         long long playtimeSeconds = 0;
         long long lastPlayed = 0;
         if (game.source == "Steam" && game.appid > 0) {
-            playtimeSeconds = get_steam_playtime_seconds(game.appid);
+            playtimeSeconds = use_steam_playtime()
+                                  ? get_steam_playtime_seconds(game.appid)
+                                  : get_play_stat(makePtKey(game)).baseline_seconds;
             lastPlayed = get_steam_last_played(game.appid);
         }
 
@@ -1015,15 +1069,38 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     game["heroPath"]   = findImagePath(gameDir, "hero");
     game["logoPath"]   = findImagePath(gameDir, "logo");
 
-    // Steam's own total wins for Steam games — it includes sessions launched
-    // outside Vortex, which our log never sees. Ours covers everything else.
-    long long ptSec = 0;
-    if (bg.source == "Steam")
-        ptSec = get_steam_playtime_seconds(bg.appid);
-    if (ptSec <= 0)
-        ptSec = get_playtime(ptKey);
+    // One read of the stats file, not one per figure -- this runs for every row
+    // on every list rebuild, and twice per game during a scan.
+    const PlayStat stat = get_play_stat(ptKey);
 
-    game["playtime"]   = formatPlaytimeLabel(ptSec);
+    // Vortex's own record is the total: Steam's lifetime figure imported once
+    // when the game was first seen, plus every session since. The exception is
+    // the "use Steam's own playtime" setting, which hands Steam titles back to
+    // Steam's live figure for anyone who plays outside the launcher.
+
+    long long ptSec        = 0;
+    bool      steamSourced = false;
+    if (use_steam_playtime() && bg.source == "Steam") {
+        ptSec        = get_steam_playtime_seconds(bg.appid);
+        steamSourced = ptSec > 0;
+    }
+    if (ptSec <= 0)
+        ptSec = stat.seconds;
+
+    const long long idleSec = std::min(stat.idle_seconds, ptSec);
+
+    // Steam's figure is displayed exactly as Steam reports it. It covers
+    // sessions Vortex never watched, so taking out idle that was only ever
+    // measured for our own would produce a number meaning neither one thing nor
+    // the other. The flag is on steamSourced rather than the setting because
+    // the fallback above lands on our own total, which idle does apply to.
+    const long long activeSec = steamSourced ? ptSec : ptSec - idleSec;
+
+    game["playtime"]     = formatPlaytimeLabel(activeSec);
+    game["idleTime"]     = formatPlaytimeLabel(idleSec);
+    game["idleSeconds"]  = static_cast<qlonglong>(idleSec);
+    game["idleDeducted"] = !steamSourced;
+    game["totalPlaytime"] = formatPlaytimeLabel(ptSec);
     game["lastPlayed"] = getLastPlayedDate(ptKey, m_baseDir);
 
     // The same three facts in a form something other than a label can use: the
@@ -1031,7 +1108,7 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     // playtimeSeconds. Derived here rather than recomputed there, so the tab and
     // the details page can never disagree about how long you played something.
     game["playKey"]         = QString::fromStdString(ptKey);
-    game["playtimeSeconds"] = static_cast<qlonglong>(ptSec);
+    game["playtimeSeconds"] = static_cast<qlonglong>(activeSec);
 
     // Steam knows the exact second; everything else is pinned to the day its
     // last session ended.
@@ -1819,8 +1896,20 @@ void VortexBridge::seedPlayedLedgerFromStats() {
             entry["steamAppId"] = 0;
         }
 
-        entry["playtimeSeconds"] = static_cast<qlonglong>(stat.seconds);
-        entry["playtime"]        = formatPlaytimeLabel(stat.seconds);
+        // Derived the same way buildGameMap() derives them, so a game that is
+        // still installed and one that is gone cannot disagree about how long
+        // it was played. These rows are always Vortex's own figures -- the
+        // stats file is the only thing left once a game is uninstalled -- so
+        // idle always applies here.
+        const long long ledgerIdle   = std::min(stat.idle_seconds, stat.seconds);
+        const long long ledgerActive = stat.seconds - ledgerIdle;
+
+        entry["playtimeSeconds"] = static_cast<qlonglong>(ledgerActive);
+        entry["playtime"]        = formatPlaytimeLabel(ledgerActive);
+        entry["idleTime"]        = formatPlaytimeLabel(ledgerIdle);
+        entry["idleSeconds"]     = static_cast<qlonglong>(ledgerIdle);
+        entry["idleDeducted"]    = true;
+        entry["totalPlaytime"]   = formatPlaytimeLabel(stat.seconds);
 
         const QString lastPlayed = getLastPlayedDate(stat.key, m_baseDir);
         entry["lastPlayed"]   = lastPlayed;
@@ -2008,6 +2097,8 @@ void VortexBridge::loadSettings() {
         m_ignorePlayedGames = object.value("ignorePlayedGames").toBool(false);
     if (object.contains("ignoreLikedGames"))
         m_ignoreLikedGames = object.value("ignoreLikedGames").toBool(false);
+    if (object.contains("useSteamPlaytime"))
+        m_useSteamPlaytime = object.value("useSteamPlaytime").toBool(false);
 }
 
 void VortexBridge::saveSettings() const {
@@ -2015,6 +2106,9 @@ void VortexBridge::saveSettings() const {
     object["curatedOnly"] = m_curatedOnly;
     object["ignorePlayedGames"] = m_ignorePlayedGames;
     object["ignoreLikedGames"] = m_ignoreLikedGames;
+    // stats_manager::use_steam_playtime() reads this same key straight off disk,
+    // so the CLI shows whichever total the launcher is showing.
+    object["useSteamPlaytime"] = m_useSteamPlaytime;
 
     QFile file(pathToQString(settingsPath()));
     if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -2064,6 +2158,25 @@ void VortexBridge::setIgnoreLikedGames(bool enabled) {
     saveSettings();
     emit ignoreLikedGamesChanged();
     loadRecommendations();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setUseSteamPlaytime — "use Steam's own playtime" toggle from the settings
+// panel. Changes which figure Steam games display, nothing else: the baseline
+// import and the idle tracking run in both positions, so this can be flipped
+// back and forth without losing a session or double counting one.
+// ─────────────────────────────────────────────────────────────────────────────
+void VortexBridge::setUseSteamPlaytime(bool enabled) {
+    if (enabled == m_useSteamPlaytime)
+        return;
+    m_useSteamPlaytime = enabled;
+    saveSettings();
+    emit useSteamPlaytimeChanged();
+
+    // Rebuild rather than re-rank, and no rescan: every number this changes is
+    // already on disk, and the recommender was never given either of them.
+    // refreshGameList() re-syncs the Played ledger on its way through.
+    refreshGameList();
 }
 
 bool VortexBridge::isWishlisted(QString name) const {
@@ -2274,6 +2387,31 @@ void VortexBridge::loadGames() {
 
             updateGameRow(i, bg);
             reportScanProgress("Fetching details", i + 1, total);
+        }
+
+        // --- Steam baseline import ----------------------------------------
+        // Take Steam's lifetime total for any game Vortex has not accounted for
+        // yet, so a library that was played for years before the launcher
+        // existed does not read as never played.
+        //
+        // This has to sit AFTER pass 2. A Steam game that IGDB resolved is
+        // filed under "igdb_<id>", and importing under the "steam_<appid>" key
+        // it carried before resolution would strand the hours under a key
+        // record_play_session() never writes to.
+        //
+        // It also runs whatever the "use Steam's own playtime" setting says.
+        // Skipping it while that setting is on would let the first session
+        // recorded in that mode create the row, closing the import window for
+        // good -- and turning the setting off afterwards would then show a
+        // total with every pre-Vortex hour missing.
+        //
+        // A no-op once a game has a baseline, so this is one stats read per
+        // Steam game per scan and cannot double count.
+        for (const BridgeGame &bg : internalGames) {
+            if (bg.source != "Steam" || bg.appid <= 0) continue;
+            if (import_steam_baseline(makePtKey(bg), bg.name,
+                                      get_steam_playtime_seconds(bg.appid)))
+                vlog::line("Scan", "imported Steam playtime for " + bg.name);
         }
 
         // Real outcomes, not a separate poll: whether the keys WORK is a
@@ -2681,19 +2819,29 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
         bool        syncOk       = true;
         bool        material     = false;
 
+        long long idleSeconds = 0;
+
         if (found.source == "Steam") {
             launch_steam_game_by_appid(found.appid);
 
             // Steam's protocol launch hands back no process to wait on, so the
             // session is observed: wait for the game to appear, then to go away.
+            // Idle sampling belongs inside that call -- it must not start until
+            // the game is actually up, or the wait for it counts as idle.
             played = monitor_steam_session(found.appid, found.installDir,
-                                           &sessionStart, &sessionEnd);
+                                           &sessionStart, &sessionEnd,
+                                           &idleSeconds);
         } else {
             sessionStart = std::time(nullptr);
-            // launchGame() in game_manager blocks until the process exits.
+            // launchGame() in game_manager blocks until the process exits, so
+            // the tracker running its own thread is what lets the local path
+            // measure idle the same way the Steam one does.
+            IdleTracker idle;
+            idle.start();
             ::launchGame(found.gamePath);
-            sessionEnd = std::time(nullptr);
-            played     = sessionEnd > sessionStart;
+            idleSeconds = idle.stop();
+            sessionEnd  = std::time(nullptr);
+            played      = sessionEnd > sessionStart;
         }
 
         if (!played) {
@@ -2708,10 +2856,17 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
         if (played) {
             const long long durationSeconds =
                 static_cast<long long>(sessionEnd - sessionStart);
-            vlog::item("Play", found.name, vlog::Status::Ok,
-                       "played for " + formatDuration(durationSeconds));
 
-            record_play_session(ptKey, found.name, sessionStart, sessionEnd);
+            // The duration is reported unaltered, with idle beside it rather
+            // than taken out of it -- that is what goes in the log, and a
+            // figure quietly missing its idle would not match what is on disk.
+            std::string played_for = "played for " + formatDuration(durationSeconds);
+            if (idleSeconds > 0)
+                played_for += " (" + formatDuration(idleSeconds) + " idle)";
+            vlog::item("Play", found.name, vlog::Status::Ok, played_for);
+
+            record_play_session(ptKey, found.name, sessionStart, sessionEnd,
+                                idleSeconds);
 
             // Steam persists its own total when the game exits — drop our cached
             // copy so the refreshed list picks the new figure up.

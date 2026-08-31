@@ -63,8 +63,8 @@ DATE_COLUMNS = frozenset({"released_at"})
 
 
 # sqlite3's built-in date/datetime adapters were deprecated in Python 3.12 and
-# emit a DeprecationWarning on every bind. The callers here (ingest_session.py,
-# sync_local_data.py) hold real datetime objects, and the schema stores ISO-8601
+# emit a DeprecationWarning on every bind. The caller here (sync_local_data.py)
+# holds real datetime objects, and the schema stores ISO-8601
 # text, so register the conversion explicitly rather than relying on a default
 # that is on its way out.
 sqlite3.register_adapter(datetime.datetime, lambda v: v.isoformat(sep=" "))
