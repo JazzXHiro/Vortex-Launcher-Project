@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Vortex
 
 // Shown once, on a fresh install, before the user has entered any credentials.
 //
@@ -37,13 +38,13 @@ Popup {
     padding: 0
 
     background: Rectangle {
-        color: "#121212"
+        color: Theme.bgPanel
         radius: 20
-        border.color: "#252525"
+        border.color: Theme.borderQuiet
         border.width: 1
     }
 
-    Overlay.modal: Rectangle { color: "#cc000000" }
+    Overlay.modal: Rectangle { color: Theme.scrim }
 
     function finish() {
         wizardRoot.close();
@@ -137,7 +138,7 @@ Popup {
             spacing: 8
             Text {
                 text: fieldRoot.label
-                color: "#bbb"
+                color: Theme.textSecondary
                 font.pixelSize: 13
                 font.bold: true
             }
@@ -147,7 +148,7 @@ Popup {
             Text {
                 visible: fieldRoot.alreadySet
                 text: "already set — leave blank to keep"
-                color: "#27ae60"
+                color: Theme.positive
                 font.pixelSize: 11
             }
         }
@@ -156,9 +157,9 @@ Popup {
             Layout.fillWidth: true
             Layout.preferredHeight: 38
             radius: 8
-            color: "#0d0d0d"
+            color: Theme.bgSunken
             border.width: 1
-            border.color: input.activeFocus ? "#4a4a4a" : "#252525"
+            border.color: input.activeFocus ? Theme.borderStrong : Theme.borderQuiet
 
             TextField {
                 id: input
@@ -166,12 +167,12 @@ Popup {
                 anchors.leftMargin: 12
                 anchors.rightMargin: 12
                 verticalAlignment: TextInput.AlignVCenter
-                color: "white"
+                color: Theme.textPrimary
                 font.pixelSize: 13
                 selectByMouse: true
                 background: null
                 placeholderText: fieldRoot.hint
-                placeholderTextColor: "#444"
+                placeholderTextColor: Theme.textGhost
             }
         }
     }
@@ -180,7 +181,7 @@ Popup {
     component ExternalLink: Text {
         id: linkRoot
         property string url: ""
-        color: linkArea.containsMouse ? "#5dade2" : "#3498db"
+        color: linkArea.containsMouse ? Theme.linkHover : Theme.link
         font.pixelSize: 12
         font.underline: linkArea.containsMouse
 
@@ -209,7 +210,7 @@ Popup {
 
                 Text {
                     text: "Welcome to Vortex"
-                    color: "white"
+                    color: Theme.textPrimary
                     font.pixelSize: 30
                     font.bold: true
                 }
@@ -217,7 +218,7 @@ Popup {
                 Text {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    color: "#999"
+                    color: Theme.textSecondary
                     font.pixelSize: 14
                     lineHeight: 1.3
                     text: "Your Steam library, playtime tracking and recommendations "
@@ -228,12 +229,12 @@ Popup {
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 1
-                    color: "#252525"
+                    color: Theme.divider
                 }
 
                 Text {
                     text: "Two optional, free accounts add:"
-                    color: "#bbb"
+                    color: Theme.textSecondary
                     font.pixelSize: 13
                     font.bold: true
                 }
@@ -263,14 +264,14 @@ Popup {
                                 Layout.fillWidth: true
                                 Text {
                                     text: benefitRow.modelData.title
-                                    color: "white"
+                                    color: Theme.textPrimary
                                     font.pixelSize: 14
                                 }
                                 Text {
                                     Layout.fillWidth: true
                                     wrapMode: Text.WordWrap
                                     text: benefitRow.modelData.body
-                                    color: "#777"
+                                    color: Theme.textMuted
                                     font.pixelSize: 12
                                 }
                             }
@@ -284,7 +285,7 @@ Popup {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     text: "You can do this later from Settings at any time."
-                    color: "#555"
+                    color: Theme.textFaint
                     font.pixelSize: 12
                 }
             }
@@ -295,7 +296,7 @@ Popup {
 
                 Text {
                     text: "API keys"
-                    color: "white"
+                    color: Theme.textPrimary
                     font.pixelSize: 26
                     font.bold: true
                 }
@@ -303,7 +304,7 @@ Popup {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     text: "Both are free. Fill in either, both, or neither."
-                    color: "#999"
+                    color: Theme.textSecondary
                     font.pixelSize: 13
                 }
 
@@ -315,7 +316,7 @@ Popup {
                         spacing: 8
                         Text {
                             text: "IGDB — via Twitch"
-                            color: "#888"
+                            color: Theme.textMuted
                             font.pixelSize: 12
                             font.bold: true
                             font.letterSpacing: 1
@@ -330,7 +331,7 @@ Popup {
                         wrapMode: Text.WordWrap
                         text: "Set the OAuth redirect URL to http://localhost — it is not used. "
                             + "The client secret is shown only once, at creation."
-                        color: "#666"
+                        color: Theme.textFaint
                         font.pixelSize: 11
                     }
                 }
@@ -352,14 +353,14 @@ Popup {
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 1
-                    color: "#252525"
+                    color: Theme.divider
                 }
 
                 RowLayout {
                     spacing: 8
                     Text {
                         text: "STEAMGRIDDB"
-                        color: "#888"
+                        color: Theme.textMuted
                         font.pixelSize: 12
                         font.bold: true
                         font.letterSpacing: 1
@@ -387,7 +388,7 @@ Popup {
 
                 Text {
                     text: "Build the Discover catalog"
-                    color: "white"
+                    color: Theme.textPrimary
                     font.pixelSize: 26
                     font.bold: true
                 }
@@ -396,7 +397,7 @@ Popup {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     lineHeight: 1.3
-                    color: "#999"
+                    color: Theme.textSecondary
                     font.pixelSize: 14
                     text: "Vortex can download around 5,700 games from IGDB to recommend "
                         + "titles you don't already own. This takes several minutes and "
@@ -409,14 +410,14 @@ Popup {
                     visible: !wizardRoot.api.credentialStatus().igdb
                     text: "IGDB credentials are not set, so this step is unavailable. "
                         + "Your own library is still recommended normally."
-                    color: "#e67e22"
+                    color: Theme.warning
                     font.pixelSize: 12
                 }
 
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 1
-                    color: "#252525"
+                    color: Theme.divider
                 }
 
                 RowLayout {
@@ -428,12 +429,12 @@ Popup {
                         Layout.preferredHeight: 42
                         radius: 10
                         color: wizardRoot.api.isCatalogRefreshing()
-                                   ? "#1a1a1a"
-                                   : (catalogArea.containsMouse ? "#ffffff" : "#1a1a1a")
+                                   ? Theme.bgRaised
+                                   : (catalogArea.containsMouse ? Theme.accent : Theme.bgRaised)
                         border.width: 1
                         border.color: wizardRoot.api.isCatalogRefreshing()
-                                          ? "#333"
-                                          : (catalogArea.containsMouse ? "#ffffff" : "#333")
+                                          ? Theme.borderControl
+                                          : (catalogArea.containsMouse ? Theme.focusRing : Theme.borderControl)
 
                         Text {
                             anchors.centerIn: parent
@@ -443,8 +444,8 @@ Popup {
                             font.pixelSize: 14
                             font.bold: true
                             color: wizardRoot.api.isCatalogRefreshing()
-                                       ? "#777"
-                                       : (catalogArea.containsMouse ? "#000000" : "#ffffff")
+                                       ? Theme.textMuted
+                                       : (catalogArea.containsMouse ? Theme.textInverse : Theme.textPrimary)
                         }
 
                         MouseArea {
@@ -476,7 +477,7 @@ Popup {
                     wrapMode: Text.WordWrap
                     text: "Skipping is fine — Discover stays sparse until you run this "
                         + "from Settings later."
-                    color: "#555"
+                    color: Theme.textFaint
                     font.pixelSize: 12
                 }
 
@@ -493,7 +494,7 @@ Popup {
             visible: wizardRoot.statusMessage !== ""
             text: wizardRoot.statusMessage
             wrapMode: Text.WordWrap
-            color: wizardRoot.statusIsError ? "#e74c3c" : "#27ae60"
+            color: wizardRoot.statusIsError ? Theme.danger : Theme.positive
             font.pixelSize: 12
         }
 
@@ -501,7 +502,7 @@ Popup {
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 72
-            color: "#0d0d0d"
+            color: Theme.bgSunken
             radius: 20
 
             // The radius above rounds all four corners; cover the top two so
@@ -510,7 +511,7 @@ Popup {
                 anchors.top: parent.top
                 width: parent.width
                 height: 20
-                color: "#0d0d0d"
+                color: Theme.bgSunken
             }
 
             RowLayout {
@@ -530,7 +531,7 @@ Popup {
                             width: 7
                             height: 7
                             radius: 4
-                            color: stepDot.index === wizardRoot.pane ? "#ffffff" : "#333"
+                            color: stepDot.index === wizardRoot.pane ? Theme.accent : Theme.bgInert
                         }
                     }
                 }
@@ -543,14 +544,14 @@ Popup {
                     Layout.preferredWidth: 96
                     Layout.preferredHeight: 40
                     radius: 10
-                    color: skipArea.containsMouse ? "#1f1f1f" : "transparent"
+                    color: skipArea.containsMouse ? Theme.bgActive : "transparent"
                     border.width: 1
-                    border.color: "#333"
+                    border.color: Theme.borderControl
 
                     Text {
                         anchors.centerIn: parent
                         text: wizardRoot.pane === 2 ? "Skip" : "Skip all"
-                        color: "#999"
+                        color: Theme.textSecondary
                         font.pixelSize: 13
                     }
                     MouseArea {
@@ -567,14 +568,14 @@ Popup {
                     Layout.preferredWidth: 88
                     Layout.preferredHeight: 40
                     radius: 10
-                    color: backArea.containsMouse ? "#1f1f1f" : "transparent"
+                    color: backArea.containsMouse ? Theme.bgActive : "transparent"
                     border.width: 1
-                    border.color: "#333"
+                    border.color: Theme.borderControl
 
                     Text {
                         anchors.centerIn: parent
                         text: "Back"
-                        color: "#999"
+                        color: Theme.textSecondary
                         font.pixelSize: 13
                     }
                     MouseArea {
@@ -593,14 +594,14 @@ Popup {
                     Layout.preferredWidth: 130
                     Layout.preferredHeight: 40
                     radius: 10
-                    color: nextArea.containsMouse ? "#ffffff" : "#1a1a1a"
+                    color: nextArea.containsMouse ? Theme.accent : Theme.bgRaised
                     border.width: 1
-                    border.color: nextArea.containsMouse ? "#ffffff" : "#333"
+                    border.color: nextArea.containsMouse ? Theme.focusRing : Theme.borderControl
 
                     Text {
                         anchors.centerIn: parent
                         text: wizardRoot.pane === 2 ? "Finish" : "Continue"
-                        color: nextArea.containsMouse ? "#000000" : "#ffffff"
+                        color: nextArea.containsMouse ? Theme.textInverse : Theme.textPrimary
                         font.pixelSize: 14
                         font.bold: true
                     }

@@ -73,6 +73,11 @@ qt_policy(SET QTP0001 NEW)
 qt_policy(SET QTP0004 NEW)
 
 # 5. Define the QML module with an explicit prefix
+# Theme.qml is the palette every view imports. It has to be marked a singleton
+# before qt_add_qml_module sees it, or the generated qmldir declares it as an
+# ordinary type and "Theme.bgWindow" fails to resolve at load time.
+set_source_files_properties(ui/Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)
+
 qt_add_qml_module(VortexLauncher
     URI Vortex
     VERSION 1.0
@@ -84,10 +89,12 @@ qt_add_qml_module(VortexLauncher
         QtQuick.Effects
         QtQuick.Layouts
     QML_FILES
+        ui/Theme.qml
         ui/main.qml
         ui/GameDetails.qml
         ui/FirstRunWizard.qml
         ui/SettingsWindow.qml
+        ui/TileMenu.qml
         ui/VortexScrollBar.qml
     RESOURCES
         ui/assets/steam.png

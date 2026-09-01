@@ -35,15 +35,22 @@ class VortexBridge : public QObject {
     // Owned games the user hearted, and saved unowned games. Separate concepts:
     // a favourite is taste (and feeds the recommender), a wishlist entry is
     // intent to acquire (and deliberately does not).
-    // gameListChanged is sufficient: every path that alters a favourite goes
-    // through updatePreference() or resetPreferences(), both of which call
-    // refreshGameList().
-    Q_PROPERTY(QVariantList favoriteGames READ favoriteGames NOTIFY gameListChanged)
+    // Deliberately NOT notified by gameListChanged. The library grid binds to
+    // gameList as a plain JS array, so that signal hands GridView a new array
+    // and throws the scroll position away -- which is what sent the library
+    // back to the top every time a game was hearted. Bulk paths still emit
+    // both (refreshGameList); updatePreference() edits the one row in place
+    // and emits this alone.
+    Q_PROPERTY(QVariantList favoriteGames READ favoriteGames NOTIFY favoritesChanged)
     Q_PROPERTY(QVariantList wishlistGames READ wishlistGames NOTIFY wishlistChanged)
     // Everything ever played, whether or not it is still on the machine. Backed
     // by a ledger rather than by gameList, because the whole point is the games
     // that are no longer there -- see loadPlayedLedger().
     Q_PROPERTY(QVariantList playedGames READ playedGames NOTIFY playedGamesChanged)
+    // Games the user took out of the launcher without uninstalling them. The
+    // scan honours this list, so a removed game does not come back on the next
+    // rescan; Settings lists them so one can be put back.
+    Q_PROPERTY(QVariantList removedGames READ removedGames NOTIFY removedGamesChanged)
     // "Only well-known games" in Settings. Restricts the DISCOVER section to
     // titles that are popular, very well rated or newly released; the library
     // section is untouched, because owned rows carry no rating counts at all.
@@ -108,8 +115,11 @@ public:
     QVariantList gameList()    const { return m_gameList;    }
     QVariantList recommendationList() const { return m_recommendationList; }
     QVariantList favoriteGames() const;
-    QVariantList wishlistGames() const { return m_wishlist; }
+    // The saved entries only. m_wishlist also holds rows whose entry has been
+    // taken off the list -- see toggleWishlist() -- which this filters out.
+    QVariantList wishlistGames() const;
     QVariantList playedGames() const;
+    QVariantList removedGames() const { return m_removed; }
     bool         isLoading()   const { return m_isLoading;   }
     bool         isRecommendationLoading() const { return m_isRecommendationLoading; }
     int          currentMood() const { return m_currentMood; }
@@ -192,6 +202,17 @@ public:
     Q_INVOKABLE void   launchGameFrom(QString name, QString origin);
     Q_INVOKABLE void   logRecommendationClick(QString name, int rank);
     Q_INVOKABLE void   uninstallGame(QString name);
+
+    // Hides a game from the launcher WITHOUT touching its files -- the counter
+    // part to uninstallGame(), for a title that is installed and staying that
+    // way but has no business being in the library. installDir is passed
+    // alongside the name because it is the only identity that survives pass 2
+    // renaming a local game (see gameDetailsForInstallDir).
+    Q_INVOKABLE void   removeFromLibrary(QString name, QString installDir);
+
+    // Puts one back. Needs a full rescan: the game is gone from
+    // m_internalGames, and only the scan can rebuild it from the disk.
+    Q_INVOKABLE void   restoreToLibrary(QString name);
     // Returns true only when a new directory was actually stored, so the UI can
     // tell "added" apart from "already in the list".
     Q_INVOKABLE bool   addLocalGameDirectory(QString folderUrl);
@@ -216,6 +237,12 @@ public:
     // images per candidate to show at most one pair. No-op for owned games,
     // which already have SteamGridDB art under Images/.
     Q_INVOKABLE void   ensureArtwork(QString name);
+
+    // Developer, genres, rating and time-to-beat for one unowned pick, on the
+    // same lazy terms as ensureArtwork(). A row copied out of a live list
+    // already carries them and this no-ops; the case it exists for is a
+    // favourite that outlived every list and has only a name to go on.
+    Q_INVOKABLE void   ensureMetadata(QString name);
 
     // ---- First-run credentials -------------------------------------------
     // Vortex runs with no credentials at all: the Steam library, playtime and
@@ -254,7 +281,9 @@ public:
 signals:
     void wishlistChanged();
     void playedGamesChanged();
+    void removedGamesChanged();
     void gameListChanged();
+    void favoritesChanged();
     void recommendationListChanged();
     void loadingChanged();
     void recommendationLoadingChanged();
@@ -288,6 +317,10 @@ private:
     // Persisted play history. Keyed by the same playtime key stats_manager uses,
     // and only ever added to, so an uninstalled game keeps its row.
     QVariantList            m_playedLedger;
+    // Games removed from the library. Records rather than bare names: identity
+    // is appid / installDir / canonical name in that order, and only a record
+    // can carry all three.
+    QVariantList            m_removed;
     std::vector<BridgeGame> m_internalGames;
     bool                    m_isLoading   = false;
     bool                    m_rescanQueued = false;  // scan requested while one was running
@@ -361,6 +394,15 @@ private:
     void        saveWishlist() const;
     fs::path    wishlistPath() const;
 
+    // ---- Removed games ----------------------------------------------------
+    void        loadRemovedGames();
+    void        saveRemovedGames() const;
+    fs::path    removedGamesPath() const;
+
+    // Name-only match, for the lists that hold snapshots rather than live rows
+    // (favourite snapshots, the played ledger).
+    bool        isRemovedName(const QString &name) const;
+
     // ---- Played ledger ----------------------------------------------------
     // Same reasoning as the wishlist and the favourite snapshots: an entry with
     // no row in gameList has nothing to draw a card or a details page from, so
@@ -417,6 +459,18 @@ private:
     // Points heroPath/logoPath at whatever is now on disk for one game, in
     // every list that carries it, and emits so the open details page re-reads.
     void        rebindArtwork(const QString &name);
+
+    // The metadata counterpart of rebindArtwork(): writes one resolved IGDB
+    // id's fields into every list holding that name, and emits for each.
+    void        applyResolvedMetadata(const QString &name, long long igdbId);
+
+    // Names this session has asked IGDB about. Entered before the request and
+    // cleared only when one comes back with an id, so it covers both "already
+    // in flight" and "IGDB has no answer for this" -- the second of which would
+    // otherwise repeat the lookup on every page open. Session-lived on purpose:
+    // igdb_resolve_game() persists what it learns, so a restart costs at most
+    // one more request per unresolvable title.
+    QSet<QString>           m_metadataAsked;
 
     // "<stem>|<kind>" of each download in flight, so reopening a details page
     // mid-download does not start a second request for the same image.

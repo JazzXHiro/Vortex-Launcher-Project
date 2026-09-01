@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Vortex
 
 // Floating settings panel. The left column lists setting sections; the right
 // pane shows the active one. New sections go in the `sections` list and get
@@ -10,19 +11,20 @@ Popup {
     id: settingsRoot
 
     property var api: vortexApi
-    readonly property var sections: ["Directories", "Recommendations"]
+    readonly property var sections: ["Directories", "Removed games", "Recommendations"]
     property string activeSection: "Directories"
     property string statusMessage: ""
 
     // Mood ids match scoring.MOOD_LABELS / MOOD_NAMES in analytics/scoring.py
     // and the picker cards in main.qml. The names are user-visible in both
     // places — explain() writes "Fits your <name> mood" onto the cards — so
-    // they must not drift apart.
+    // they must not drift apart. The accents no longer can: both this list and
+    // main.qml's cards read them from Theme.
     readonly property var moods: [
-        { id: 3, name: "Neutral",     icon: "🎯", accent: "#7f8c8d" },
-        { id: 0, name: "Relaxed",     icon: "🌿", accent: "#27ae60" },
-        { id: 1, name: "Competitive", icon: "⚔️", accent: "#e74c3c" },
-        { id: 2, name: "Immersive",   icon: "🌌", accent: "#9b59b6" }
+        { id: 3, name: "Neutral",     icon: "🎯", accent: Theme.moodNeutral },
+        { id: 0, name: "Relaxed",     icon: "🌿", accent: Theme.moodRelaxed },
+        { id: 1, name: "Competitive", icon: "⚔️", accent: Theme.moodCompetitive },
+        { id: 2, name: "Immersive",   icon: "🌌", accent: Theme.moodImmersive }
     ]
 
     // Position of a mood id in `moods`. Falls back to 0 — Neutral, which is
@@ -94,9 +96,9 @@ Popup {
     }
 
     background: Rectangle {
-        color: "#121212"
+        color: Theme.bgPanel
         radius: 20
-        border.color: "#252525"
+        border.color: Theme.borderQuiet
         border.width: 1
     }
 
@@ -108,7 +110,7 @@ Popup {
             id: sidebar
             Layout.preferredWidth: 230
             Layout.fillHeight: true
-            color: "#0d0d0d"
+            color: Theme.bgSunken
             radius: 20
 
             // Square off the inner edge so only the outer corners stay rounded.
@@ -124,7 +126,7 @@ Popup {
 
                 Text {
                     text: "SETTINGS"
-                    color: "#666"; font.pixelSize: 12; font.bold: true; font.letterSpacing: 2
+                    color: Theme.textFaint; font.pixelSize: 12; font.bold: true; font.letterSpacing: 2
                 }
 
                 Column {
@@ -139,13 +141,13 @@ Popup {
 
                             width: parent.width; height: 40; radius: 8
                             color: settingsRoot.activeSection === sectionButton.modelData
-                                   ? "#1f1f1f"
-                                   : (sectionArea.containsMouse ? "#181818" : "transparent")
+                                   ? Theme.bgActive
+                                   : (sectionArea.containsMouse ? Theme.bgRaised : "transparent")
 
                             Rectangle {
                                 anchors { left: parent.left; verticalCenter: parent.verticalCenter }
                                 width: 3; height: 20; radius: 2
-                                color: "white"
+                                color: Theme.accent
                                 visible: settingsRoot.activeSection === sectionButton.modelData
                             }
 
@@ -154,7 +156,7 @@ Popup {
                                 text: sectionButton.modelData
                                 font.pixelSize: 14
                                 font.bold: settingsRoot.activeSection === sectionButton.modelData
-                                color: settingsRoot.activeSection === sectionButton.modelData ? "white" : "#888"
+                                color: settingsRoot.activeSection === sectionButton.modelData ? Theme.textPrimary : Theme.textMuted
                             }
 
                             MouseArea {
@@ -174,7 +176,7 @@ Popup {
             }
         }
 
-        Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; color: "#252525" }
+        Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; color: Theme.divider }
 
         // ── RIGHT PANE: active section ───────────────────────────────────────
         Item {
@@ -186,8 +188,8 @@ Popup {
                 anchors { top: parent.top; right: parent.right; margins: 20 }
                 z: 5
                 width: 32; height: 32; radius: 16
-                color: closeArea.containsMouse ? "#252525" : "transparent"
-                Text { anchors.centerIn: parent; text: "✕"; color: "#888"; font.pixelSize: 14 }
+                color: closeArea.containsMouse ? Theme.bgEmphasis : "transparent"
+                Text { anchors.centerIn: parent; text: "✕"; color: Theme.textMuted; font.pixelSize: 14 }
                 MouseArea {
                     id: closeArea
                     anchors.fill: parent
@@ -205,7 +207,7 @@ Popup {
                     Layout.fillWidth: true
                     Layout.rightMargin: 40
                     text: settingsRoot.activeSection
-                    color: "white"; font.pixelSize: 24; font.bold: true
+                    color: Theme.textPrimary; font.pixelSize: 24; font.bold: true
                 }
 
                 // One page per entry in `sections`, in the same order.
@@ -221,7 +223,7 @@ Popup {
                         Text {
                             Layout.fillWidth: true
                             text: "Folders Vortex scans for locally installed games."
-                            color: "#888"; font.pixelSize: 14
+                            color: Theme.textMuted; font.pixelSize: 14
                             wrapMode: Text.WordWrap
                         }
 
@@ -229,8 +231,8 @@ Popup {
                         Rectangle {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            color: "#0d0d0d"; radius: 10
-                            border.color: "#222"; border.width: 1
+                            color: Theme.bgSunken; radius: 10
+                            border.color: Theme.borderQuiet; border.width: 1
                             clip: true
 
                             Text {
@@ -239,7 +241,7 @@ Popup {
                                 visible: dirList.count === 0
                                 text: "No game folders configured yet.\nUse the button below to add one."
                                 horizontalAlignment: Text.AlignHCenter
-                                color: "#555"; font.pixelSize: 14
+                                color: Theme.textFaint; font.pixelSize: 14
                                 wrapMode: Text.WordWrap
                             }
 
@@ -263,9 +265,9 @@ Popup {
 
                                     width: dirList.width - 20
                                     height: 46; radius: 8
-                                    color: dirRow.armed ? "#231717" : "#161616"
+                                    color: dirRow.armed ? Theme.dangerBgSubtle : Theme.bgSurface
                                     border.width: 1
-                                    border.color: dirRow.armed ? "#5c2b2b" : "transparent"
+                                    border.color: dirRow.armed ? Theme.dangerBorder : "transparent"
 
                                     // Hover tracking only — the row itself is not clickable.
                                     MouseArea {
@@ -278,7 +280,7 @@ Popup {
                                     Text {
                                         anchors { left: parent.left; leftMargin: 14; verticalCenter: parent.verticalCenter }
                                         text: (dirRow.index + 1) + "."
-                                        color: "#555"; font.pixelSize: 13
+                                        color: Theme.textFaint; font.pixelSize: 13
                                     }
 
                                     Text {
@@ -288,7 +290,7 @@ Popup {
                                             verticalCenter: parent.verticalCenter
                                         }
                                         text: dirRow.modelData
-                                        color: dirRow.armed ? "#999" : "#ddd"; font.pixelSize: 14
+                                        color: dirRow.armed ? Theme.textSecondary : Theme.textBody; font.pixelSize: 14
                                         elide: Text.ElideMiddle
                                     }
 
@@ -300,11 +302,11 @@ Popup {
 
                                         Rectangle {
                                             width: 86; height: 28; radius: 14
-                                            color: confirmArea.containsMouse ? "#e74c3c" : "#c0392b"
+                                            color: confirmArea.containsMouse ? Theme.danger : Theme.dangerRest
                                             Text {
                                                 anchors.centerIn: parent
                                                 text: "REMOVE"
-                                                color: "white"; font.pixelSize: 10; font.bold: true; font.letterSpacing: 1
+                                                color: Theme.textPrimary; font.pixelSize: 10; font.bold: true; font.letterSpacing: 1
                                             }
                                             MouseArea {
                                                 id: confirmArea
@@ -321,12 +323,12 @@ Popup {
 
                                         Rectangle {
                                             width: 74; height: 28; radius: 14
-                                            color: cancelArea.containsMouse ? "#2b2b2b" : "transparent"
-                                            border.color: "#3a3a3a"; border.width: 1
+                                            color: cancelArea.containsMouse ? Theme.bgEmphasis : "transparent"
+                                            border.color: Theme.borderControl; border.width: 1
                                             Text {
                                                 anchors.centerIn: parent
                                                 text: "CANCEL"
-                                                color: "#aaa"; font.pixelSize: 10; font.bold: true; font.letterSpacing: 1
+                                                color: Theme.textSecondary; font.pixelSize: 10; font.bold: true; font.letterSpacing: 1
                                             }
                                             MouseArea {
                                                 id: cancelArea
@@ -343,12 +345,12 @@ Popup {
                                         width: 26; height: 26; radius: 13
                                         visible: !dirRow.armed
                                         opacity: rowHover.containsMouse || removeArea.containsMouse ? 1.0 : 0.35
-                                        color: removeArea.containsMouse ? "#c0392b" : "transparent"
+                                        color: removeArea.containsMouse ? Theme.dangerRest : "transparent"
 
                                         Text {
                                             anchors.centerIn: parent
                                             text: "✕"
-                                            color: removeArea.containsMouse ? "white" : "#777"
+                                            color: removeArea.containsMouse ? Theme.textPrimary : Theme.textMuted
                                             font.pixelSize: 12
                                         }
 
@@ -369,14 +371,14 @@ Popup {
 
                             Rectangle {
                                 implicitWidth: 190; implicitHeight: 42; radius: 21
-                                color: addDirArea.containsMouse ? "#ffffff" : "#1a1a1a"
-                                border.color: addDirArea.containsMouse ? "#ffffff" : "#333"
+                                color: addDirArea.containsMouse ? Theme.accent : Theme.bgRaised
+                                border.color: addDirArea.containsMouse ? Theme.focusRing : Theme.borderControl
 
                                 Text {
                                     anchors.centerIn: parent
                                     text: "+ ADD DIRECTORY"
                                     font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                                    color: addDirArea.containsMouse ? "black" : "#aaa"
+                                    color: addDirArea.containsMouse ? Theme.textInverse : Theme.textSecondary
                                 }
 
                                 MouseArea {
@@ -390,514 +392,666 @@ Popup {
                             Text {
                                 Layout.fillWidth: true
                                 text: settingsRoot.statusMessage
-                                color: "#888"; font.pixelSize: 13
+                                color: Theme.textMuted; font.pixelSize: 13
                                 elide: Text.ElideRight
                             }
                         }
                     }
 
-                    // ── PAGE: Recommendations ────────────────────────────────
+                    // ── PAGE: Removed games ──────────────────────────────────
+                    //
+                    // Games taken out of the library from a card's ⋮ menu. The
+                    // scan honours that list, so this page is the only way
+                    // back — which is the reason it exists at all.
                     ColumnLayout {
                         spacing: 18
 
                         Text {
                             Layout.fillWidth: true
-                            text: "How Vortex ranks the picks on the Recommendations tab."
-                            color: "#888"; font.pixelSize: 14
+                            text: "Games hidden from the library. Their files were never touched — "
+                                  + "restoring one puts it back where it was."
+                            color: Theme.textMuted; font.pixelSize: 14
                             wrapMode: Text.WordWrap
                         }
 
-                        Text {
-                            text: "MOOD"
-                            color: "#666"; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
-                        }
-
-                        // The same four moods as the startup picker, reachable
-                        // again without restarting. Picking one re-ranks only —
-                        // it does not rescan the disk, so it is cheap enough to
-                        // change on a whim.
-                        ComboBox {
-                            id: moodPicker
-
+                        Rectangle {
                             Layout.fillWidth: true
-                            Layout.maximumWidth: 260
-                            Layout.preferredHeight: 46
+                            Layout.fillHeight: true
+                            color: Theme.bgSunken; radius: 10
+                            border.color: Theme.borderQuiet; border.width: 1
+                            clip: true
 
-                            model: settingsRoot.moods
-                            padding: 0
-                            rightPadding: 36
-
-                            // currentIndex is -1 until the first assignment lands.
-                            readonly property var selected:
-                                settingsRoot.moods[Math.max(0, moodPicker.currentIndex)]
-
-                            // api.currentMood is the source of truth, but choosing an
-                            // item makes ComboBox write currentIndex itself, which
-                            // would clobber a plain binding. A Binding element keeps
-                            // reapplying, so a mood set anywhere else still shows here.
-                            Binding {
-                                target: moodPicker
-                                property: "currentIndex"
-                                value: settingsRoot.moodIndex(
-                                           settingsRoot.api ? settingsRoot.api.currentMood : 3)
+                            Text {
+                                anchors.centerIn: parent
+                                width: parent.width - 60
+                                visible: removedList.count === 0
+                                // "three-dot" rather than a ⋮ glyph: no font
+                                // family is set anywhere in this UI, and the
+                                // one the panel falls back to draws it as a
+                                // hairline that reads as a stray pipe.
+                                text: "Nothing removed.\nUse the three-dot button on a game card to take one out of the library."
+                                horizontalAlignment: Text.AlignHCenter
+                                color: Theme.textFaint; font.pixelSize: 14
+                                wrapMode: Text.WordWrap
                             }
 
-                            onActivated: function (index) {
-                                if (settingsRoot.api)
-                                    settingsRoot.api.setMood(settingsRoot.moods[index].id);
-                            }
+                            ListView {
+                                id: removedList
+                                anchors.fill: parent
+                                anchors.margins: 10
+                                clip: true
+                                spacing: 6
 
-                            background: Rectangle {
-                                radius: 10
-                                color: moodPicker.hovered ? "#181818" : "#111111"
-                                border.width: 1
-                                border.color: moodPicker.popup.visible
-                                              ? moodPicker.selected.accent : "#2a2a2a"
+                                model: settingsRoot.api ? settingsRoot.api.removedGames : []
 
-                                Behavior on color { ColorAnimation { duration: 150 } }
-                                Behavior on border.color { ColorAnimation { duration: 150 } }
-                            }
+                                ScrollBar.vertical: VortexScrollBar { }
 
-                            contentItem: Item {
-                                Text {
-                                    id: pickerIcon
-                                    anchors { left: parent.left; leftMargin: 14; verticalCenter: parent.verticalCenter }
-                                    text: moodPicker.selected.icon
-                                    font.pixelSize: 18
-                                }
+                                delegate: Rectangle {
+                                    id: removedRow
+                                    // An object rather than a path string: the
+                                    // record carries the identity keys the
+                                    // bridge matches on as well as the title.
+                                    required property var modelData
 
-                                Text {
-                                    anchors {
-                                        left: pickerIcon.right; leftMargin: 12
-                                        right: parent.right
-                                        verticalCenter: parent.verticalCenter
-                                    }
-                                    text: moodPicker.selected.name.toUpperCase()
-                                    color: moodPicker.selected.accent
-                                    font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                                    elide: Text.ElideRight
-                                }
-                            }
+                                    width: removedList.width - 20
+                                    height: 46; radius: 8
+                                    color: Theme.bgSurface
 
-                            indicator: Text {
-                                anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
-                                text: "▾"
-                                color: "#777"; font.pixelSize: 12
-                                rotation: moodPicker.popup.visible ? 180 : 0
-                                Behavior on rotation { NumberAnimation { duration: 150 } }
-                            }
-
-                            delegate: ItemDelegate {
-                                id: moodItem
-                                required property int index
-                                required property var modelData
-
-                                readonly property bool current: moodPicker.currentIndex === moodItem.index
-
-                                width: moodItem.ListView.view ? moodItem.ListView.view.width : moodPicker.width
-                                height: 42
-                                padding: 0
-
-                                background: Rectangle {
-                                    radius: 8
-                                    color: moodItem.hovered ? "#1f1f1f"
-                                                            : (moodItem.current ? "#1a1a1a" : "transparent")
-                                }
-
-                                contentItem: Item {
-                                    Text {
-                                        id: itemIcon
-                                        anchors { left: parent.left; leftMargin: 12; verticalCenter: parent.verticalCenter }
-                                        text: moodItem.modelData.icon
-                                        font.pixelSize: 16
+                                    // Hover tracking only — the row itself is
+                                    // not clickable, exactly as above.
+                                    MouseArea {
+                                        id: removedRowHover
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        acceptedButtons: Qt.NoButton
                                     }
 
                                     Text {
                                         anchors {
-                                            left: itemIcon.right; leftMargin: 12
-                                            right: parent.right; rightMargin: 12
+                                            left: parent.left; leftMargin: 16
+                                            right: parent.right; rightMargin: 190
                                             verticalCenter: parent.verticalCenter
                                         }
-                                        text: moodItem.modelData.name.toUpperCase()
-                                        color: moodItem.current ? moodItem.modelData.accent : "#ccc"
+                                        text: removedRow.modelData.name
+                                        color: Theme.textBody; font.pixelSize: 14
+                                        elide: Text.ElideRight
+                                    }
+
+                                    Text {
+                                        anchors {
+                                            right: parent.right; rightMargin: 116
+                                            verticalCenter: parent.verticalCenter
+                                        }
+                                        text: removedRow.modelData.source || ""
+                                        color: Theme.textFaint; font.pixelSize: 11
+                                        font.bold: true; font.letterSpacing: 1
+                                    }
+
+                                    // No confirm step: putting a game back
+                                    // cannot lose anything.
+                                    Rectangle {
+                                        anchors { right: parent.right; rightMargin: 12; verticalCenter: parent.verticalCenter }
+                                        width: 92; height: 28; radius: 14
+                                        color: restoreArea.containsMouse ? Theme.accent : "transparent"
+                                        border.color: restoreArea.containsMouse ? Theme.focusRing : Theme.borderControl
+                                        border.width: 1
+                                        opacity: removedRowHover.containsMouse
+                                                 || restoreArea.containsMouse ? 1.0 : 0.55
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: "RESTORE"
+                                            color: restoreArea.containsMouse ? Theme.textInverse : Theme.textSecondary
+                                            font.pixelSize: 10; font.bold: true; font.letterSpacing: 1
+                                        }
+
+                                        MouseArea {
+                                            id: restoreArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            onClicked: {
+                                                if (!settingsRoot.api) return;
+                                                // Restoring rescans the disk, so
+                                                // reuse the wait the add-directory
+                                                // button already reports with.
+                                                settingsRoot.awaitingScan = true;
+                                                settingsRoot.statusMessage =
+                                                    "Restoring " + removedRow.modelData.name
+                                                    + " — rescanning library…";
+                                                settingsRoot.api.restoreToLibrary(removedRow.modelData.name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: settingsRoot.statusMessage
+                            color: Theme.textMuted; font.pixelSize: 13
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    // ── PAGE: Recommendations ────────────────────────────────
+                    // Taller than the popup at any window size, so the page
+                    // scrolls rather than squeezing its sections. Same Flickable
+                    // + VortexScrollBar pairing as the recommendations tab.
+                    Flickable {
+                        id: recsPage
+
+                        clip: true
+                        contentWidth: width
+                        contentHeight: recsColumn.height
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: VortexScrollBar { }
+
+                        ColumnLayout {
+                            id: recsColumn
+
+                            // Leaves the scrollbar's 14px gutter free, so the
+                            // wrapping description text never runs under it.
+                            width: recsPage.width - 14
+                            spacing: 18
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: "How Vortex ranks the picks on the Recommendations tab."
+                                color: Theme.textMuted; font.pixelSize: 14
+                                wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                                text: "MOOD"
+                                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                            }
+
+                            // The same four moods as the startup picker, reachable
+                            // again without restarting. Picking one re-ranks only —
+                            // it does not rescan the disk, so it is cheap enough to
+                            // change on a whim.
+                            ComboBox {
+                                id: moodPicker
+
+                                Layout.fillWidth: true
+                                Layout.maximumWidth: 260
+                                Layout.preferredHeight: 46
+
+                                model: settingsRoot.moods
+                                padding: 0
+                                rightPadding: 36
+
+                                // currentIndex is -1 until the first assignment lands.
+                                readonly property var selected:
+                                    settingsRoot.moods[Math.max(0, moodPicker.currentIndex)]
+
+                                // api.currentMood is the source of truth, but choosing an
+                                // item makes ComboBox write currentIndex itself, which
+                                // would clobber a plain binding. A Binding element keeps
+                                // reapplying, so a mood set anywhere else still shows here.
+                                Binding {
+                                    target: moodPicker
+                                    property: "currentIndex"
+                                    value: settingsRoot.moodIndex(
+                                               settingsRoot.api ? settingsRoot.api.currentMood : 3)
+                                }
+
+                                onActivated: function (index) {
+                                    if (settingsRoot.api)
+                                        settingsRoot.api.setMood(settingsRoot.moods[index].id);
+                                }
+
+                                background: Rectangle {
+                                    radius: 10
+                                    color: moodPicker.hovered ? Theme.bgRaised : Theme.bgPanel
+                                    border.width: 1
+                                    border.color: moodPicker.popup.visible
+                                                  ? moodPicker.selected.accent : Theme.borderMuted
+
+                                    Behavior on color { ColorAnimation { duration: 150 } }
+                                    Behavior on border.color { ColorAnimation { duration: 150 } }
+                                }
+
+                                contentItem: Item {
+                                    Text {
+                                        id: pickerIcon
+                                        anchors { left: parent.left; leftMargin: 14; verticalCenter: parent.verticalCenter }
+                                        text: moodPicker.selected.icon
+                                        font.pixelSize: 18
+                                    }
+
+                                    Text {
+                                        anchors {
+                                            left: pickerIcon.right; leftMargin: 12
+                                            right: parent.right
+                                            verticalCenter: parent.verticalCenter
+                                        }
+                                        text: moodPicker.selected.name.toUpperCase()
+                                        color: moodPicker.selected.accent
                                         font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
                                         elide: Text.ElideRight
                                     }
                                 }
-                            }
 
-                            popup: Popup {
-                                y: moodPicker.height + 6
-                                width: moodPicker.width
-                                implicitHeight: contentItem.implicitHeight + 12
-                                padding: 6
-
-                                background: Rectangle {
-                                    color: "#141414"; radius: 10
-                                    border.color: "#2a2a2a"; border.width: 1
+                                indicator: Text {
+                                    anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
+                                    text: "▾"
+                                    color: Theme.textMuted; font.pixelSize: 12
+                                    rotation: moodPicker.popup.visible ? 180 : 0
+                                    Behavior on rotation { NumberAnimation { duration: 150 } }
                                 }
 
-                                contentItem: ListView {
-                                    clip: true
-                                    implicitHeight: contentHeight
-                                    spacing: 2
-                                    model: moodPicker.delegateModel
-                                    currentIndex: moodPicker.highlightedIndex
-                                }
-                            }
-                        }
+                                delegate: ItemDelegate {
+                                    id: moodItem
+                                    required property int index
+                                    required property var modelData
 
-                        Text {
-                            Layout.topMargin: 8
-                            text: "QUALITY FILTER"
-                            color: "#666"; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
-                        }
+                                    readonly property bool current: moodPicker.currentIndex === moodItem.index
 
-                        // Restricts the Discover picks to games that are widely
-                        // played, highly rated or newly released. The library
-                        // section is deliberately excluded: owned rows carry no
-                        // rating counts at all, so "popular" cannot be answered
-                        // for them, and the pool is only 18 games for 10 slots.
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.maximumWidth: 420
-                            spacing: 14
+                                    width: moodItem.ListView.view ? moodItem.ListView.view.width : moodPicker.width
+                                    height: 42
+                                    padding: 0
 
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 3
+                                    background: Rectangle {
+                                        radius: 8
+                                        color: moodItem.hovered ? Theme.bgActive
+                                                                : (moodItem.current ? Theme.bgRaised : "transparent")
+                                    }
 
-                                Text {
-                                    text: "Only well-known games"
-                                    color: "#ddd"; font.pixelSize: 14
-                                }
+                                    contentItem: Item {
+                                        Text {
+                                            id: itemIcon
+                                            anchors { left: parent.left; leftMargin: 12; verticalCenter: parent.verticalCenter }
+                                            text: moodItem.modelData.icon
+                                            font.pixelSize: 16
+                                        }
 
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: "Limits discovery picks to games that are widely played, "
-                                          + "highly rated, or newly released. Your own library is unaffected."
-                                    color: "#777"; font.pixelSize: 12
-                                    wrapMode: Text.WordWrap
-                                }
-                            }
-
-                            Switch {
-                                id: curatedSwitch
-
-                                Layout.alignment: Qt.AlignTop
-                                padding: 0
-                                implicitWidth: 52
-                                implicitHeight: 30
-
-                                // api.curatedOnly is the source of truth, but flicking the
-                                // switch makes Switch write `checked` itself, which would
-                                // clobber a plain binding -- the same reason the mood
-                                // ComboBox above uses a Binding element for currentIndex.
-                                Binding {
-                                    target: curatedSwitch
-                                    property: "checked"
-                                    value: settingsRoot.api ? settingsRoot.api.curatedOnly : false
-                                }
-
-                                onToggled: {
-                                    if (settingsRoot.api)
-                                        settingsRoot.api.setCuratedOnly(curatedSwitch.checked);
-                                }
-
-                                indicator: Rectangle {
-                                    implicitWidth: 52
-                                    implicitHeight: 30
-                                    radius: height / 2
-                                    color: curatedSwitch.checked ? "#1e4d2f" : "#141414"
-                                    border.width: 1
-                                    border.color: curatedSwitch.checked
-                                                  ? "#27ae60"
-                                                  : (curatedSwitch.hovered ? "#3a3a3a" : "#2a2a2a")
-
-                                    Behavior on color { ColorAnimation { duration: 150 } }
-                                    Behavior on border.color { ColorAnimation { duration: 150 } }
-
-                                    Rectangle {
-                                        width: 22; height: 22
-                                        radius: height / 2
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        x: curatedSwitch.checked ? parent.width - width - 4 : 4
-                                        color: curatedSwitch.checked ? "#27ae60" : "#555"
-
-                                        Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                        Text {
+                                            anchors {
+                                                left: itemIcon.right; leftMargin: 12
+                                                right: parent.right; rightMargin: 12
+                                                verticalCenter: parent.verticalCenter
+                                            }
+                                            text: moodItem.modelData.name.toUpperCase()
+                                            color: moodItem.current ? moodItem.modelData.accent : Theme.textBody
+                                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                            elide: Text.ElideRight
+                                        }
                                     }
                                 }
 
-                                // The label lives in the RowLayout above, so the
-                                // control itself contributes no extra text.
-                                contentItem: Item {}
+                                popup: Popup {
+                                    y: moodPicker.height + 6
+                                    width: moodPicker.width
+                                    implicitHeight: contentItem.implicitHeight + 12
+                                    padding: 6
+
+                                    background: Rectangle {
+                                        color: Theme.bgSurface; radius: 10
+                                        border.color: Theme.borderMuted; border.width: 1
+                                    }
+
+                                    contentItem: ListView {
+                                        clip: true
+                                        implicitHeight: contentHeight
+                                        spacing: 2
+                                        model: moodPicker.delegateModel
+                                        currentIndex: moodPicker.highlightedIndex
+                                    }
+                                }
                             }
-                        }
 
-                        Text {
-                            Layout.topMargin: 8
-                            text: "PROFILE"
-                            color: "#666"; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
-                        }
+                            Text {
+                                Layout.topMargin: 8
+                                text: "QUALITY FILTER"
+                                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                            }
 
-                        // Drops the games you have actually played from the
-                        // profile the moods rank with, leaving the mood itself
-                        // and your hearted games. Neutral is deliberately
-                        // exempt -- it has no mood weights to fall back on, so
-                        // without a history it would rank on ratings alone.
-                        // Played games stay out of the results either way.
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.maximumWidth: 420
-                            spacing: 14
-
-                            ColumnLayout {
+                            // Restricts the Discover picks to games that are widely
+                            // played, highly rated or newly released. The library
+                            // section is deliberately excluded: owned rows carry no
+                            // rating counts at all, so "popular" cannot be answered
+                            // for them, and the pool is only 18 games for 10 slots.
+                            RowLayout {
                                 Layout.fillWidth: true
-                                spacing: 3
+                                Layout.maximumWidth: 420
+                                spacing: 14
 
-                                Text {
-                                    text: "Ignore games you've played"
-                                    color: "#ddd"; font.pixelSize: 14
-                                }
-
-                                Text {
+                                ColumnLayout {
                                     Layout.fillWidth: true
-                                    text: "Relaxed, Competitive and Immersive stop using your playtime, "
-                                          + "and go on the mood and your favourites instead. Neutral is unaffected."
-                                    color: "#777"; font.pixelSize: 12
-                                    wrapMode: Text.WordWrap
-                                }
-                            }
+                                    spacing: 3
 
-                            Switch {
-                                id: ignorePlayedSwitch
+                                    Text {
+                                        text: "Only well-known games"
+                                        color: Theme.textBody; font.pixelSize: 14
+                                    }
 
-                                Layout.alignment: Qt.AlignTop
-                                padding: 0
-                                implicitWidth: 52
-                                implicitHeight: 30
-
-                                // Same reason curatedSwitch above uses a Binding
-                                // element: flicking the switch makes it write
-                                // `checked` itself, clobbering a plain binding.
-                                Binding {
-                                    target: ignorePlayedSwitch
-                                    property: "checked"
-                                    value: settingsRoot.api ? settingsRoot.api.ignorePlayedGames : false
-                                }
-
-                                onToggled: {
-                                    if (settingsRoot.api)
-                                        settingsRoot.api.setIgnorePlayedGames(ignorePlayedSwitch.checked);
-                                }
-
-                                indicator: Rectangle {
-                                    implicitWidth: 52
-                                    implicitHeight: 30
-                                    radius: height / 2
-                                    color: ignorePlayedSwitch.checked ? "#1e4d2f" : "#141414"
-                                    border.width: 1
-                                    border.color: ignorePlayedSwitch.checked
-                                                  ? "#27ae60"
-                                                  : (ignorePlayedSwitch.hovered ? "#3a3a3a" : "#2a2a2a")
-
-                                    Behavior on color { ColorAnimation { duration: 150 } }
-                                    Behavior on border.color { ColorAnimation { duration: 150 } }
-
-                                    Rectangle {
-                                        width: 22; height: 22
-                                        radius: height / 2
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        x: ignorePlayedSwitch.checked ? parent.width - width - 4 : 4
-                                        color: ignorePlayedSwitch.checked ? "#27ae60" : "#555"
-
-                                        Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: "Limits discovery picks to games that are widely played, "
+                                              + "highly rated, or newly released. Your own library is unaffected."
+                                        color: Theme.textMuted; font.pixelSize: 12
+                                        wrapMode: Text.WordWrap
                                     }
                                 }
 
-                                // The label lives in the RowLayout above, so the
-                                // control itself contributes no extra text.
-                                contentItem: Item {}
-                            }
-                        }
+                                Switch {
+                                    id: curatedSwitch
 
-                        // The counterpart. A game that was played AND hearted
-                        // counts as played, so it survives this one and only
-                        // the pure hearts go -- the same call the cards make
-                        // when they say "played" rather than "liked".
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.maximumWidth: 420
-                            spacing: 14
-
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 3
-
-                                Text {
-                                    text: "Ignore games you've liked"
-                                    color: "#ddd"; font.pixelSize: 14
-                                }
-
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: "Drops your favourites from the same three moods. "
-                                          + "Turn both of these on and the picks come from the mood alone."
-                                    color: "#777"; font.pixelSize: 12
-                                    wrapMode: Text.WordWrap
-                                }
-                            }
-
-                            Switch {
-                                id: ignoreLikedSwitch
-
-                                Layout.alignment: Qt.AlignTop
-                                padding: 0
-                                implicitWidth: 52
-                                implicitHeight: 30
-
-                                // Binding element, same reason as the two switches above.
-                                Binding {
-                                    target: ignoreLikedSwitch
-                                    property: "checked"
-                                    value: settingsRoot.api ? settingsRoot.api.ignoreLikedGames : false
-                                }
-
-                                onToggled: {
-                                    if (settingsRoot.api)
-                                        settingsRoot.api.setIgnoreLikedGames(ignoreLikedSwitch.checked);
-                                }
-
-                                indicator: Rectangle {
+                                    Layout.alignment: Qt.AlignTop
+                                    padding: 0
                                     implicitWidth: 52
                                     implicitHeight: 30
-                                    radius: height / 2
-                                    color: ignoreLikedSwitch.checked ? "#1e4d2f" : "#141414"
-                                    border.width: 1
-                                    border.color: ignoreLikedSwitch.checked
-                                                  ? "#27ae60"
-                                                  : (ignoreLikedSwitch.hovered ? "#3a3a3a" : "#2a2a2a")
 
-                                    Behavior on color { ColorAnimation { duration: 150 } }
-                                    Behavior on border.color { ColorAnimation { duration: 150 } }
+                                    // api.curatedOnly is the source of truth, but flicking the
+                                    // switch makes Switch write `checked` itself, which would
+                                    // clobber a plain binding -- the same reason the mood
+                                    // ComboBox above uses a Binding element for currentIndex.
+                                    Binding {
+                                        target: curatedSwitch
+                                        property: "checked"
+                                        value: settingsRoot.api ? settingsRoot.api.curatedOnly : false
+                                    }
 
-                                    Rectangle {
-                                        width: 22; height: 22
+                                    onToggled: {
+                                        if (settingsRoot.api)
+                                            settingsRoot.api.setCuratedOnly(curatedSwitch.checked);
+                                    }
+
+                                    indicator: Rectangle {
+                                        implicitWidth: 52
+                                        implicitHeight: 30
                                         radius: height / 2
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        x: ignoreLikedSwitch.checked ? parent.width - width - 4 : 4
-                                        color: ignoreLikedSwitch.checked ? "#27ae60" : "#555"
+                                        color: curatedSwitch.checked ? Theme.positiveBg : Theme.bgSurface
+                                        border.width: 1
+                                        border.color: curatedSwitch.checked
+                                                      ? Theme.positive
+                                                      : (curatedSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
 
-                                        Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                                         Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                        Rectangle {
+                                            width: 22; height: 22
+                                            radius: height / 2
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            x: curatedSwitch.checked ? parent.width - width - 4 : 4
+                                            color: curatedSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
+
+                                            Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                            Behavior on color { ColorAnimation { duration: 150 } }
+                                        }
+                                    }
+
+                                    // The label lives in the RowLayout above, so the
+                                    // control itself contributes no extra text.
+                                    contentItem: Item {}
+                                }
+                            }
+
+                            Text {
+                                Layout.topMargin: 8
+                                text: "PROFILE"
+                                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                            }
+
+                            // Drops the games you have actually played from the
+                            // profile the moods rank with, leaving the mood itself
+                            // and your hearted games. Neutral is deliberately
+                            // exempt -- it has no mood weights to fall back on, so
+                            // without a history it would rank on ratings alone.
+                            // Played games stay out of the results either way.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.maximumWidth: 420
+                                spacing: 14
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 3
+
+                                    Text {
+                                        text: "Ignore games you've played"
+                                        color: Theme.textBody; font.pixelSize: 14
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: "Relaxed, Competitive and Immersive stop using your playtime, "
+                                              + "and go on the mood and your favourites instead. Neutral is unaffected."
+                                        color: Theme.textMuted; font.pixelSize: 12
+                                        wrapMode: Text.WordWrap
                                     }
                                 }
 
-                                // The label lives in the RowLayout above, so the
-                                // control itself contributes no extra text.
-                                contentItem: Item {}
-                            }
-                        }
+                                Switch {
+                                    id: ignorePlayedSwitch
 
-                        Text {
-                            Layout.topMargin: 8
-                            text: "PLAYTIME"
-                            color: "#666"; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
-                        }
-
-                        // Which figure a Steam game's playtime comes from.
-                        //
-                        // Off, Vortex uses the total it keeps itself: Steam's
-                        // lifetime figure taken once when the game is first
-                        // seen, plus every session since, with idle time taken
-                        // out. On, Steam games show Steam's own live figure,
-                        // untouched -- it counts play started outside the
-                        // launcher, but nothing measured how much of it was
-                        // spent at a pause menu, so nothing is deducted from it.
-                        //
-                        // Either way Vortex keeps recording, so this can be
-                        // switched back without having lost anything.
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.maximumWidth: 420
-                            spacing: 14
-
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 3
-
-                                Text {
-                                    text: "Use Steam's own playtime"
-                                    color: "#ddd"; font.pixelSize: 14
-                                }
-
-                                Text {
-                                    Layout.fillWidth: true
-                                    text: "Steam games show the total Steam reports, exactly as it reports it. "
-                                          + "It counts sessions you started outside Vortex, but none of it can be "
-                                          + "broken down into time played and time idle. Leave this off and Vortex "
-                                          + "tracks them itself, starting from the hours Steam already had."
-                                    color: "#777"; font.pixelSize: 12
-                                    wrapMode: Text.WordWrap
-                                }
-                            }
-
-                            Switch {
-                                id: steamPlaytimeSwitch
-
-                                Layout.alignment: Qt.AlignTop
-                                padding: 0
-                                implicitWidth: 52
-                                implicitHeight: 30
-
-                                // Same reason the switches above use a Binding
-                                // element: flicking the switch writes `checked`
-                                // itself, clobbering a plain binding.
-                                Binding {
-                                    target: steamPlaytimeSwitch
-                                    property: "checked"
-                                    value: settingsRoot.api ? settingsRoot.api.useSteamPlaytime : false
-                                }
-
-                                onToggled: {
-                                    if (settingsRoot.api)
-                                        settingsRoot.api.setUseSteamPlaytime(steamPlaytimeSwitch.checked);
-                                }
-
-                                indicator: Rectangle {
+                                    Layout.alignment: Qt.AlignTop
+                                    padding: 0
                                     implicitWidth: 52
                                     implicitHeight: 30
-                                    radius: height / 2
-                                    color: steamPlaytimeSwitch.checked ? "#1e4d2f" : "#141414"
-                                    border.width: 1
-                                    border.color: steamPlaytimeSwitch.checked
-                                                  ? "#27ae60"
-                                                  : (steamPlaytimeSwitch.hovered ? "#3a3a3a" : "#2a2a2a")
 
-                                    Behavior on color { ColorAnimation { duration: 150 } }
-                                    Behavior on border.color { ColorAnimation { duration: 150 } }
+                                    // Same reason curatedSwitch above uses a Binding
+                                    // element: flicking the switch makes it write
+                                    // `checked` itself, clobbering a plain binding.
+                                    Binding {
+                                        target: ignorePlayedSwitch
+                                        property: "checked"
+                                        value: settingsRoot.api ? settingsRoot.api.ignorePlayedGames : false
+                                    }
 
-                                    Rectangle {
-                                        width: 22; height: 22
+                                    onToggled: {
+                                        if (settingsRoot.api)
+                                            settingsRoot.api.setIgnorePlayedGames(ignorePlayedSwitch.checked);
+                                    }
+
+                                    indicator: Rectangle {
+                                        implicitWidth: 52
+                                        implicitHeight: 30
                                         radius: height / 2
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        x: steamPlaytimeSwitch.checked ? parent.width - width - 4 : 4
-                                        color: steamPlaytimeSwitch.checked ? "#27ae60" : "#555"
+                                        color: ignorePlayedSwitch.checked ? Theme.positiveBg : Theme.bgSurface
+                                        border.width: 1
+                                        border.color: ignorePlayedSwitch.checked
+                                                      ? Theme.positive
+                                                      : (ignorePlayedSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
 
-                                        Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
                                         Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                        Rectangle {
+                                            width: 22; height: 22
+                                            radius: height / 2
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            x: ignorePlayedSwitch.checked ? parent.width - width - 4 : 4
+                                            color: ignorePlayedSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
+
+                                            Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                            Behavior on color { ColorAnimation { duration: 150 } }
+                                        }
+                                    }
+
+                                    // The label lives in the RowLayout above, so the
+                                    // control itself contributes no extra text.
+                                    contentItem: Item {}
+                                }
+                            }
+
+                            // The counterpart. A game that was played AND hearted
+                            // counts as played, so it survives this one and only
+                            // the pure hearts go -- the same call the cards make
+                            // when they say "played" rather than "liked".
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.maximumWidth: 420
+                                spacing: 14
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 3
+
+                                    Text {
+                                        text: "Ignore games you've liked"
+                                        color: Theme.textBody; font.pixelSize: 14
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: "Drops your favourites from the same three moods. "
+                                              + "Turn both of these on and the picks come from the mood alone."
+                                        color: Theme.textMuted; font.pixelSize: 12
+                                        wrapMode: Text.WordWrap
                                     }
                                 }
 
-                                // The label lives in the RowLayout above, so the
-                                // control itself contributes no extra text.
-                                contentItem: Item {}
+                                Switch {
+                                    id: ignoreLikedSwitch
+
+                                    Layout.alignment: Qt.AlignTop
+                                    padding: 0
+                                    implicitWidth: 52
+                                    implicitHeight: 30
+
+                                    // Binding element, same reason as the two switches above.
+                                    Binding {
+                                        target: ignoreLikedSwitch
+                                        property: "checked"
+                                        value: settingsRoot.api ? settingsRoot.api.ignoreLikedGames : false
+                                    }
+
+                                    onToggled: {
+                                        if (settingsRoot.api)
+                                            settingsRoot.api.setIgnoreLikedGames(ignoreLikedSwitch.checked);
+                                    }
+
+                                    indicator: Rectangle {
+                                        implicitWidth: 52
+                                        implicitHeight: 30
+                                        radius: height / 2
+                                        color: ignoreLikedSwitch.checked ? Theme.positiveBg : Theme.bgSurface
+                                        border.width: 1
+                                        border.color: ignoreLikedSwitch.checked
+                                                      ? Theme.positive
+                                                      : (ignoreLikedSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
+
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                        Rectangle {
+                                            width: 22; height: 22
+                                            radius: height / 2
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            x: ignoreLikedSwitch.checked ? parent.width - width - 4 : 4
+                                            color: ignoreLikedSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
+
+                                            Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                            Behavior on color { ColorAnimation { duration: 150 } }
+                                        }
+                                    }
+
+                                    // The label lives in the RowLayout above, so the
+                                    // control itself contributes no extra text.
+                                    contentItem: Item {}
+                                }
+                            }
+
+                            Text {
+                                Layout.topMargin: 8
+                                text: "PLAYTIME"
+                                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                            }
+
+                            // Which figure a Steam game's playtime comes from.
+                            //
+                            // Off, Vortex uses the total it keeps itself: Steam's
+                            // lifetime figure taken once when the game is first
+                            // seen, plus every session since, with idle time taken
+                            // out. On, Steam games show Steam's own live figure,
+                            // untouched -- it counts play started outside the
+                            // launcher, but nothing measured how much of it was
+                            // spent at a pause menu, so nothing is deducted from it.
+                            //
+                            // Either way Vortex keeps recording, so this can be
+                            // switched back without having lost anything.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.maximumWidth: 420
+                                spacing: 14
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 3
+
+                                    Text {
+                                        text: "Use Steam's own playtime"
+                                        color: Theme.textBody; font.pixelSize: 14
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: "Steam games show the total Steam reports, exactly as it reports it. "
+                                              + "It counts sessions you started outside Vortex, but none of it can be "
+                                              + "broken down into time played and time idle. Leave this off and Vortex "
+                                              + "tracks them itself, starting from the hours Steam already had."
+                                        color: Theme.textMuted; font.pixelSize: 12
+                                        wrapMode: Text.WordWrap
+                                    }
+                                }
+
+                                Switch {
+                                    id: steamPlaytimeSwitch
+
+                                    Layout.alignment: Qt.AlignTop
+                                    padding: 0
+                                    implicitWidth: 52
+                                    implicitHeight: 30
+
+                                    // Same reason the switches above use a Binding
+                                    // element: flicking the switch writes `checked`
+                                    // itself, clobbering a plain binding.
+                                    Binding {
+                                        target: steamPlaytimeSwitch
+                                        property: "checked"
+                                        value: settingsRoot.api ? settingsRoot.api.useSteamPlaytime : false
+                                    }
+
+                                    onToggled: {
+                                        if (settingsRoot.api)
+                                            settingsRoot.api.setUseSteamPlaytime(steamPlaytimeSwitch.checked);
+                                    }
+
+                                    indicator: Rectangle {
+                                        implicitWidth: 52
+                                        implicitHeight: 30
+                                        radius: height / 2
+                                        color: steamPlaytimeSwitch.checked ? Theme.positiveBg : Theme.bgSurface
+                                        border.width: 1
+                                        border.color: steamPlaytimeSwitch.checked
+                                                      ? Theme.positive
+                                                      : (steamPlaytimeSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
+
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                        Rectangle {
+                                            width: 22; height: 22
+                                            radius: height / 2
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            x: steamPlaytimeSwitch.checked ? parent.width - width - 4 : 4
+                                            color: steamPlaytimeSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
+
+                                            Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                            Behavior on color { ColorAnimation { duration: 150 } }
+                                        }
+                                    }
+
+                                    // The label lives in the RowLayout above, so the
+                                    // control itself contributes no extra text.
+                                    contentItem: Item {}
+                                }
                             }
                         }
-
-                        Item { Layout.fillHeight: true }
                     }
                 }
             }

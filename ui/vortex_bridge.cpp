@@ -70,6 +70,7 @@ VortexBridge::VortexBridge(QObject *parent) : QObject(parent),
     repair_metadata_cache_file();
     loadWishlist();
     loadFavoriteSnapshots();
+    loadRemovedGames();
     loadPlayedLedger();
     seedPlayedLedgerFromStats();
     backfillPlayedLedgerMetadata();
@@ -815,6 +816,34 @@ static void applyGameMetadata(QVariantMap &game, long long igdbId) {
     game["tags"]   = tags.isEmpty()   ? QString("Unknown") : tags;
 }
 
+// Whether a row still has nothing but the placeholders applyGameMetadata()
+// writes for an unresolved game. Developer and genres together, because a
+// handful of real games genuinely have one or the other missing upstream.
+static bool metadataIsBlank(const QVariantMap &item) {
+    const QString developer = item.value("developer").toString();
+    const QString genres    = item.value("genres").toString();
+    return (developer.isEmpty() || developer == "Unknown") &&
+           (genres.isEmpty()    || genres    == "Unknown");
+}
+
+// Stands up the keys a details page reads straight off the row, for a game no
+// list could supply one for. QML renders a missing key as "undefined", so they
+// all have to exist even where the answer is not known yet -- applyGameMetadata()
+// writes its own placeholders for an id of 0, and ensureMetadata() replaces
+// those with the real values when the page opens.
+static QVariantMap bareSnapshotFor(const QString &name) {
+    QVariantMap snapshot;
+    snapshot["name"]       = name;
+    snapshot["source"]     = "IGDB";
+    snapshot["matched"]    = false;
+    snapshot["installDir"] = QString();
+    snapshot["steamAppId"] = 0;
+    snapshot["playtime"]   = "Not in library";
+    snapshot["lastPlayed"] = "N/A";
+    applyGameMetadata(snapshot, igdb_cached_id_for(name.toStdString()));
+    return snapshot;
+}
+
 // The set of games that exist on this machine right now, with the exact names
 // the UI shows. The analytics side cannot work either of those out for itself:
 // igdb_cache.txt is append-only and is never pruned on uninstall, and it is
@@ -1137,6 +1166,7 @@ void VortexBridge::refreshGameList() {
     m_gameList = list;
     syncPlayedLedger();
     emit gameListChanged();
+    emit favoritesChanged();
 }
 
 // Public entry point. Coalesces bursts of calls: hearting a game, finishing a
@@ -1419,6 +1449,107 @@ void VortexBridge::ensureArtwork(QString name) {
     }
 }
 
+
+// Real developer, genres and rating for one unowned pick, resolved when its
+// details page opens.
+//
+// A snapshot normally carries these from whichever list it was copied out of.
+// The exception is a favourite that outlived every list -- hearted from
+// Discover, un-hearted, then hearted again after the recommendations moved on
+// -- which has nothing but a name to build from and rendered "Unknown" in every
+// slot. igdb_cached_id_for() answers offline for any title a scan has already
+// resolved; a name the cache has never seen is what the lookup below is for.
+// igdb_resolve_game() writes both the resolution cache and game_metadata.txt on
+// the way through, so a title costs one request per machine, hit or miss.
+//
+// No-op for owned games and for rows that already carry real metadata.
+void VortexBridge::ensureMetadata(QString name) {
+    name = name.trimmed();
+    if (name.isEmpty())
+        return;
+
+    // Same list order and the same `matched` exclusion as ensureArtwork().
+    QVariantMap item = findGameByName(m_recommendationList, name);
+    if (item.isEmpty())
+        item = findGameByName(m_wishlist, name);
+    if (item.isEmpty())
+        item = findGameByName(m_favoriteSnapshots, name);
+    if (item.isEmpty())
+        item = findGameByName(m_playedLedger, name);
+    if (item.isEmpty() || item.value("matched").toBool())
+        return;
+    if (!metadataIsBlank(item))
+        return;
+
+    // The row's own spelling, for the same reason ensureArtwork() takes it:
+    // findGameByName() matches canonically, and the caches are keyed literally.
+    name = item.value("name").toString();
+    if (m_metadataAsked.contains(name))
+        return;      // request in flight, or IGDB has already said it has none
+
+    const long long cached = igdb_cached_id_for(name.toStdString());
+    if (cached > 0) {
+        applyResolvedMetadata(name, cached);
+        return;
+    }
+
+    // Blocking HTTPS, so off the UI thread -- every other network call in here
+    // is dispatched the same way.
+    m_metadataAsked.insert(name);
+    QThread *thread = QThread::create([this, name]() {
+        const long long resolved = igdb_resolve_game(name.toStdString(), false).id;
+        QMetaObject::invokeMethod(this, [this, name, resolved]() {
+            // Cleared only on success. A title IGDB has no answer for stays in
+            // the set and is asked once per session rather than once per page
+            // open; a success needs no entry, because the row stops being blank
+            // and the check above returns before reaching here.
+            if (resolved > 0) {
+                m_metadataAsked.remove(name);
+                applyResolvedMetadata(name, resolved);
+            }
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+// Writes one resolved id's metadata into every list carrying that name, and
+// emits so an open details page re-reads it. Shaped like rebindArtwork() and
+// for the same reason: an unowned game can sit in any of these four lists at
+// once, and the two that persist have to be written back to disk.
+void VortexBridge::applyResolvedMetadata(const QString &name, long long igdbId) {
+    auto apply = [&](QVariantList &list) {
+        bool changed = false;
+        for (QVariant &entry : list) {
+            QVariantMap item = entry.toMap();
+            if (QString::compare(item.value("name").toString(), name,
+                                 Qt::CaseInsensitive) != 0)
+                continue;
+            if (!metadataIsBlank(item))
+                continue;      // came from a live row, which knows more
+            applyGameMetadata(item, igdbId);
+            entry = item;
+            changed = true;
+        }
+        return changed;
+    };
+
+    if (apply(m_recommendationList))
+        emit recommendationListChanged();
+    if (apply(m_wishlist)) {
+        saveWishlist();
+        emit wishlistChanged();
+    }
+    if (apply(m_favoriteSnapshots)) {
+        saveFavoriteSnapshots();
+        emit favoritesChanged();
+    }
+    if (apply(m_playedLedger)) {
+        savePlayedLedger();
+        emit playedGamesChanged();
+    }
+}
+
 void VortexBridge::fetchArtworkFrom(const QString &name, const QString &kind,
                                     const QStringList &urls, int index,
                                     bool allDefinitive) {
@@ -1534,7 +1665,10 @@ void VortexBridge::rebindArtwork(const QString &name) {
     }
     if (apply(m_favoriteSnapshots)) {
         saveFavoriteSnapshots();
-        emit gameListChanged();   // favoriteGames is notified by this one
+        // Nothing in m_gameList moved, so this must not be gameListChanged:
+        // art arriving for an unowned favourite would rebuild the library grid
+        // and scroll it back to the top mid-scan.
+        emit favoritesChanged();
     }
     if (apply(m_playedLedger)) {
         savePlayedLedger();
@@ -1572,6 +1706,11 @@ QVariantList VortexBridge::favoriteGames() const {
         QVariantMap snapshot = entry.toMap();
         const QString name = snapshot.value("name").toString();
         if (name.isEmpty() || seen.contains(name.toLower()))
+            continue;
+        // Taken out of the library, so it must not come back through the
+        // snapshot list -- the heart itself is left alone, so restoring the
+        // game restores the favourite with it.
+        if (isRemovedName(name))
             continue;
         // The preference file remains the source of truth; a snapshot whose
         // heart was removed elsewhere must not linger.
@@ -1618,6 +1757,52 @@ fs::path VortexBridge::favoriteSnapshotPath() const {
     return m_baseDir / "favorite_snapshots.json";
 }
 
+// Points a snapshot's three art slots at whatever is on disk for that name.
+//
+// Both art roots are keyed by name, so a game's artwork can always be found
+// again even when no list still carries a row for it. That is the case the
+// snapshot fallback below could not handle: un-hearting a Discover pick deletes
+// its snapshot, and if the recommendations have been reshuffled since, hearting
+// it again rebuilt the snapshot from a map holding nothing but a name -- the
+// card lost its cover while the cached JPEG sat there untouched. Only the
+// details page recovered, because ensureArtwork() rebinds hero and logo but
+// never the cover.
+//
+// Re-resolving rather than trusting a stored value also matters on load: the
+// saved paths are absolute file:// URLs and stop working the moment the app is
+// moved to another folder. Same reasoning as loadPlayedLedger().
+static void bindArtworkFromCache(const fs::path &baseDir, const QString &name,
+                                 QVariantMap &item) {
+    if (name.isEmpty()) return;
+
+    // "grid" is the cover. In Images/ each kind is a subfolder; in the
+    // candidate root the cover sits at the top level and only hero and logo
+    // get a subfolder, which is what the empty kind means to findCandidateArt.
+    static const std::pair<const char *, const char *> kArtSlots[] = {
+        { "coverPath", "grid" }, { "heroPath", "hero" }, { "logoPath", "logo" }
+    };
+
+    const fs::path gameDir =
+        baseDir / "Images" / steamgriddb_image_folder_name(name.toStdString());
+    const fs::path candidates = candidateImagesDir(baseDir);
+
+    for (const auto &slot : kArtSlots) {
+        // Images/ first: a favourite that is installed, or was played and then
+        // uninstalled, has its full-size art there rather than in the cache of
+        // covers downloaded for discovery picks.
+        QString found = findImagePath(gameDir, slot.second);
+        if (found.isEmpty()) {
+            const QString kind = qstrcmp(slot.second, "grid") == 0
+                                 ? QString() : QString::fromLatin1(slot.second);
+            found = findCandidateArt(candidates, name, kind);
+        }
+        // Nothing on disk leaves whatever the row already had -- for an unowned
+        // pick heroPath legitimately holds the cover standing in for a hero.
+        if (!found.isEmpty())
+            item[slot.first] = found;
+    }
+}
+
 void VortexBridge::loadFavoriteSnapshots() {
     m_favoriteSnapshots.clear();
 
@@ -1628,8 +1813,19 @@ void VortexBridge::loadFavoriteSnapshots() {
     if (!doc.isArray()) return;
 
     for (const QJsonValue &value : doc.array()) {
-        if (value.isObject())
-            m_favoriteSnapshots << value.toObject().toVariantMap();
+        if (!value.isObject()) continue;
+        QVariantMap entry = value.toObject().toVariantMap();
+        const QString name = entry.value("name").toString();
+        bindArtworkFromCache(m_baseDir, name, entry);
+        // A row written before snapshots were kept across an un-heart can still
+        // be holding placeholders. The resolution cache covers anything a scan
+        // has already seen; the rest waits for ensureMetadata() and one lookup.
+        if (metadataIsBlank(entry)) {
+            const long long id = igdb_cached_id_for(name.toStdString());
+            if (id > 0)
+                applyGameMetadata(entry, id);
+        }
+        m_favoriteSnapshots << entry;
     }
 }
 
@@ -1648,15 +1844,21 @@ void VortexBridge::saveFavoriteSnapshots() const {
 // nothing to draw a card or a details page from — and this way the tab still
 // works with Postgres stopped and no network.
 void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
-    for (int i = 0; i < m_favoriteSnapshots.size(); ++i) {
-        if (QString::compare(m_favoriteSnapshots[i].toMap().value("name").toString(),
-                             name, Qt::CaseInsensitive) == 0) {
-            if (!favorited) {
-                m_favoriteSnapshots.removeAt(i);
-                saveFavoriteSnapshots();
-            }
+    // Deliberately kept on un-heart rather than removed.
+    //
+    // favoriteGames() already gates every snapshot on get_game_preference(), so
+    // a kept row is invisible the moment the heart comes off -- removing it buys
+    // nothing and costs the only copy of the game's art and metadata that
+    // survives the recommendations reshuffling past it. Deleting it meant
+    // hearting the same game again rebuilt it from a map holding nothing but a
+    // name: a blank card, and "Unknown" in every slot on the details page.
+    //
+    // Added to and never pruned, like the played ledger and for the same
+    // reason. resetPreferences() is what empties it.
+    for (const QVariant &entry : m_favoriteSnapshots) {
+        if (QString::compare(entry.toMap().value("name").toString(),
+                             name, Qt::CaseInsensitive) == 0)
             return;
-        }
     }
 
     if (!favorited || !findGameByName(m_gameList, name).isEmpty())
@@ -1672,7 +1874,7 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     if (snapshot.isEmpty())
         snapshot = findGameByName(playedGames(), name);
     if (snapshot.isEmpty())
-        snapshot["name"] = name;
+        snapshot = bareSnapshotFor(name);
 
     snapshot.remove("score");
     snapshot.remove("reason");
@@ -1682,9 +1884,105 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     snapshot.remove("installed");   // a played row's momentary install state
     snapshot["status"] = 1.0;
     snapshot["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    bindArtworkFromCache(m_baseDir, name, snapshot);
 
     m_favoriteSnapshots << snapshot;
     saveFavoriteSnapshots();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Removed games — the library minus what the user took out of it
+//
+// "Remove from library" is not "uninstall": the files stay exactly where they
+// are and Steam still knows about the game. All that changes is that the
+// launcher stops listing it. The scan rebuilds the library from the disk every
+// time, so without a persisted record here the game would be back on the next
+// rescan, which is to say within seconds.
+//
+// Identity is a record rather than a name because none of the three keys is
+// sufficient on its own: appid is empty for local games, installDir moves if
+// the user moves the folder, and the NAME of a local game is rewritten mid-scan
+// when IGDB resolves it (see loadGames pass 2). Matching tries all three.
+// ─────────────────────────────────────────────────────────────────────────────
+fs::path VortexBridge::removedGamesPath() const {
+    return m_baseDir / "removed_games.json";
+}
+
+void VortexBridge::loadRemovedGames() {
+    m_removed.clear();
+
+    QFile file(pathToQString(removedGamesPath()));
+    if (!file.open(QIODevice::ReadOnly)) return;
+
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isArray()) return;
+
+    for (const QJsonValue &value : doc.array()) {
+        if (!value.isObject()) continue;
+        const QVariantMap entry = value.toObject().toVariantMap();
+        // A record with no identity at all would match everything, which is the
+        // one failure mode worth guarding: it would empty the library.
+        if (entry.value("name").toString().isEmpty()
+            && entry.value("installDir").toString().isEmpty()
+            && entry.value("appid").toInt() <= 0)
+            continue;
+        m_removed << entry;
+    }
+}
+
+void VortexBridge::saveRemovedGames() const {
+    QJsonArray array;
+    for (const QVariant &entry : m_removed)
+        array.append(QJsonObject::fromVariantMap(entry.toMap()));
+
+    QFile file(pathToQString(removedGamesPath()));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QJsonDocument(array).toJson(QJsonDocument::Indented));
+}
+
+// Free function, taking the list by argument: the scan thread filters with a
+// snapshot captured at scan start rather than reading the member underneath the
+// main thread.
+static bool isRemovedIn(const QVariantList &removed, const BridgeGame &bg) {
+    if (removed.isEmpty()) return false;
+
+    const QString installDir = QString::fromStdString(bg.installDir.string());
+    const std::string canonical = make_canonical(bg.name);
+
+    for (const QVariant &entry : removed) {
+        const QVariantMap record = entry.toMap();
+
+        const int appid = record.value("appid").toInt();
+        if (appid > 0 && bg.appid > 0)
+            { if (appid == bg.appid) return true; continue; }
+
+        const QString dir = record.value("installDir").toString();
+        if (!dir.isEmpty() && !installDir.isEmpty()) {
+            // Case-insensitive: Windows paths that differ only in case are the
+            // same folder, and the two strings come from different scans.
+            if (QString::compare(dir, installDir, Qt::CaseInsensitive) == 0)
+                return true;
+            continue;
+        }
+
+        const QString name = record.value("name").toString();
+        if (!name.isEmpty()
+            && make_canonical(name.toStdString()) == canonical)
+            return true;
+    }
+    return false;
+}
+
+bool VortexBridge::isRemovedName(const QString &name) const {
+    if (m_removed.isEmpty() || name.isEmpty()) return false;
+    const std::string canonical = make_canonical(name.toStdString());
+    for (const QVariant &entry : m_removed) {
+        const QString stored = entry.toMap().value("name").toString();
+        if (!stored.isEmpty()
+            && make_canonical(stored.toStdString()) == canonical)
+            return true;
+    }
+    return false;
 }
 
 fs::path VortexBridge::wishlistPath() const {
@@ -1700,9 +1998,22 @@ void VortexBridge::loadWishlist() {
     const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
     if (!doc.isArray()) return;
 
+    // Repaired on the way in, exactly as loadFavoriteSnapshots() does: the
+    // stored art paths are absolute file:// URLs that break if the app is
+    // moved, and a row saved by a build that still rebuilt the entry on a
+    // re-add can be holding placeholders. ensureMetadata() covers what the
+    // offline cache cannot answer, when the page opens.
     for (const QJsonValue &value : doc.array()) {
-        if (value.isObject())
-            m_wishlist << value.toObject().toVariantMap();
+        if (!value.isObject()) continue;
+        QVariantMap entry = value.toObject().toVariantMap();
+        const QString name = entry.value("name").toString();
+        bindArtworkFromCache(m_baseDir, name, entry);
+        if (metadataIsBlank(entry)) {
+            const long long id = igdb_cached_id_for(name.toStdString());
+            if (id > 0)
+                applyGameMetadata(entry, id);
+        }
+        m_wishlist << entry;
     }
 }
 
@@ -1824,13 +2135,7 @@ void VortexBridge::backfillPlayedLedgerMetadata() {
                 entry[key] = repaired;
         }
 
-        const QString developer = entry.value("developer").toString();
-        const QString genres    = entry.value("genres").toString();
-        const bool blank =
-            (developer.isEmpty() || developer == "Unknown") &&
-            (genres.isEmpty()    || genres    == "Unknown");
-
-        if (blank) {
+        if (metadataIsBlank(entry)) {
             const long long id = playedIgdbId(entry.value("key").toString(),
                                               entry.value("name").toString());
             if (id > 0)
@@ -2041,6 +2346,11 @@ QVariantList VortexBridge::playedGames() const {
         QVariantMap item = entry.toMap();
         if (liveKeys.contains(item.value("key").toString()))
             continue;
+        // m_gameList above is already filtered; the ledger is not, and it holds
+        // a row for every game that was ever played -- including the one just
+        // removed, which would otherwise reappear here as "uninstalled".
+        if (isRemovedName(item.value("name").toString()))
+            continue;
         item["installed"] = false;
         // Uninstalled, so the details page must not offer Play or Uninstall --
         // launchGameFrom() and uninstallGame() both search m_internalGames and
@@ -2179,39 +2489,68 @@ void VortexBridge::setUseSteamPlaytime(bool enabled) {
     refreshGameList();
 }
 
+// A row taken off the wishlist keeps its "wishlisted" flag at false rather than
+// leaving m_wishlist. Absent means true: every entry written before the flag
+// existed was, by definition, on the list.
+static bool isWishlistedRow(const QVariantMap &entry) {
+    return entry.value("wishlisted", true).toBool();
+}
+
+QVariantList VortexBridge::wishlistGames() const {
+    QVariantList list;
+    for (const QVariant &entry : m_wishlist) {
+        if (isWishlistedRow(entry.toMap()))
+            list << entry;
+    }
+    return list;
+}
+
 bool VortexBridge::isWishlisted(QString name) const {
     for (const QVariant &entry : m_wishlist) {
-        if (QString::compare(entry.toMap().value("name").toString(), name,
+        const QVariantMap row = entry.toMap();
+        if (QString::compare(row.value("name").toString(), name,
                              Qt::CaseInsensitive) == 0)
-            return true;
+            return isWishlistedRow(row);
     }
     return false;
 }
 
 bool VortexBridge::toggleWishlist(QString name) {
+    // Flagged rather than removed. wishlistGames() already hides an unflagged
+    // row, so dropping it bought nothing and cost the only copy of the game's
+    // art and metadata -- removing an entry and adding it straight back rebuilt
+    // it from the recommendations, and for a game those have since moved past,
+    // that meant a blank page under the user without the panel ever closing.
+    // Added to and never pruned, like the favourite snapshots.
     for (int i = 0; i < m_wishlist.size(); ++i) {
-        if (QString::compare(m_wishlist[i].toMap().value("name").toString(), name,
-                             Qt::CaseInsensitive) == 0) {
-            m_wishlist.removeAt(i);
-            saveWishlist();
-            emit wishlistChanged();
-            return false;
-        }
+        QVariantMap entry = m_wishlist[i].toMap();
+        if (QString::compare(entry.value("name").toString(), name,
+                             Qt::CaseInsensitive) != 0)
+            continue;
+
+        const bool saved = !isWishlistedRow(entry);
+        entry["wishlisted"] = saved;
+        if (saved)   // re-added: the list reads as when you saved it, not first saved it
+            entry["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+        m_wishlist[i] = entry;
+        saveWishlist();
+        emit wishlistChanged();
+        return saved;
     }
 
     // Snapshot the metadata: wishlist entries are unowned, so they are absent
     // from gameList and there would be nothing to render them from later. It
     // also keeps the tab working with Postgres stopped and no network.
-    QVariantMap snapshot;
-    for (const QVariant &entry : m_recommendationList) {
-        const QVariantMap item = entry.toMap();
-        if (QString::compare(item.value("name").toString(), name, Qt::CaseInsensitive) == 0) {
-            snapshot = item;
-            break;
-        }
-    }
+    // Same order updateFavoriteSnapshot() builds from, and for the same reason:
+    // a game can be saved from any tab, and only the list it is showing in has
+    // a row to copy.
+    QVariantMap snapshot = findGameByName(m_recommendationList, name);
     if (snapshot.isEmpty())
-        snapshot["name"] = name;
+        snapshot = findGameByName(m_favoriteSnapshots, name);
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(playedGames(), name);
+    if (snapshot.isEmpty())
+        snapshot = bareSnapshotFor(name);
 
     snapshot.remove("score");
     snapshot.remove("reason");
@@ -2219,7 +2558,9 @@ bool VortexBridge::toggleWishlist(QString name) {
     snapshot.remove("section");
     snapshot.remove("similarity");
     snapshot.remove("installed");   // a played row's momentary install state
+    snapshot["wishlisted"] = true;
     snapshot["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
+    bindArtworkFromCache(m_baseDir, name, snapshot);
 
     m_wishlist << snapshot;
     saveWishlist();
@@ -2281,8 +2622,12 @@ void VortexBridge::loadGames() {
 
     const fs::path baseDir    = m_baseDir;   // capture by value for lambda
     const fs::path imagesRoot = baseDir / "Images";
+    // Snapshot, not the member: the scan thread must not read m_removed while
+    // the main thread could be appending to it. A removal made during the scan
+    // is picked up by the rescan removeFromLibrary() queues.
+    const QVariantList removedSnapshot = m_removed;
 
-    QThread *thread = QThread::create([this, baseDir, imagesRoot]() {
+    QThread *thread = QThread::create([this, baseDir, imagesRoot, removedSnapshot]() {
         // Whatever happens below -- an exception, or an early return added
         // later -- the UI must not be left with a progress strip that never
         // clears and a loading flag that never drops. A scope guard rather
@@ -2319,6 +2664,11 @@ void VortexBridge::loadGames() {
         for (const fs::path &dir : readLocalGameDirectories(baseDir))
             scan_directory_for_games(dir, localEntries, false);
 
+        // Games the user removed from the library are dropped HERE, before
+        // either vector exists, rather than when the QVariantList is built:
+        // updateGameRow() writes m_gameList by position, so m_internalGames and
+        // m_gameList have to stay index-parallel, and they only do if both are
+        // built from the same filtered set.
         std::vector<BridgeGame> internalGames;
         for (const SteamGame &g : steamGames) {
             BridgeGame bg;
@@ -2327,6 +2677,7 @@ void VortexBridge::loadGames() {
             bg.appid      = g.appid;
             bg.igdb_id    = g.igdb_id;
             bg.installDir = g.installDir;
+            if (isRemovedIn(removedSnapshot, bg)) continue;
             internalGames.push_back(std::move(bg));
         }
         for (const temp_GameEntry &g : localEntries) {
@@ -2336,6 +2687,7 @@ void VortexBridge::loadGames() {
             bg.igdb_id    = g.igdb_id;
             bg.installDir = g.installDir;
             bg.gamePath   = g.gamePath;
+            if (isRemovedIn(removedSnapshot, bg)) continue;
             internalGames.push_back(std::move(bg));
         }
 
@@ -2360,6 +2712,7 @@ void VortexBridge::loadGames() {
                 // pass has had a chance to rename anything.
                 syncPlayedLedger();
                 emit gameListChanged();
+                emit favoritesChanged();
             }, Qt::QueuedConnection);
         }
 
@@ -2957,13 +3310,126 @@ void VortexBridge::uninstallGame(QString name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// removeFromLibrary — take a game out of the launcher, leave it on the disk.
+//
+// The record is written first and the lists are corrected second, because the
+// record is what makes the removal survive the next scan; a list that is right
+// now and wrong after a restart would be the worse half to get.
+// ─────────────────────────────────────────────────────────────────────────────
+void VortexBridge::removeFromLibrary(QString name, QString installDir) {
+    if (name.isEmpty() && installDir.isEmpty())
+        return;
+
+    // Find the live row so the record carries every key that can identify the
+    // game later -- installDir alone is what a QML card knows, but appid is
+    // what survives a Steam library being moved.
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(m_internalGames.size()); ++i) {
+        const BridgeGame &bg = m_internalGames[i];
+        if (!installDir.isEmpty()
+            && QString::compare(QString::fromStdString(bg.installDir.string()),
+                                installDir, Qt::CaseInsensitive) == 0) {
+            index = i;
+            break;
+        }
+        if (index < 0 && !name.isEmpty()
+            && QString::compare(QString::fromStdString(bg.name), name,
+                                Qt::CaseInsensitive) == 0)
+            index = i;                       // keep looking for an installDir hit
+    }
+
+    QVariantMap record;
+    record["name"]       = name;
+    record["installDir"] = installDir;
+    record["appid"]      = 0;
+    record["source"]     = QString();
+    if (index >= 0) {
+        const BridgeGame &bg = m_internalGames[index];
+        if (name.isEmpty())       record["name"] = QString::fromStdString(bg.name);
+        if (installDir.isEmpty())
+            record["installDir"] = QString::fromStdString(bg.installDir.string());
+        record["appid"]  = bg.appid;
+        record["source"] = QString::fromStdString(bg.source);
+    }
+    record["removedAt"] = QDateTime::currentSecsSinceEpoch();
+
+    m_removed << record;
+    saveRemovedGames();
+    emit removedGamesChanged();
+    vlog::line("Library", "removed " + record["name"].toString().toStdString()
+                          + " (files left in place)");
+
+    // A scan in flight holds its own copy of the game vector and writes rows
+    // back by position, so pulling one out from under it would send the rest of
+    // its updates to the wrong cards. Let the scan finish and rescan after it;
+    // the queue for exactly this already exists.
+    if (m_isLoading) {
+        m_rescanQueued = true;
+        return;
+    }
+
+    if (index >= 0)
+        m_internalGames.erase(m_internalGames.begin() + index);
+
+    // Rebuilds m_gameList from the (now shorter) vector, keeping the two
+    // index-parallel, and emits gameListChanged + favoritesChanged.
+    refreshGameList();
+    emit playedGamesChanged();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// restoreToLibrary — put one back.
+//
+// A full rescan rather than a list rebuild: the game is not in m_internalGames
+// any more, and the disk is the only place its install directory, appid and
+// artwork can be read from again.
+// ─────────────────────────────────────────────────────────────────────────────
+void VortexBridge::restoreToLibrary(QString name) {
+    if (name.isEmpty()) return;
+
+    const std::string canonical = make_canonical(name.toStdString());
+    bool changed = false;
+    for (int i = m_removed.size() - 1; i >= 0; --i) {
+        const QString stored = m_removed[i].toMap().value("name").toString();
+        if (stored.isEmpty()
+            || make_canonical(stored.toStdString()) != canonical)
+            continue;
+        m_removed.removeAt(i);
+        changed = true;
+    }
+    if (!changed) return;
+
+    saveRemovedGames();
+    emit removedGamesChanged();
+    vlog::line("Library", "restored " + name.toStdString());
+    loadGames();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // updatePreference — updates preferences.json via the engine, then does a
 // lightweight refresh so the favourite state updates immediately.
 // ─────────────────────────────────────────────────────────────────────────────
 double VortexBridge::updatePreference(QString name, double score) {
     double newStatus = toggle_game_preference(name.toStdString(), score);
     updateFavoriteSnapshot(name, newStatus > 0.0);
-    refreshGameList();   // emits gameListChanged, which favoriteGames binds to
+
+    // One field on one row changed, so patch it in place rather than calling
+    // refreshGameList(). Same reasoning as updateGameRow(): rebuilding
+    // m_gameList emits gameListChanged, the library grid binds to that array,
+    // and GridView answers a new array by dropping the scroll position -- so
+    // hearting a game halfway down the library threw the user back to the top.
+    // favoriteGames() reads `status` straight off these rows, and its notify is
+    // favoritesChanged, so the Favorites tab and the heart still update at once.
+    for (int i = 0; i < m_gameList.size(); ++i) {
+        QVariantMap row = m_gameList[i].toMap();
+        if (QString::compare(row.value("name").toString(), name,
+                             Qt::CaseInsensitive) == 0) {
+            row["status"] = newStatus;
+            m_gameList[i] = row;
+            break;
+        }
+    }
+    emit favoritesChanged();
     // Deliberately no loadRecommendations(): hearting does change the profile,
     // but reshuffling the list the instant you tap the heart is the same
     // unasked-for movement as reloading on a tab switch. The new weight is

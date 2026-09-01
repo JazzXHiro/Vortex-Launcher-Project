@@ -3,6 +3,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Effects
 import QtQuick.Layouts
+import Vortex
 
 Popup {
     id: detailsRoot
@@ -207,15 +208,51 @@ Popup {
             || detailsRoot.findIn(detailsRoot.api.playedGames);
     }
 
+    // A refresh must never blank the page under the user.
+    //
+    // findGameData() can only resolve an unowned favourite through
+    // favoriteGames(), and taking the heart off drops it out of that list --
+    // leaving the page they are still looking at with no row at all: no title,
+    // no art, "Unknown" in every field. Nothing was deleted, so keep showing
+    // what is on screen; opening another game or reopening this one goes
+    // through onSelectedGameNameChanged, which assigns unconditionally and is
+    // where a genuinely unresolvable name still has to end up null.
+    function refreshGameData() {
+        const found = detailsRoot.findGameData();
+        if (found) {
+            detailsRoot.gameData = found;
+            return;
+        }
+        if (!detailsRoot.gameData)
+            return;
+
+        // The one field the kept row must not carry over. `status` is baked in
+        // when the row is built and never rewritten, so holding 1.0 here would
+        // keep the heart lit after the click that just cleared it. Zeroed, the
+        // button falls through to favoriteGames(), which is live. A copy, not
+        // an edit in place: assigning the same object back notifies nothing.
+        if (detailsRoot.gameData.status === undefined
+            || detailsRoot.gameData.status === 0.0)
+            return;
+        const kept = Object.assign({}, detailsRoot.gameData);
+        kept.status = 0.0;
+        detailsRoot.gameData = kept;
+    }
+
     Connections {
         target: detailsRoot.api
-        function onGameListChanged() { detailsRoot.gameData = detailsRoot.findGameData(); }
-        function onRecommendationListChanged() { detailsRoot.gameData = detailsRoot.findGameData(); }
+        function onGameListChanged() { detailsRoot.refreshGameData(); }
+        // Hearting no longer emits gameListChanged -- it patches the row in
+        // place so the library grid keeps its scroll position -- so re-read the
+        // row here too, or an un-hearted owned game keeps its stale status: 1.0
+        // and the heart stays lit until the page is reopened.
+        function onFavoritesChanged() { detailsRoot.refreshGameData(); }
+        function onRecommendationListChanged() { detailsRoot.refreshGameData(); }
         function onWishlistChanged() {
-            detailsRoot.gameData = detailsRoot.findGameData();
+            detailsRoot.refreshGameData();
             detailsRoot.wishlistRevision++;
         }
-        function onPlayedGamesChanged() { detailsRoot.gameData = detailsRoot.findGameData(); }
+        function onPlayedGamesChanged() { detailsRoot.refreshGameData(); }
     }
 
     // Never carry an armed confirm across games or across an open/close cycle.
@@ -231,8 +268,13 @@ Popup {
             // are ever shown, and the bridge no-ops on anything already cached
             // or already known to have none. The Connections block above swaps
             // them in when they land, so the page updates without reopening.
-            if (!detailsRoot.isOwned)
+            if (!detailsRoot.isOwned) {
                 detailsRoot.api.ensureArtwork(detailsRoot.gameData.name);
+                // Same lazy deal for the text: a saved favourite whose list
+                // entry is long gone has only a name, and this is where the
+                // developer, genres and rating come back.
+                detailsRoot.api.ensureMetadata(detailsRoot.gameData.name);
+            }
         }
     }
 
@@ -242,9 +284,9 @@ Popup {
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
     background: Rectangle { 
-        color: "#121212"
+        color: Theme.bgPanel
         radius: 20 
-        border.color: "#252525"
+        border.color: Theme.borderQuiet
         border.width: 1 
     }
 
@@ -255,7 +297,7 @@ Popup {
         Rectangle {
             id: heroBanner
             Layout.fillWidth: true; Layout.preferredHeight: parent.height * 0.5
-            color: "#1a1a1a"
+            color: Theme.bgRaised
             radius: 20 
             // Fix 1: Layer + Clip ensures images follow the curved edges of the window
             layer.enabled: true
@@ -344,9 +386,9 @@ Popup {
                 visible: !detailsRoot.uninstallArmed && detailsRoot.isOwned
                 // Loud on purpose: a dark red outline on a dark button read as
                 // "the selection disappeared" rather than "uninstall is picked".
-                color: uninstallButton.emphasized ? "#4a1d1a" : "#222"
+                color: uninstallButton.emphasized ? Theme.dangerBg : Theme.bgActive
                 border.width: uninstallButton.emphasized ? 3 : 0
-                border.color: "white"
+                border.color: Theme.focusRing
                 scale: uninstallButton.emphasized ? 1.12 : 1.0
 
                 Behavior on color { ColorAnimation { duration: 150 } }
@@ -354,7 +396,7 @@ Popup {
 
                 Text {
                     anchors.centerIn: parent; text: "🗑"
-                    color: uninstallButton.emphasized ? "#ff6b5b" : "#c0392b"; font.pixelSize: 24
+                    color: uninstallButton.emphasized ? Theme.dangerIcon : Theme.dangerRest; font.pixelSize: 24
                 }
                 MouseArea {
                     id: uninstallArea
@@ -383,9 +425,9 @@ Popup {
                 height: 50; radius: 8
                 width: wishlistRow.implicitWidth + 32
                 visible: !detailsRoot.isOwned
-                color: wishlistButton.saved ? "#1d4a2b" : (wishlistButton.emphasized ? "#2a2a2a" : "#222")
+                color: wishlistButton.saved ? Theme.positiveDim : (wishlistButton.emphasized ? Theme.bgEmphasis : Theme.bgActive)
                 border.width: wishlistButton.emphasized ? 3 : 0
-                border.color: "white"
+                border.color: Theme.focusRing
                 scale: wishlistButton.emphasized ? 1.08 : 1.0
 
                 Behavior on color { ColorAnimation { duration: 150 } }
@@ -403,7 +445,7 @@ Popup {
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         text: wishlistButton.saved ? "WISHLISTED" : "ADD TO WISHLIST"
-                        color: "white"
+                        color: Theme.textPrimary
                         font.pixelSize: 12
                         font.bold: true
                         font.letterSpacing: 1
@@ -433,7 +475,7 @@ Popup {
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     text: "delete this game's files from disk?"
-                    color: "#ff8a7a"; font.pixelSize: 16
+                    color: Theme.dangerText; font.pixelSize: 16
                 }
 
                 Rectangle {
@@ -444,9 +486,9 @@ Popup {
                         || (confirmDeleteArea.containsMouse && detailsRoot.mouseInControl)
 
                     width: 120; height: 50; radius: 8
-                    color: confirmDeleteButton.emphasized ? "#e74c3c" : "#c0392b"
+                    color: confirmDeleteButton.emphasized ? Theme.danger : Theme.dangerRest
                     border.width: confirmDeleteButton.emphasized ? 3 : 0
-                    border.color: "white"
+                    border.color: Theme.focusRing
                     scale: confirmDeleteButton.emphasized ? 1.06 : 1.0
 
                     Behavior on color { ColorAnimation { duration: 150 } }
@@ -454,7 +496,7 @@ Popup {
 
                     Text {
                         anchors.centerIn: parent; text: "DELETE"
-                        color: "white"; font.bold: true; font.pixelSize: 15; font.letterSpacing: 1
+                        color: Theme.textPrimary; font.bold: true; font.pixelSize: 15; font.letterSpacing: 1
                     }
                     MouseArea {
                         id: confirmDeleteArea
@@ -473,9 +515,9 @@ Popup {
                         || (cancelDeleteArea.containsMouse && detailsRoot.mouseInControl)
 
                     width: 120; height: 50; radius: 8
-                    color: cancelDeleteButton.emphasized ? "#333" : "#222"
+                    color: cancelDeleteButton.emphasized ? Theme.bgInert : Theme.bgActive
                     border.width: cancelDeleteButton.emphasized ? 3 : 1
-                    border.color: cancelDeleteButton.emphasized ? "white" : "#3a3a3a"
+                    border.color: cancelDeleteButton.emphasized ? Theme.focusRing : Theme.borderControl
                     scale: cancelDeleteButton.emphasized ? 1.06 : 1.0
 
                     Behavior on color { ColorAnimation { duration: 150 } }
@@ -483,7 +525,7 @@ Popup {
 
                     Text {
                         anchors.centerIn: parent; text: "CANCEL"
-                        color: "#ddd"; font.bold: true; font.pixelSize: 15; font.letterSpacing: 1
+                        color: Theme.textBody; font.bold: true; font.pixelSize: 15; font.letterSpacing: 1
                     }
                     MouseArea {
                         id: cancelDeleteArea
@@ -521,10 +563,10 @@ Popup {
                             implicitHeight: 65
                             radius: 8
                             color: detailsRoot.isOwned
-                                   ? (playBtn.down ? "#e0e0e0" : "white")
-                                   : (playBtn.down ? "#132b45" : "#1b2838")   // Steam navy
+                                   ? (playBtn.down ? Theme.bgPressed : Theme.accent)
+                                   : (playBtn.down ? Theme.steamBgPressed : Theme.steamBg)   // Steam navy
                             border.width: playBtn.emphasized ? 3 : 0
-                            border.color: detailsRoot.isOwned ? "#27ae60" : "#66c0f4"
+                            border.color: detailsRoot.isOwned ? Theme.positive : Theme.steamAccent
                         }
                         contentItem: Item {
                             implicitWidth: playContent.implicitWidth
@@ -552,7 +594,7 @@ Popup {
                                 Text {
                                     anchors.verticalCenter: parent.verticalCenter
                                     text: detailsRoot.isOwned ? "play" : "CHECK ON STEAM"
-                                    color: detailsRoot.isOwned ? "black" : "white"
+                                    color: detailsRoot.isOwned ? Theme.textInverse : Theme.textPrimary
                                     font.bold: true
                                     font.pixelSize: detailsRoot.isOwned ? 24 : 15
                                     font.letterSpacing: detailsRoot.isOwned ? 0 : 1
@@ -585,7 +627,7 @@ Popup {
                             // game the snapshot alone reads 0.0 forever and the
                             // heart never lit. favoriteGames() is the live
                             // answer (it re-checks preferences.json) and its
-                            // gameListChanged notify is exactly what
+                            // favoritesChanged notify is exactly what
                             // updatePreference() emits, so the fill animates on
                             // the tap.
                             readonly property bool isFavorite: {
@@ -600,9 +642,9 @@ Popup {
                                 || (favoriteArea.containsMouse && detailsRoot.mouseInControl)
 
                             width: 50; height: 50; radius: 25
-                            border.color: favoriteButton.emphasized ? "white" : "#333"
+                            border.color: favoriteButton.emphasized ? Theme.focusRing : Theme.borderControl
                             border.width: favoriteButton.emphasized ? 2 : 1
-                            color: favoriteButton.isFavorite ? "#e0245e" : "#1a1a1a"
+                            color: favoriteButton.isFavorite ? Theme.favorite : Theme.bgRaised
                             scale: favoriteButton.emphasized ? 1.12 : 1.0
 
                             Behavior on color { ColorAnimation { duration: 150 } }
@@ -611,7 +653,7 @@ Popup {
                             Text {
                                 anchors.centerIn: parent
                                 text: "♥"
-                                color: favoriteButton.isFavorite ? "white" : "#666"
+                                color: favoriteButton.isFavorite ? Theme.textPrimary : Theme.textFaint
                                 font.pixelSize: 22
                             }
                             MouseArea {
@@ -635,8 +677,8 @@ Popup {
                     // The caption below says which of the two this is rather
                     // than leaving the reader to guess why the numbers do not
                     // subtract.
-                    Text { text: "playtime"; color: "#888"; font.pixelSize: 18; font.letterSpacing: 1 }
-                    Text { text: detailsRoot.gameData ? detailsRoot.gameData.playtime : "0m"; color: "white"; font.pixelSize: 32; font.bold: true }
+                    Text { text: "playtime"; color: Theme.textMuted; font.pixelSize: 18; font.letterSpacing: 1 }
+                    Text { text: detailsRoot.gameData ? detailsRoot.gameData.playtime : "0m"; color: Theme.textPrimary; font.pixelSize: 32; font.bold: true }
 
                     Text {
                         visible: detailsRoot.gameData !== null
@@ -648,15 +690,15 @@ Popup {
                                        + detailsRoot.gameData.totalPlaytime + " total"
                                      : detailsRoot.gameData.idleTime + " idle observed by Vortex")
                               : ""
-                        color: "#888"; font.pixelSize: 14
+                        color: Theme.textMuted; font.pixelSize: 14
                     }
 
                     // Fix 5: Brighter color for Last Played
-                    Text { text: "Last Played: " + (detailsRoot.gameData ? detailsRoot.gameData.lastPlayed : "Never"); color: "#aaa"; font.pixelSize: 15 }
+                    Text { text: "Last Played: " + (detailsRoot.gameData ? detailsRoot.gameData.lastPlayed : "Never"); color: Theme.textSecondary; font.pixelSize: 15 }
                 }
 
                 Rectangle {
-                    width: 550; height: 55; color: "#1a1a1a"; radius: 8; border.color: "#222"
+                    width: 550; height: 55; color: Theme.bgRaised; radius: 8; border.color: Theme.borderQuiet
                     Text {
                         anchors { left: parent.left; verticalCenter: parent.verticalCenter; leftMargin: 20 }
                         // Unowned discovery picks carry no install path at all,
@@ -664,7 +706,7 @@ Popup {
                         text: detailsRoot.gameData && detailsRoot.gameData.installDir
                               ? detailsRoot.gameData.installDir
                               : (detailsRoot.isOwned ? "Unknown Path" : "Not installed")
-                        color: "#aaa"; font.pixelSize: 15; font.italic: true
+                        color: Theme.textSecondary; font.pixelSize: 15; font.italic: true
                         elide: Text.ElideMiddle; width: 510
                     }
                 }
@@ -674,11 +716,11 @@ Popup {
             Column {
                 anchors { bottom: parent.bottom; right: parent.right; margins: 40 }
                 spacing: 12
-                Text { text: "developer: " + (detailsRoot.gameData ? detailsRoot.gameData.developer : "Unknown"); color: "#bbb"; font.pixelSize: 16; anchors.right: parent.right }
-                Text { text: "genres: " + (detailsRoot.gameData ? detailsRoot.gameData.genres : "Unknown"); color: "#bbb"; font.pixelSize: 16; anchors.right: parent.right }
-                Text { text: "rating: " + (detailsRoot.gameData && detailsRoot.gameData.rating ? detailsRoot.gameData.rating.toFixed(1) : "N/A"); color: "#bbb"; font.pixelSize: 16; anchors.right: parent.right }
-                Text { text: "time to beat: " + (detailsRoot.gameData ? detailsRoot.gameData.timeToBeat : "N/A"); color: "#bbb"; font.pixelSize: 16; anchors.right: parent.right }
-                Text { text: "source: " + (detailsRoot.gameData ? detailsRoot.gameData.source : "Local"); color: "#888"; font.bold: true; font.pixelSize: 14; anchors.right: parent.right; font.capitalization: Font.AllUppercase }
+                Text { text: "developer: " + (detailsRoot.gameData ? detailsRoot.gameData.developer : "Unknown"); color: Theme.textSecondary; font.pixelSize: 16; anchors.right: parent.right }
+                Text { text: "genres: " + (detailsRoot.gameData ? detailsRoot.gameData.genres : "Unknown"); color: Theme.textSecondary; font.pixelSize: 16; anchors.right: parent.right }
+                Text { text: "rating: " + (detailsRoot.gameData && detailsRoot.gameData.rating ? detailsRoot.gameData.rating.toFixed(1) : "N/A"); color: Theme.textSecondary; font.pixelSize: 16; anchors.right: parent.right }
+                Text { text: "time to beat: " + (detailsRoot.gameData ? detailsRoot.gameData.timeToBeat : "N/A"); color: Theme.textSecondary; font.pixelSize: 16; anchors.right: parent.right }
+                Text { text: "source: " + (detailsRoot.gameData ? detailsRoot.gameData.source : "Local"); color: Theme.textMuted; font.bold: true; font.pixelSize: 14; anchors.right: parent.right; font.capitalization: Font.AllUppercase }
             }
         }
     }

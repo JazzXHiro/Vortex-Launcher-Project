@@ -3,10 +3,11 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import Vortex
 
 Window {
     id: root
-    width: 1920; height: 1080; visible: true; title: "Vortex Launcher"; color: "black"
+    width: 1920; height: 1080; visible: true; title: "Vortex Launcher"; color: Theme.bgWindow
 
     property string activeFilter: "All"
     property string activeTab: "Library"
@@ -174,6 +175,12 @@ Window {
             }
             return
         }
+        // Above the grid, below the details page: the menu only ever opens
+        // over the cards, never on top of a page that is already open.
+        if (tileMenu.visible) {
+            tileMenu.navigate(direction)
+            return
+        }
         if (detailPopup.visible) {
             detailPopup.navigate(direction)
             return
@@ -190,6 +197,10 @@ Window {
                 root.focusedMood = root.moodOrder[0]   // wake on Neutral, not id 0
             else
                 moodOverlay.chooseMood(root.focusedMood)
+            return
+        }
+        if (tileMenu.visible) {
+            tileMenu.activateFocused()
             return
         }
         if (detailPopup.visible) {
@@ -221,6 +232,24 @@ Window {
         detailPopup.open()
     }
 
+    // R3 — the pad's equivalent of clicking a card's overflow button. Only the
+    // library grid has one; the recommendation and wishlist cards are unchanged.
+    function controllerOptions() {
+        root.padActive = true
+        if (root.padBlocked || moodOverlay.visible || detailPopup.visible)
+            return
+        if (tileMenu.visible) {                      // pressing it again closes it
+            tileMenu.close()
+            return
+        }
+        if (root.activeTab === "Recommendations" || root.activeTab === "Wishlist")
+            return
+        if (gameGrid.currentIndex < 0 || !gameGrid.currentItem)
+            return
+        gameGrid.currentItem.openTileMenu()
+        tileMenu.focusedItem = 0                     // the pad opens with a selection
+    }
+
     // B — one level back from wherever we are.
     function controllerBack() {
         root.padActive = true
@@ -230,6 +259,13 @@ Window {
         }
         if (root.padBlocked || moodOverlay.visible)
             return                                   // nothing sits above the mood picker
+        if (tileMenu.visible) {
+            // Back drops the confirm step first, exactly as it does on the
+            // details page, and only closes the menu once there is none.
+            if (!tileMenu.handleBack())
+                tileMenu.close()
+            return
+        }
         if (detailPopup.visible) {
             // The details page eats Back itself when its uninstall confirm is
             // showing — that step is the "one level" to come back from.
@@ -287,11 +323,54 @@ Window {
         function onFilterPrevious()         { root.cycleFilter(-1) }
         function onFilterNext()             { root.cycleFilter(1) }
         function onToggleRecommendations()  { root.toggleRecommendations() }
+        function onOptions()                { root.controllerOptions() }
+    }
+
+    // The tile overflow menu. One instance for the whole grid -- see TileMenu.qml.
+    TileMenu {
+        id: tileMenu
+
+        // Removing rebuilds gameList, and the grid binds to that as a plain JS
+        // array -- GridView answers a new array by throwing the scroll position
+        // away, which sent the user back to the top of the library every time
+        // they removed a card. Same fix the details page uses for hearts: pin
+        // where the grid was and let its own restoreScroll() re-assert that as
+        // the new rows settle.
+        onRemoveRequested: (name, installDir) => {
+            gameGrid.restoreY = gameGrid.contentY
+            if (root.api)
+                root.api.removeFromLibrary(name, installDir)
+            releaseScrollPin.restart()
+        }
+    }
+
+    // Lets go of that pin once the grid has settled. contentHeight is not final
+    // when countChanged fires, so it cannot be dropped on the line after the
+    // call; leaving it set for good would snap a later filter or tab change
+    // back to a position that no longer means anything.
+    Timer {
+        id: releaseScrollPin
+        interval: 400
+        onTriggered: gameGrid.restoreY = -1
     }
 
     GameDetails {
         id: detailPopup
-        onClosed: detailPopup.focusedAction = -1
+
+        // Every heart and wishlist toggle happens from this page, so this is
+        // the last moment the grids' scroll positions are still intact. Both
+        // are captured because the page does not know which tab it was opened
+        // from, and a grid with nothing pending simply never restores.
+        onOpened: {
+            gameGrid.restoreY = gameGrid.contentY
+            wishlistGrid.restoreY = wishlistGrid.contentY
+        }
+
+        onClosed: {
+            detailPopup.focusedAction = -1
+            gameGrid.restoreY = -1
+            wishlistGrid.restoreY = -1
+        }
     }
 
     SettingsWindow {
@@ -344,7 +423,7 @@ Window {
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 35
-            color: "black"
+            color: Theme.bgWindow
             z: 10
 
             RowLayout {
@@ -372,8 +451,8 @@ Window {
                         width: tabLabel.implicitWidth + 44
                         height: 35
                         radius: 17
-                        color: tabButton.active ? "white" : (tabButton.hovered ? "#2e2e2e" : "#1a1a1a")
-                        border.color: tabButton.hovered ? "#555" : "#333"
+                        color: tabButton.active ? Theme.accent : (tabButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
+                        border.color: tabButton.hovered ? Theme.borderStrong : Theme.borderControl
 
                         Behavior on color { ColorAnimation { duration: 150 } }
 
@@ -382,7 +461,7 @@ Window {
                             anchors.centerIn: parent
                             text: tabButton.modelData.toUpperCase()
                             font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                            color: tabButton.active ? "black" : (tabButton.hovered ? "#ddd" : "#888")
+                            color: tabButton.active ? Theme.textInverse : (tabButton.hovered ? Theme.textBody : Theme.textMuted)
                         }
 
                         MouseArea {
@@ -421,8 +500,8 @@ Window {
                             filterArea.containsMouse && root.mouseInControl && !filterButton.active
 
                         width: 120; height: 35; radius: 17
-                        color: filterButton.active ? "white" : (filterButton.hovered ? "#2e2e2e" : "#1a1a1a")
-                        border.color: filterButton.hovered ? "#555" : "#333"
+                        color: filterButton.active ? Theme.accent : (filterButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
+                        border.color: filterButton.hovered ? Theme.borderStrong : Theme.borderControl
 
                         Behavior on color { ColorAnimation { duration: 150 } }
 
@@ -430,7 +509,7 @@ Window {
                             anchors.centerIn: parent
                             text: filterButton.modelData.toUpperCase()
                             font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                            color: filterButton.active ? "black" : (filterButton.hovered ? "#ddd" : "#888")
+                            color: filterButton.active ? Theme.textInverse : (filterButton.hovered ? Theme.textBody : Theme.textMuted)
                         }
 
                         MouseArea {
@@ -450,14 +529,14 @@ Window {
 
                 implicitWidth: 150; implicitHeight: 35; radius: 17
                 visible: root.activeTab === "Library"
-                color: addFolderButton.hovered ? "#ffffff" : "#1a1a1a"
-                border.color: addFolderButton.hovered ? "#ffffff" : "#333"
+                color: addFolderButton.hovered ? Theme.accent : Theme.bgRaised
+                border.color: addFolderButton.hovered ? Theme.focusRing : Theme.borderControl
 
                 Text {
                     anchors.centerIn: parent
                     text: "+ FOLDER"
                     font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                    color: addFolderButton.hovered ? "black" : "#888"
+                    color: addFolderButton.hovered ? Theme.textInverse : Theme.textMuted
                 }
 
                 MouseArea {
@@ -496,7 +575,7 @@ Window {
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     text: root.api ? root.api.scanPhase : ""
-                    color: "#888"
+                    color: Theme.textMuted
                     font.pixelSize: 11
                     font.bold: true
                     font.letterSpacing: 1
@@ -508,12 +587,12 @@ Window {
                 Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
                     width: 110; height: 3; radius: 2
-                    color: "#252525"
+                    color: Theme.bgEmphasis
 
                     Rectangle {
                         height: parent.height
                         radius: parent.radius
-                        color: "white"
+                        color: Theme.accent
                         width: scanStrip.total > 0
                                ? parent.width * Math.min(1, scanStrip.done / scanStrip.total)
                                : parent.width * 0.25
@@ -532,7 +611,7 @@ Window {
                     anchors.verticalCenter: parent.verticalCenter
                     visible: scanStrip.total > 0
                     text: scanStrip.done + " / " + scanStrip.total
-                    color: "#555"
+                    color: Theme.textFaint
                     font.pixelSize: 11
                 }
             }
@@ -558,8 +637,8 @@ Window {
 
                     width: 150; height: 35; radius: 17
                     visible: !root.resetLikesArmed
-                    color: resetLikesButton.hovered ? "#ffffff" : "#1a1a1a"
-                    border.color: resetLikesButton.hovered ? "#ffffff" : "#333"
+                    color: resetLikesButton.hovered ? Theme.accent : Theme.bgRaised
+                    border.color: resetLikesButton.hovered ? Theme.focusRing : Theme.borderControl
 
                     Behavior on color { ColorAnimation { duration: 150 } }
 
@@ -567,7 +646,7 @@ Window {
                         anchors.centerIn: parent
                         text: "RESET LIKES"
                         font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                        color: resetLikesButton.hovered ? "black" : "#888"
+                        color: resetLikesButton.hovered ? Theme.textInverse : Theme.textMuted
                     }
 
                     MouseArea {
@@ -583,12 +662,12 @@ Window {
                     id: confirmResetButton
                     width: 170; height: 35; radius: 17
                     visible: root.resetLikesArmed
-                    color: confirmResetArea.containsMouse ? "#e74c3c" : "#c0392b"
+                    color: confirmResetArea.containsMouse ? Theme.danger : Theme.dangerRest
 
                     Text {
                         anchors.centerIn: parent
                         text: "CLEAR ALL LIKES"
-                        color: "white"; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                        color: Theme.textPrimary; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
                     }
 
                     MouseArea {
@@ -608,13 +687,13 @@ Window {
                     id: cancelResetButton
                     width: 100; height: 35; radius: 17
                     visible: root.resetLikesArmed
-                    color: cancelResetArea.containsMouse ? "#2b2b2b" : "transparent"
-                    border.color: "#3a3a3a"; border.width: 1
+                    color: cancelResetArea.containsMouse ? Theme.bgEmphasis : "transparent"
+                    border.color: Theme.borderControl; border.width: 1
 
                     Text {
                         anchors.centerIn: parent
                         text: "CANCEL"
-                        color: "#aaa"; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                        color: Theme.textSecondary; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
                     }
 
                     MouseArea {
@@ -633,14 +712,14 @@ Window {
                 readonly property bool hovered: settingsArea.containsMouse && root.mouseInControl
 
                 implicitWidth: 35; implicitHeight: 35; radius: 17
-                color: settingsButton.hovered ? "#ffffff" : "#1a1a1a"
-                border.color: settingsButton.hovered ? "#ffffff" : "#333"
+                color: settingsButton.hovered ? Theme.accent : Theme.bgRaised
+                border.color: settingsButton.hovered ? Theme.focusRing : Theme.borderControl
 
                 Text {
                     anchors.centerIn: parent
                     text: "⚙"
                     font.pixelSize: 17
-                    color: settingsButton.hovered ? "black" : "#888"
+                    color: settingsButton.hovered ? Theme.textInverse : Theme.textMuted
                 }
 
                 MouseArea {
@@ -658,14 +737,14 @@ Window {
 
                 implicitWidth: 120; implicitHeight: 35; radius: 17
                 visible: root.activeTab === "Recommendations"
-                color: refreshButton.hovered ? "#ffffff" : "#1a1a1a"
-                border.color: refreshButton.hovered ? "#ffffff" : "#333"
+                color: refreshButton.hovered ? Theme.accent : Theme.bgRaised
+                border.color: refreshButton.hovered ? Theme.focusRing : Theme.borderControl
 
                 Text {
                     anchors.centerIn: parent
                     text: "REFRESH"
                     font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                    color: refreshButton.hovered ? "black" : "#888"
+                    color: refreshButton.hovered ? Theme.textInverse : Theme.textMuted
                 }
 
                 MouseArea {
@@ -703,7 +782,7 @@ Window {
                     visible: gameGrid.count === 0 && root.activeTab === "Favorites"
                     text: "NO FAVORITES YET\nOpen a game and tap the heart"
                     horizontalAlignment: Text.AlignHCenter
-                    color: "#444"
+                    color: Theme.textGhost
                     font.pixelSize: 16
                     font.bold: true
                     font.letterSpacing: 2
@@ -714,13 +793,42 @@ Window {
                     visible: gameGrid.count === 0 && root.activeTab === "Played"
                     text: "NOTHING PLAYED YET\nLaunch a game and it lands here for good"
                     horizontalAlignment: Text.AlignHCenter
-                    color: "#444"
+                    color: Theme.textGhost
                     font.pixelSize: 16
                     font.bold: true
                     font.letterSpacing: 2
                 }
 
+                // Where to put the grid back after the details page changes
+                // a list it is showing.
+                //
+                // Favorites and Played are derived lists: a heart moving
+                // rebuilds them, GridView is handed a new JS array and answers
+                // by dropping the scroll position. The Library escapes this
+                // because the bridge patches gameList in place (see
+                // updatePreference), which a derived list cannot do.
+                //
+                // Captured when the details page opens rather than when the
+                // change lands -- by then the old position is already gone --
+                // and re-asserted rather than applied once, because
+                // contentHeight is not final when countChanged fires. Safe to
+                // re-assert: the page is modal, so nothing can scroll the grid
+                // while a value is pending. -1 means nothing is.
+                property real restoreY: -1
+
+                function restoreScroll() {
+                    if (gameGrid.restoreY < 0)
+                        return
+                    gameGrid.contentY = Math.max(0, Math.min(
+                        gameGrid.restoreY,
+                        gameGrid.contentHeight - gameGrid.height))
+                }
+
+                onContentHeightChanged: gameGrid.restoreScroll()
+
                 onCountChanged: {
+                    gameGrid.restoreScroll()
+
                     if (!root.padActive || gameGrid.count === 0)
                         gameGrid.currentIndex = -1
                     else if (gameGrid.currentIndex < 0)
@@ -752,8 +860,15 @@ Window {
 
                     // Mouse hover and controller focus light the card the same
                     // way, but only whichever input is currently driving.
+                    //
+                    // The overflow button counts as being on the card. It sits
+                    // above cardArea and takes the hover off it, and since the
+                    // button only shows while the card is lit, leaving it out
+                    // here made the two chase each other: hover the button, the
+                    // card unlights, the button vanishes, the card lights again.
                     readonly property bool highlighted:
-                        (cardArea.containsMouse && root.mouseInControl)
+                        ((cardArea.containsMouse || overflowArea.containsMouse)
+                         && root.mouseInControl)
                         || (gameDelegate.GridView.isCurrentItem && root.padInControl)
 
                     // The live row for this card, re-read whenever the scan
@@ -790,6 +905,13 @@ Window {
 
                     width: 240; height: 400
 
+                    // Opened by the card's own button and, for the pad, by
+                    // root.controllerOptions() reaching through currentItem.
+                    function openTileMenu() {
+                        tileMenu.openFor(overflowButton, gameDelegate.liveName,
+                                         gameDelegate.modelData.installDir || "")
+                    }
+
                     Column {
                         anchors.centerIn: parent
                         spacing: 12
@@ -797,8 +919,8 @@ Window {
                         Rectangle {
                             id: capsuleContainer
                             width: 240; height: 360
-                            color: "#1a1a1a"; radius: 12
-                            border.color: gameDelegate.highlighted ? "white" : "#333"
+                            color: Theme.bgRaised; radius: 12
+                            border.color: gameDelegate.highlighted ? Theme.focusRing : Theme.borderControl
                             border.width: 2; clip: true
 
                             Image {
@@ -821,7 +943,7 @@ Window {
                             Column {
                                 anchors.centerIn: parent; spacing: 10
                                 visible: gameCover.status !== Image.Ready
-                                Text { text: "NO ART"; color: "#333"; font.bold: true }
+                                Text { text: "NO ART"; color: Theme.textGhost; font.bold: true }
                             }
 
                             // ── Played tab markers ──────────────────────────
@@ -839,8 +961,8 @@ Window {
                                 width: playtimePill.implicitWidth + 18
                                 height: 24
                                 radius: 12
-                                color: "#D9000000"
-                                border.color: "#3a3a3a"
+                                color: Theme.overlayBadge
+                                border.color: Theme.borderControl
 
                                 Text {
                                     id: playtimePill
@@ -851,7 +973,7 @@ Window {
                                     text: (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
                                           ? gameDelegate.liveDetails.playtime
                                           : (gameDelegate.modelData.playtime || "0m")
-                                    color: "#ddd"
+                                    color: Theme.textBody
                                     font.pixelSize: 11
                                     font.bold: true
                                 }
@@ -863,20 +985,23 @@ Window {
                             Rectangle {
                                 visible: root.activeTab === "Played"
                                          && gameDelegate.modelData.installed === true
-                                anchors.right: parent.right
+                                // Top-LEFT: the top-right corner belongs to the
+                                // overflow button, which appears over the art
+                                // the moment the card is hovered or focused.
+                                anchors.left: parent.left
                                 anchors.top: parent.top
                                 anchors.margins: 10
                                 width: installedTag.implicitWidth + 16
                                 height: 22
                                 radius: 11
-                                color: "#D91e4d2f"
-                                border.color: "#27ae60"
+                                color: Theme.overlayPositive
+                                border.color: Theme.positive
 
                                 Text {
                                     id: installedTag
                                     anchors.centerIn: parent
                                     text: "INSTALLED"
-                                    color: "#7fe0a0"
+                                    color: Theme.positiveText
                                     font.pixelSize: 9
                                     font.bold: true
                                     font.letterSpacing: 1
@@ -890,7 +1015,7 @@ Window {
                         Text {
                             anchors.horizontalCenter: parent.horizontalCenter
                             text: gameDelegate.liveName
-                            color: gameDelegate.highlighted ? "white" : "#ccc"
+                            color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
                             font.pixelSize: 15; font.weight: Font.DemiBold
                             horizontalAlignment: Text.AlignHCenter
                             elide: Text.ElideRight; width: 220
@@ -912,6 +1037,78 @@ Window {
                             detailPopup.open()
                         }
                     }
+
+                    // ── Overflow button ─────────────────────────────────────
+                    //
+                    // Declared AFTER cardArea, and as its sibling rather than a
+                    // child of the art: cardArea fills the whole card, so
+                    // anything earlier in the file sits under it and would never
+                    // see the click.
+                    //
+                    // Anchored to the delegate rather than to the art it sits
+                    // on: capsuleContainer is a child of the Column, so it is
+                    // neither parent nor sibling here and anchoring to it is
+                    // refused outright. The Column centres 360px of art plus a
+                    // ~20px title in 400px, so the art starts 4px down -- 14
+                    // puts the button 10px inside its top-right corner, and it
+                    // stays put while the art scales under it on hover.
+                    Rectangle {
+                        id: overflowButton
+                        readonly property bool hovered:
+                            overflowArea.containsMouse && root.mouseInControl
+                        // Stays up while its own menu is open, or it would
+                        // vanish the moment the pointer left the card for it.
+                        readonly property bool menuOpen:
+                            tileMenu.visible
+                            && tileMenu.gameName === gameDelegate.liveName
+
+                        anchors {
+                            top: parent.top
+                            right: parent.right
+                            topMargin: 4
+                            rightMargin: 2
+                        }
+                        width: 32; height: 32; radius: 16
+
+                        // Semi-opaque rather than solid: the cover art stays
+                        // readable underneath it.
+                        color: overflowButton.hovered ? Theme.overlayBadge : Theme.overlayButton
+                        border.width: 1
+                        border.color: overflowButton.hovered ? Theme.focusRing : Theme.borderStrong
+
+                        visible: opacity > 0
+                        opacity: (gameDelegate.highlighted || overflowButton.menuOpen)
+                                 ? 1.0 : 0.0
+                        Behavior on opacity { NumberAnimation { duration: 150 } }
+                        Behavior on color { ColorAnimation { duration: 120 } }
+
+                        // Drawn rather than typed: the ⋮ glyph renders at a
+                        // different weight and baseline in every font, and the
+                        // rest of this UI has no font family set at all.
+                        Column {
+                            anchors.centerIn: parent
+                            spacing: 3
+                            Repeater {
+                                model: 3
+                                Rectangle {
+                                    width: 4; height: 4; radius: 2
+                                    color: overflowButton.hovered ? Theme.accent : Theme.bgDot
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            id: overflowArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (root.padActive)
+                                    gameGrid.currentIndex = gameDelegate.index
+                                gameDelegate.openTileMenu()
+                            }
+                        }
+                    }
                 }
             }
 
@@ -928,7 +1125,7 @@ Window {
 
                         Text {
                             text: "RECOMMENDATIONS"
-                            color: "white"
+                            color: Theme.textPrimary
                             font.pixelSize: 22
                             font.bold: true
                             font.letterSpacing: 2
@@ -962,7 +1159,7 @@ Window {
 
                             // Amber for a real blocker, so it reads as
                             // something to act on rather than as status noise.
-                            color: (blocker !== "" && !downloadingCatalog) ? "#e0a33a" : "#777"
+                            color: (blocker !== "" && !downloadingCatalog) ? Theme.caution : Theme.textMuted
                             font.pixelSize: 13
                             elide: Text.ElideRight
                             Layout.fillWidth: true
@@ -1023,14 +1220,14 @@ Window {
                                         spacing: 10
                                         Text {
                                             text: sectionColumn.modelData.title
-                                            color: "#bbb"
+                                            color: Theme.textSecondary
                                             font.pixelSize: 14
                                             font.bold: true
                                             font.letterSpacing: 2
                                         }
                                         Text {
                                             text: sectionColumn.modelData.blurb
-                                            color: "#555"
+                                            color: Theme.textFaint
                                             font.pixelSize: 12
                                             anchors.verticalCenter: parent.verticalCenter
                                         }
@@ -1066,7 +1263,7 @@ Window {
                                                     spacing: 3
                                                     Text {
                                                         text: root.api ? root.api.catalogPhase : ""
-                                                        color: "#bbb"
+                                                        color: Theme.textSecondary
                                                         font.pixelSize: 13
                                                     }
                                                     Text {
@@ -1080,7 +1277,7 @@ Window {
                                                               ? (root.api.catalogFetched
                                                                  + " games downloaded so far")
                                                               : "This runs once and takes a few minutes."
-                                                        color: "#555"
+                                                        color: Theme.textFaint
                                                         font.pixelSize: 11
                                                     }
                                                 }
@@ -1091,7 +1288,7 @@ Window {
                                                          && !sectionColumn.igdbUsable
                                                 width: 620
                                                 wrapMode: Text.WordWrap
-                                                color: "#666"
+                                                color: Theme.textFaint
                                                 font.pixelSize: 12
                                                 // Says which of the two it is
                                                 // rather than guessing: keys
@@ -1109,7 +1306,7 @@ Window {
                                                          && sectionColumn.igdbUsable
                                                 width: 620
                                                 wrapMode: Text.WordWrap
-                                                color: "#666"
+                                                color: Theme.textFaint
                                                 font.pixelSize: 12
                                                 text: "Nothing to suggest yet. Play a few games so Vortex "
                                                     + "learns what you like, or refresh the catalogue "
@@ -1185,9 +1382,9 @@ Window {
                                                     width: 240
                                                     height: 360
                                                     radius: 12
-                                                    color: "#141414"
+                                                    color: Theme.bgSurface
                                                     border.width: 2
-                                                    border.color: recommendationDelegate.highlighted ? "white" : "#303030"
+                                                    border.color: recommendationDelegate.highlighted ? Theme.focusRing : Theme.borderMuted
                                                     clip: true
 
                                                     Image {
@@ -1210,8 +1407,8 @@ Window {
                                                         anchors.top: parent.top
                                                         anchors.margins: 10
                                                         width: 30; height: 30; radius: 15
-                                                        color: "#E6000000"
-                                                        border.color: "#3a3a3a"
+                                                        color: Theme.overlayStrong
+                                                        border.color: Theme.borderControl
                                                         Text {
                                                             anchors.centerIn: parent
                                                             text: "\u{1F6D2}"
@@ -1227,7 +1424,7 @@ Window {
                                                         Text {
                                                             anchors.horizontalCenter: parent.horizontalCenter
                                                             text: "ML PICK"
-                                                            color: "#333"
+                                                            color: Theme.textGhost
                                                             font.pixelSize: 18
                                                             font.bold: true
                                                             font.letterSpacing: 2
@@ -1237,7 +1434,7 @@ Window {
                                                             anchors.horizontalCenter: parent.horizontalCenter
                                                             width: 200
                                                             text: recommendationDelegate.modelData.matched ? "NO ART" : "NOT IN LIBRARY"
-                                                            color: "#555"
+                                                            color: Theme.textFaint
                                                             font.pixelSize: 12
                                                             horizontalAlignment: Text.AlignHCenter
                                                         }
@@ -1273,7 +1470,7 @@ Window {
                                                         width: 220
                                                         height: 20
                                                         text: recommendationDelegate.modelData.name
-                                                        color: recommendationDelegate.highlighted ? "white" : "#ccc"
+                                                        color: recommendationDelegate.highlighted ? Theme.textPrimary : Theme.textBody
                                                         font.pixelSize: 15
                                                         font.weight: Font.DemiBold
                                                         horizontalAlignment: Text.AlignHCenter
@@ -1300,7 +1497,7 @@ Window {
                                                         width: 220
                                                         height: 30
                                                         text: recommendationDelegate.modelData.reason || ""
-                                                        color: "#6f6f6f"
+                                                        color: Theme.textFaint
                                                         font.pixelSize: 11
                                                         lineHeight: 15
                                                         lineHeightMode: Text.FixedHeight
@@ -1349,7 +1546,7 @@ Window {
                                                         text: topMatch
                                                               ? (Math.round(topMatch.similarity * 100) + "% match")
                                                               : ""
-                                                        color: "#4a4a4a"
+                                                        color: Theme.textGhost
                                                         font.pixelSize: 10
                                                         font.letterSpacing: 0.5
                                                         verticalAlignment: Text.AlignVCenter
@@ -1391,7 +1588,7 @@ Window {
                                  && root.api.recommendationList
                                  && root.api.recommendationList.length === 0
                         text: "NO RECOMMENDATIONS YET"
-                        color: "#444"
+                        color: Theme.textGhost
                         font.pixelSize: 18
                         font.bold: true
                         font.letterSpacing: 2
@@ -1416,7 +1613,24 @@ Window {
                     ScrollBar.vertical: VortexScrollBar { }
 
                     currentIndex: -1
+
+                    // Same as gameGrid.restoreY, for the same reason: removing
+                    // a game from the wishlist rebuilds wishlistGames.
+                    property real restoreY: -1
+
+                    function restoreScroll() {
+                        if (wishlistGrid.restoreY < 0)
+                            return
+                        wishlistGrid.contentY = Math.max(0, Math.min(
+                            wishlistGrid.restoreY,
+                            wishlistGrid.contentHeight - wishlistGrid.height))
+                    }
+
+                    onContentHeightChanged: wishlistGrid.restoreScroll()
+
                     onCountChanged: {
+                        wishlistGrid.restoreScroll()
+
                         if (!root.padActive || wishlistGrid.count === 0)
                             wishlistGrid.currentIndex = -1
                         else if (wishlistGrid.currentIndex < 0)
@@ -1428,7 +1642,7 @@ Window {
                         visible: wishlistGrid.count === 0
                         text: "NOTHING WISHLISTED YET\nOpen a Discover pick and tap Add to Wishlist"
                         horizontalAlignment: Text.AlignHCenter
-                        color: "#444"
+                        color: Theme.textGhost
                         font.pixelSize: 16
                         font.bold: true
                         font.letterSpacing: 2
@@ -1454,9 +1668,9 @@ Window {
                                 width: 260
                                 height: 320
                                 radius: 12
-                                color: "#141414"
+                                color: Theme.bgSurface
                                 border.width: 2
-                                border.color: wishlistDelegate.highlighted ? "white" : "#303030"
+                                border.color: wishlistDelegate.highlighted ? Theme.focusRing : Theme.borderMuted
                                 clip: true
 
                                 Image {
@@ -1472,7 +1686,7 @@ Window {
                                     anchors.centerIn: parent
                                     visible: wishlistCover.status !== Image.Ready
                                     text: "NOT IN LIBRARY"
-                                    color: "#555"
+                                    color: Theme.textFaint
                                     font.pixelSize: 12
                                 }
 
@@ -1484,7 +1698,7 @@ Window {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 width: 240
                                 text: wishlistDelegate.modelData.name
-                                color: wishlistDelegate.highlighted ? "white" : "#ccc"
+                                color: wishlistDelegate.highlighted ? Theme.textPrimary : Theme.textBody
                                 font.pixelSize: 15
                                 font.weight: Font.DemiBold
                                 horizontalAlignment: Text.AlignHCenter
@@ -1495,7 +1709,7 @@ Window {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 width: 240
                                 text: wishlistDelegate.modelData.developer || ""
-                                color: "#6f6f6f"
+                                color: Theme.textFaint
                                 font.pixelSize: 11
                                 horizontalAlignment: Text.AlignHCenter
                                 elide: Text.ElideRight
@@ -1527,7 +1741,7 @@ Window {
     Rectangle {
         id: moodOverlay
         anchors.fill: parent
-        color: "black"
+        color: Theme.bgWindow
         visible: true
         z: 10
 
@@ -1544,8 +1758,8 @@ Window {
             anchors.fill: parent
             gradient: Gradient {
                 orientation: Gradient.Vertical
-                GradientStop { position: 0.0; color: "#0d0d0d" }
-                GradientStop { position: 1.0; color: "#000000" }
+                GradientStop { position: 0.0; color: Theme.bgSunken }
+                GradientStop { position: 1.0; color: Theme.bgWindow }
             }
         }
 
@@ -1560,13 +1774,13 @@ Window {
 
                 Text {
                     text: "VORTEX"
-                    color: "white"
+                    color: Theme.textPrimary
                     font.pixelSize: 72; font.bold: true; font.letterSpacing: 8
                     Layout.alignment: Qt.AlignHCenter
                 }
                 Text {
                     text: "select your mood to begin"
-                    color: "#555"
+                    color: Theme.textFaint
                     font.pixelSize: 16; font.letterSpacing: 3
                     Layout.alignment: Qt.AlignHCenter
                 }
@@ -1585,7 +1799,7 @@ Window {
                     label: "Neutral"
                     icon: "🎯"
                     description: "just my history\nno mood filter"
-                    accentColor: "#7f8c8d"
+                    accentColor: Theme.moodNeutral
                     onSelected: function(idx) { moodOverlay.chooseMood(idx) }
                 }
 
@@ -1595,7 +1809,7 @@ Window {
                     label: "Relaxed"
                     icon: "🌿"
                     description: "casual play\nno pressure"
-                    accentColor: "#27ae60"
+                    accentColor: Theme.moodRelaxed
                     onSelected: function(idx) { moodOverlay.chooseMood(idx) }
                 }
 
@@ -1605,7 +1819,7 @@ Window {
                     label: "Competitive"
                     icon: "⚔️"
                     description: "ranked matches\nhigh performance"
-                    accentColor: "#e74c3c"
+                    accentColor: Theme.moodCompetitive
                     onSelected: function(idx) { moodOverlay.chooseMood(idx) }
                 }
 
@@ -1615,7 +1829,7 @@ Window {
                     label: "Immersive"
                     icon: "🌌"
                     description: "story & exploration\nlose yourself"
-                    accentColor: "#9b59b6"
+                    accentColor: Theme.moodImmersive
                     onSelected: function(idx) { moodOverlay.chooseMood(idx) }
                 }
             }
@@ -1644,8 +1858,8 @@ Window {
         color: moodCard.highlighted ? Qt.rgba(
             Qt.color(accentColor).r,
             Qt.color(accentColor).g,
-            Qt.color(accentColor).b, 0.12) : "#111111"
-        border.color: moodCard.highlighted ? accentColor : "#222"
+            Qt.color(accentColor).b, 0.12) : Theme.bgPanel
+        border.color: moodCard.highlighted ? accentColor : Theme.borderQuiet
         border.width: moodCard.highlighted ? 2 : 1
 
         Behavior on color  { ColorAnimation { duration: 200 } }
@@ -1666,7 +1880,7 @@ Window {
 
             Text {
                 text: moodCard.label.toUpperCase()
-                color: moodCard.highlighted ? moodCard.accentColor : "white"
+                color: moodCard.highlighted ? moodCard.accentColor : Theme.textPrimary
                 font.pixelSize: 22; font.bold: true; font.letterSpacing: 2
                 Layout.alignment: Qt.AlignHCenter
                 Behavior on color { ColorAnimation { duration: 200 } }
@@ -1674,7 +1888,7 @@ Window {
 
             Text {
                 text: moodCard.description
-                color: "#666"
+                color: Theme.textFaint
                 font.pixelSize: 13
                 horizontalAlignment: Text.AlignHCenter
                 Layout.alignment: Qt.AlignHCenter

@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Vortex
 
 // Shared vertical scrollbar for the launcher's scrollable views.
 //
@@ -27,14 +28,16 @@ ScrollBar {
     contentItem: Rectangle {
         implicitWidth: 6
         radius: width / 2
-        color: control.pressed ? "white" : (control.hovered ? "#888" : "#3a3a3a")
+        color: control.pressed ? Theme.scrollHandleDown
+                               : (control.hovered ? Theme.scrollHandleHover
+                                                 : Theme.scrollHandle)
         Behavior on color { ColorAnimation { duration: 150 } }
     }
 
     background: Rectangle {
         radius: width / 2
-        color: "#141414"
-        border.color: "#222"
+        color: Theme.bgSurface
+        border.color: Theme.borderQuiet
         border.width: 1
         opacity: control.hovered || control.pressed ? 1 : 0
         Behavior on opacity { NumberAnimation { duration: 150 } }
