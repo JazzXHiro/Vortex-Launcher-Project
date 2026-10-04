@@ -348,7 +348,8 @@ void scan_directory_for_games(const fs::path &gameDir,
   }
 }
 
-int launchGame(const fs::path &gamePath) {
+int launchGame(const fs::path &gamePath,
+               const std::function<void()> &onStarted) {
 #ifdef _WIN32
   std::wstring command = L"\"" + gamePath.wstring() + L"\"";
 
@@ -378,12 +379,17 @@ int launchGame(const fs::path &gamePath) {
 
       if (ShellExecuteExW(&sei)) {
         if (sei.hProcess) {
+          WaitForInputIdle(sei.hProcess, 10000);
+          if (onStarted)
+            onStarted();
           WaitForSingleObject(sei.hProcess, INFINITE);
           DWORD exitCode = 0;
           GetExitCodeProcess(sei.hProcess, &exitCode);
           CloseHandle(sei.hProcess);
           return static_cast<int>(exitCode);
         }
+        if (onStarted)
+          onStarted();
         return 0;
       } else {
         std::cerr << "[ERROR] ShellExecuteEx failed. Error code: "
@@ -394,6 +400,13 @@ int launchGame(const fs::path &gamePath) {
     std::cerr << "[ERROR] CreateProcess failed. Error code: " << err << "\n";
     return -1;
   }
+
+  // Returns once the game is pumping messages -- its window is up -- or at
+  // once for a process with no GUI. The cap keeps a game that never goes
+  // idle from sitting on LAUNCHING forever.
+  WaitForInputIdle(pi.hProcess, 10000);
+  if (onStarted)
+    onStarted();
 
   // Wait until child process exits.
   WaitForSingleObject(pi.hProcess, INFINITE);
@@ -407,6 +420,7 @@ int launchGame(const fs::path &gamePath) {
   return static_cast<int>(exitCode);
 #else
   std::cout << "[MOCK] Linux: Skipping actual launch for " << gamePath << "\n";
+  (void)onStarted;
   return 0;
 #endif
 }
@@ -457,5 +471,84 @@ bool is_game_running_in_dir(const fs::path &installDir) {
   return found;
 #else
   return false;
+#endif
+}
+
+#ifdef _WIN32
+// The ids of every process whose image lives under installDir; the same
+// prefix match is_game_running_in_dir() uses.
+static std::vector<DWORD> pids_in_dir(const fs::path &installDir) {
+  std::vector<DWORD> pids;
+  if (installDir.empty())
+    return pids;
+
+  std::wstring dirStr = installDir.wstring();
+  if (dirStr.back() != L'\\' && dirStr.back() != L'/')
+    dirStr += L'\\';
+  std::transform(dirStr.begin(), dirStr.end(), dirStr.begin(), ::towlower);
+
+  HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (hSnapshot == INVALID_HANDLE_VALUE)
+    return pids;
+
+  PROCESSENTRY32W pe32;
+  pe32.dwSize = sizeof(PROCESSENTRY32W);
+  if (Process32FirstW(hSnapshot, &pe32)) {
+    do {
+      HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                    pe32.th32ProcessID);
+      if (!hProcess)
+        continue;
+      wchar_t pathBuf[MAX_PATH];
+      DWORD size = MAX_PATH;
+      if (QueryFullProcessImageNameW(hProcess, 0, pathBuf, &size)) {
+        std::wstring procPath = pathBuf;
+        std::transform(procPath.begin(), procPath.end(), procPath.begin(),
+                       ::towlower);
+        if (procPath.find(dirStr) == 0)
+          pids.push_back(pe32.th32ProcessID);
+      }
+      CloseHandle(hProcess);
+    } while (Process32NextW(hSnapshot, &pe32));
+  }
+  CloseHandle(hSnapshot);
+  return pids;
+}
+
+static BOOL CALLBACK post_close_to_pid(HWND hwnd, LPARAM lParam) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == static_cast<DWORD>(lParam) && IsWindowVisible(hwnd))
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+  return TRUE;
+}
+#endif
+
+int quit_games_in_dir(const fs::path &installDir, int graceSeconds) {
+#ifdef _WIN32
+  const std::vector<DWORD> pids = pids_in_dir(installDir);
+  for (DWORD pid : pids)
+    EnumWindows(post_close_to_pid, static_cast<LPARAM>(pid));
+
+  for (int waited = 0; waited < graceSeconds * 2; ++waited) {
+    if (pids_in_dir(installDir).empty())
+      return static_cast<int>(pids.size());
+    Sleep(500);
+  }
+
+  // Still up: no window, ignored WM_CLOSE, or sitting on a confirm dialog.
+  // An elevated game refuses the handle, and there is nothing more to do.
+  for (DWORD pid : pids_in_dir(installDir)) {
+    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (hProcess) {
+      TerminateProcess(hProcess, 0);
+      CloseHandle(hProcess);
+    }
+  }
+  return static_cast<int>(pids.size());
+#else
+  (void)installDir;
+  (void)graceSeconds;
+  return 0;
 #endif
 }

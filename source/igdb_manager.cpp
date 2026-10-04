@@ -16,9 +16,11 @@
 // also means rotating a key no longer requires a rebuild.
 
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -329,19 +331,25 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
       }
   }
 
-  // Extract "id"
-  auto id_pos = root_obj.find("\"id\"");
-  if (id_pos != string::npos) {
-    id_pos += 4;
-    while (id_pos < root_obj.size() && (root_obj[id_pos] == ' ' || root_obj[id_pos] == ':'))
-      id_pos++;
-    long long id = 0;
-    while (id_pos < root_obj.size() && std::isdigit((unsigned char)root_obj[id_pos])) {
-      id = id * 10 + (root_obj[id_pos] - '0');
-      id_pos++;
+  // Root-level integer field, 0 when absent.
+  auto root_int = [&root_obj](const char *key) -> long long {
+    auto pos = root_obj.find(key);
+    if (pos == string::npos)
+      return 0;
+    pos += std::strlen(key);
+    while (pos < root_obj.size() && (root_obj[pos] == ' ' || root_obj[pos] == ':'))
+      pos++;
+    long long value = 0;
+    while (pos < root_obj.size() && std::isdigit((unsigned char)root_obj[pos])) {
+      value = value * 10 + (root_obj[pos] - '0');
+      pos++;
     }
-    info.id = id;
-  }
+    return value;
+  };
+
+  info.id = root_int("\"id\"");
+  info.standalone = root_int("\"parent_game\"") == 0 &&
+                    root_int("\"version_parent\"") == 0;
 
   // Extract "name"
   auto name_pos = root_obj.find("\"name\"");
@@ -505,7 +513,8 @@ static IgdbGameInfo extract_info_at(const string &json, size_t &from) {
 // which pass resolved the game.
 static const char *const IGDB_FIELDS =
     "fields id, name, total_rating, involved_companies.company.name, "
-    "involved_companies.developer, genres.name, themes.name, game_modes.name;";
+    "involved_companies.developer, genres.name, themes.name, game_modes.name, "
+    "parent_game, version_parent;";
 
 // Reduce a store name to bare words for IGDB's fuzzy `search`.
 //
@@ -535,10 +544,17 @@ static string search_friendly(const string &name) {
 // Walk all "name" fields in the response.
 // Priority:
 //   1. Canonical exact match  (alphanumeric-only, lowercase)
-//   2. First result as fallback
+//   2. First standalone game
+//   3. First result as fallback
+//
+// Step 2 matters because the substring pass returns results in no fixed order,
+// and a game whose IGDB title does not equal its folder name ("NTE: Neverness
+// to Everness" for a "Neverness To Everness" folder) would otherwise resolve to
+// whichever of its updates or DLCs happened to come back first.
 static IgdbGameInfo extract_best_info(const string &json, const string &query) {
   const string queryCanon = make_canonical(query);
   IgdbGameInfo first;
+  IgdbGameInfo firstStandalone;
   size_t cursor = 0;
 
   while (cursor != string::npos) {
@@ -547,10 +563,12 @@ static IgdbGameInfo extract_best_info(const string &json, const string &query) {
       break;
     if (first.name.empty())
       first = info;
+    if (firstStandalone.name.empty() && info.standalone)
+      firstStandalone = info;
     if (make_canonical(info.name) == queryCanon)
       return info; // canonical match — wins immediately
   }
-  return first; // no canonical match — best guess is first result
+  return firstStandalone.name.empty() ? first : firstStandalone;
 }
 
 // ---------- Cache -------------------------------------------
@@ -901,4 +919,53 @@ IgdbGameInfo igdb_resolve_game(const std::string &folderName,
              "-> " + resolved.name + " (id " + std::to_string(resolved.id) + ")");
   save_to_cache(folderName, resolved);
   return resolved;
+}
+
+// ---------- raw queries -------------------------------------
+
+// Serialises the token refresh only. Browse searches arrive in bursts as the
+// user types, and two workers racing through igdb_fetch_token() would both
+// rewrite s_access_token while the other was reading it.
+static std::mutex s_token_mutex;
+
+std::string igdb_query(const std::string &endpoint, const std::string &body) {
+  const string client_id = get_secret("IGDB_CLIENT_ID");
+  if (client_id.empty() || get_secret("IGDB_CLIENT_SECRET").empty())
+    throw std::runtime_error("IGDB credentials are not set");
+
+  const wstring path = L"/v4/" + widen_ascii(endpoint);
+
+  // Two attempts: the second only after a 401, with a freshly issued token.
+  // Twitch tokens last about two months, so a launcher left running that long
+  // is the one case where the cached token goes stale under us.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    string token;
+    {
+      std::lock_guard<std::mutex> lock(s_token_mutex);
+      if (attempt > 0) {
+        s_access_token.clear();
+        s_token_fetch_failed = false;
+      }
+      if (s_access_token.empty() && !igdb_fetch_token()) {
+        s_last_auth_ok = false;
+        throw std::runtime_error("IGDB authentication failed");
+      }
+      token = s_access_token;
+    }
+
+    const wstring headers =
+        L"Client-ID: " + widen_ascii(client_id) + L"\r\n" +
+        L"Authorization: Bearer " + widen_ascii(token) + L"\r\n" +
+        L"Content-Type: text/plain";
+    try {
+      string resp = https_post(L"api.igdb.com", path, headers, body);
+      s_last_auth_ok = true;
+      return resp;
+    } catch (const std::exception &e) {
+      if (attempt == 0 && http_status_from_error(e.what()) == 401)
+        continue;
+      throw;
+    }
+  }
+  throw std::runtime_error("IGDB rejected the access token");
 }

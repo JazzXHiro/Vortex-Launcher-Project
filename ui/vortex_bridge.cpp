@@ -14,6 +14,7 @@
 
 #include <QMetaObject>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -37,6 +38,7 @@
 #include <QUuid>
 
 #include <functional>
+#include <memory>
 #include <QVersionNumber>
 
 #include <chrono>
@@ -68,6 +70,8 @@ VortexBridge::VortexBridge(QObject *parent) : QObject(parent),
     m_baseDir(resolveBaseDir()) {
     init_stats_manager(m_baseDir.string());
     repair_metadata_cache_file();
+    // Before the saved lists: loading them applies cached live art.
+    loadLiveArtCache();
     loadWishlist();
     loadFavoriteSnapshots();
     loadRemovedGames();
@@ -159,50 +163,37 @@ void VortexBridge::setRecommendationStatus(const QString &status) {
     }
 }
 
-// Artwork for unowned recommendations lives in its own root, deliberately not
-// inside Images/. That namespace is keyed by game name and
-// delete_steamgriddb_images() runs over it whenever a local folder is removed,
-// which would silently delete a candidate's cover on a name collision.
-static fs::path candidateImagesDir(const fs::path &baseDir) {
+// Where older builds downloaded artwork for unowned games. Nothing writes here
+// any more -- unowned art loads live by URL -- and removeLegacyCandidateImages()
+// deletes what an older build left behind. Still named because rows saved by
+// those builds hold file:// paths into it, which applyLiveArtFallback() has to
+// recognise to replace.
+static fs::path legacyCandidateImagesDir(const fs::path &baseDir) {
     return baseDir / "CandidateImages";
 }
 
-static std::string candidateCoverStem(const QString &name) {
-    std::string stem = name.toStdString();
-    for (char &c : stem)
-        if (c == '<' || c == '>' || c == ':' || c == '"' || c == '/' ||
-            c == '\\' || c == '|' || c == '?' || c == '*')
-            c = '_';
-    return stem;
-}
+static void removeLegacyCandidateImages(const fs::path &baseDir) {
+    const fs::path root = legacyCandidateImagesDir(baseDir);
+    std::error_code ec;
+    if (!fs::exists(root, ec))
+        return;
 
-// Covers stay flat at CandidateImages/<stem>.<ext> -- that is where the ones
-// already downloaded live, and moving them would re-fetch every one. Hero and
-// logo, added later, get a subdirectory each rather than a suffix on the stem:
-// candidateCoverStem() folds nine characters onto '_', so "<stem>_hero" can
-// collide with a real title that sanitises to the same thing, while a directory
-// never can.
-static fs::path candidateArtDir(const fs::path &root, const QString &kind) {
-    return kind.isEmpty() ? root : root / kind.toStdString();
-}
-
-static QString findCandidateArt(const fs::path &root, const QString &name,
-                                const QString &kind) {
-    const std::string stem = candidateCoverStem(name);
-    const fs::path dir = candidateArtDir(root, kind);
-    for (const std::string &ext : {".jpg", ".png", ".jpeg"}) {
-        fs::path full = dir / (stem + ext);
-        std::error_code ec;
-        if (fs::exists(full, ec) && !ec) {
-            QString abs = QString::fromStdString(fs::absolute(full).string());
-            return QUrl::fromLocalFile(abs).toString();
+    std::uintmax_t bytes = 0;
+    for (auto it = fs::recursive_directory_iterator(root, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        std::error_code sizeEc;
+        if (it->is_regular_file(sizeEc)) {
+            const std::uintmax_t size = it->file_size(sizeEc);
+            if (!sizeEc)
+                bytes += size;
         }
     }
-    return "";
-}
-
-static QString findCandidateCover(const fs::path &root, const QString &name) {
-    return findCandidateArt(root, name, QString());
+    std::error_code removeEc;
+    const std::uintmax_t files = fs::remove_all(root, removeEc);
+    vlog::line("Artwork", "Deleted the old artwork cache (CandidateImages): " +
+                          std::to_string(files) + " entries, " +
+                          std::to_string(bytes / (1024 * 1024)) + " MB" +
+                          (removeEc ? " -- some files could not be removed" : ""));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,95 +225,14 @@ static QString igdbHeroUrl(const QString &coverUrl) {
     return url == coverUrl ? QString() : url;
 }
 
-// Ordered; each entry is tried until one returns bytes.
-static QStringList artworkUrlChain(const QVariantMap &item, const QString &kind) {
-    const int appId = item.value("steamAppId").toInt();
-    QStringList urls;
-
-    if (kind == QLatin1String("hero")) {
-        // library_hero.jpg is 1920x620 and is what the Steam client itself
-        // draws behind a library page. Apps older than that layout 404 on it,
-        // which is why IGDB follows rather than replaces it.
-        if (appId > 0)
-            urls << steamArtUrl(appId, QStringLiteral("library_hero.jpg"));
-        const QString igdb = igdbHeroUrl(item.value("coverUrl").toString());
-        if (!igdb.isEmpty())
-            urls << igdb;
-    } else if (kind == QLatin1String("logo")) {
-        // No IGDB equivalent: it has no transparent logo art at all. Without an
-        // appid this slot stays empty and GameDetails centres the cover.
-        if (appId > 0)
-            urls << steamArtUrl(appId, QStringLiteral("logo.png"));
-    }
-
-    return urls;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Negative cache, mirroring the .sgdb_state convention in
-// steamgriddb_manager.cpp: a game with nothing upstream would otherwise
-// re-request every time its details page is opened, forever. One file for the
-// whole root rather than one per game, because candidates are flat files and
-// have no per-game directory to hold it.
-//
-// Only definitive answers are stamped. Being offline must never write a game
-// off, so fetchArtworkFrom() stamps only when every attempt in the chain failed
-// for a reason the server actually gave.
-// ─────────────────────────────────────────────────────────────────────────────
-static constexpr std::time_t kArtworkNegativeCacheSeconds = 7 * 24 * 60 * 60;
-
-static fs::path artworkStatePath(const fs::path &root) {
-    return root / ".artwork_state";
-}
-
-// Keyed on the sanitised stem, so the separator cannot appear in it: '|' is one
-// of the characters candidateCoverStem() replaces. '=' is legal in a Windows
-// filename, hence rfind below rather than find.
-static QString artworkStateKey(const QString &name, const QString &kind) {
-    return QString::fromStdString(candidateCoverStem(name)) + QLatin1Char('|') + kind;
-}
-
-static QHash<QString, std::time_t> loadArtworkState(const fs::path &root) {
-    QHash<QString, std::time_t> state;
-    std::ifstream in(artworkStatePath(root));
-    if (!in)
-        return state;
-
-    std::string line;
-    while (std::getline(in, line)) {
-        const size_t eq = line.rfind('=');
-        if (eq == std::string::npos)
-            continue;
-        try {
-            state.insert(QString::fromStdString(line.substr(0, eq)),
-                         static_cast<std::time_t>(std::stoll(line.substr(eq + 1))));
-        } catch (...) {
-            continue; // unparsable stamp: treat as never attempted
-        }
-    }
-    return state;
-}
-
-static void saveArtworkState(const fs::path &root,
-                             const QHash<QString, std::time_t> &state) {
-    std::error_code ec;
-    fs::create_directories(root, ec);
-    if (ec)
-        return;
-
-    std::ofstream out(artworkStatePath(root), std::ios::trunc);
-    if (!out)
-        return;
-    for (auto it = state.constBegin(); it != state.constEnd(); ++it)
-        out << it.key().toStdString() << "="
-            << static_cast<long long>(it.value()) << "\n";
-}
-
-// A stamp in the future (the clock moved backwards between runs) counts as
-// stale, so a bad clock cannot block a game's artwork indefinitely.
-static bool artworkAttemptIsFresh(std::time_t stamp, std::time_t now) {
-    return stamp > 0 && now >= stamp
-        && (now - stamp) < kArtworkNegativeCacheSeconds;
+// Whether a failed artwork request is the server answering "nothing here", as
+// opposed to never reaching it. A 200 with no body counts as an answer.
+static bool isDefinitiveMiss(QNetworkReply::NetworkError error) {
+    return error == QNetworkReply::NoError
+        || error == QNetworkReply::ContentNotFoundError
+        || error == QNetworkReply::ContentAccessDenied
+        || error == QNetworkReply::ContentGoneError
+        || error == QNetworkReply::ContentOperationNotPermittedError;
 }
 
 static QString findImagePath(const fs::path &gameDir, const std::string &type) {
@@ -910,7 +820,12 @@ static QVariantMap recommendationFromGameMap(QVariantMap game, double score, boo
 // Without this the bridge happily displayed a stale file as a fresh result
 // whenever the script failed. A nonce beats a timestamp here because the build
 // copies analytics/ next to the exe on every build, rewriting mtimes.
-static bool recommendationRunMatches(const fs::path &metaPath, const QString &runId) {
+// catalogAgeDays, when given, receives the sidecar's catalog_age_days for a
+// matching run, or -1 when the run did not match or the catalog is empty.
+static bool recommendationRunMatches(const fs::path &metaPath, const QString &runId,
+                                     double *catalogAgeDays = nullptr) {
+    if (catalogAgeDays) *catalogAgeDays = -1.0;
+
     QFile file(pathToQString(metaPath));
     if (!file.open(QIODevice::ReadOnly))
         return false;
@@ -919,11 +834,19 @@ static bool recommendationRunMatches(const fs::path &metaPath, const QString &ru
     if (!doc.isObject())
         return false;
 
-    return doc.object().value("run_id").toString() == runId;
+    const QJsonObject meta = doc.object();
+    if (meta.value("run_id").toString() != runId)
+        return false;
+
+    if (catalogAgeDays) {
+        const QJsonValue age = meta.value("catalog_age_days");
+        if (age.isDouble())
+            *catalogAgeDays = age.toDouble();
+    }
+    return true;
 }
 
-static QVariantList readRecommendationJson(const fs::path &jsonPath, const QVariantList &games,
-                                           const fs::path &candidateImages) {
+static QVariantList readRecommendationJson(const fs::path &jsonPath, const QVariantList &games) {
     QFile file(pathToQString(jsonPath));
     if (!file.open(QIODevice::ReadOnly))
         return {};
@@ -1025,20 +948,15 @@ static QVariantList readRecommendationJson(const fs::path &jsonPath, const QVari
         item["status"] = 0.0;
         item["matched"] = false;
 
-        // Cover art is cached under a sibling root, never inside Images/:
-        // that namespace is keyed by name and delete_steamgriddb_images()
-        // would happily remove a candidate's artwork on a folder removal.
-        const QString cached = findCandidateCover(candidateImages, name);
-        const QString hero = findCandidateArt(candidateImages, name, "hero");
-        const QString logo = findCandidateArt(candidateImages, name, "logo");
-        item["coverPath"] = cached;
-        // Wide art and logo arrive through ensureArtwork(), lazily, when the
-        // details page opens on this game -- so on a first sighting there is
-        // nothing here yet and the cover stands in for the hero. GameDetails
-        // blurs a stand-in deliberately rather than stretching it sharp. What
-        // a previous session already fetched is picked up right here.
-        item["heroPath"] = hero.isEmpty() ? cached : hero;
-        item["logoPath"] = logo;
+        // Art loads live by URL; nothing is downloaded for these. IGDB's cover
+        // stands in until the live-art lookup answers (applyLiveArtwork()),
+        // and for the hero too -- GameDetails blurs a portrait stand-in
+        // deliberately rather than stretching it sharp.
+        const QString coverUrl = item.value("coverUrl").toString();
+        const QString heroUrl = igdbHeroUrl(coverUrl);
+        item["coverPath"] = coverUrl;
+        item["heroPath"] = heroUrl.isEmpty() ? coverUrl : heroUrl;
+        item["logoPath"] = QString();
         list << item;
     }
 
@@ -1093,6 +1011,7 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     game["source"]     = QString::fromStdString(bg.source);
     game["appid"]      = bg.appid;
     game["installDir"] = QString::fromStdString(bg.installDir.string());
+    game["gamePath"]   = QString::fromStdString(bg.gamePath.string());   // empty for Steam
 
     game["coverPath"]  = findImagePath(gameDir, "grid");
     game["heroPath"]   = findImagePath(gameDir, "hero");
@@ -1262,9 +1181,15 @@ void VortexBridge::startRecommendationRun() {
         // "ML cache loaded", so a stale result was indistinguishable from a
         // fresh one -- and the build copies analytics/ over the output on
         // every build, so a committed stale file would be served as current.
-        if (jsonPath && recommendationRunMatches(metaPath, runId)) {
-            recommendations = readRecommendationJson(*jsonPath, gameListSnapshot,
-                                                     candidateImagesDir(baseDir));
+        // Read even when the list itself comes back empty: an empty Discover
+        // is exactly the case where the catalog's state matters most.
+        // A no-op once the folder is gone; here because this already runs off
+        // the UI thread, and an old cache can hold thousands of files.
+        removeLegacyCandidateImages(baseDir);
+
+        double catalogAgeDays = -1.0;
+        if (jsonPath && recommendationRunMatches(metaPath, runId, &catalogAgeDays)) {
+            recommendations = readRecommendationJson(*jsonPath, gameListSnapshot);
             if (!recommendations.isEmpty())
                 status = "ML recommendations ready";
         }
@@ -1295,22 +1220,27 @@ void VortexBridge::startRecommendationRun() {
                 ++discoverCount;
         }
 
-        QMetaObject::invokeMethod(this, [this, recommendations, status, discoverCount]() {
+        QMetaObject::invokeMethod(this, [this, recommendations, status, discoverCount,
+                                         catalogAgeDays]() {
             m_recommendationList = recommendations;
+            // Live art the cache already knows goes on before the first paint;
+            // the rest is looked up, the visible picks ahead of the saved lists.
+            for (QVariant &entry : m_recommendationList) {
+                QVariantMap item = entry.toMap();
+                if (item.value("matched").toBool())
+                    continue;
+                prepareLiveArtwork(item, true);
+                entry = item;
+            }
             m_discoverCandidateCount = discoverCount;
+            m_catalogAgeDays = catalogAgeDays;
             setRecommendationLoading(false);
             setRecommendationStatus(status);
 
-            // Nothing to discover from means the catalog was never fetched.
-            // Runs once per session and only with credentials present.
+            // Nothing to discover from means the catalog was never fetched; an
+            // old one is due its periodic refresh. Only with credentials present.
             maybeAutoFetchCatalog();
             emit recommendationListChanged();
-
-            // Covers download only after the list is on screen, and only for
-            // cache misses. Doing it inside recommend.py would add seconds of
-            // network I/O to a bounded QProcess on a path that fires whenever
-            // the user hearts a game.
-            fetchCandidateCovers();
 
             if (m_recommendationQueued) {
                 m_recommendationQueued = false;
@@ -1323,130 +1253,26 @@ void VortexBridge::startRecommendationRun() {
     thread->start();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Candidate cover art — asynchronous, cache-miss only.
-// ─────────────────────────────────────────────────────────────────────────────
-void VortexBridge::fetchCandidateCovers() {
-    const fs::path root = candidateImagesDir(m_baseDir);
-
-    QList<QPair<QString, QString>> wanted;  // name -> url
-    for (const QVariant &entry : m_recommendationList) {
-        const QVariantMap item = entry.toMap();
-        if (item.value("matched").toBool()) continue;
-        if (!item.value("coverPath").toString().isEmpty()) continue;
-
-        const QString url = item.value("coverUrl").toString();
-        if (!url.isEmpty())
-            wanted.append({ item.value("name").toString(), url });
-    }
-    if (wanted.isEmpty()) return;
-
-    std::error_code ec;
-    fs::create_directories(root, ec);
-    if (ec) return;
-
-    if (!m_network) m_network = new QNetworkAccessManager(this);
-
-    auto *pending = new int(wanted.size());
-    for (const auto &[name, url] : wanted) {
-        QNetworkReply *reply = m_network->get(QNetworkRequest(QUrl(url)));
-        connect(reply, &QNetworkReply::finished, this, [this, reply, name, root, pending]() {
-            reply->deleteLater();
-            if (reply->error() == QNetworkReply::NoError) {
-                const QByteArray data = reply->readAll();
-                if (!data.isEmpty()) {
-                    QString ext = QFileInfo(reply->url().path()).suffix().toLower();
-                    if (ext != "png" && ext != "jpeg") ext = "jpg";
-                    QFile out(pathToQString(root / (candidateCoverStem(name) + "." + ext.toStdString())));
-                    if (out.open(QIODevice::WriteOnly))
-                        out.write(data);
-                }
-            }
-            // Rebind paths once, after the last download settles, rather than
-            // emitting a full list change per image.
-            if (--(*pending) == 0) {
-                delete pending;
-                for (QVariant &entry : m_recommendationList) {
-                    QVariantMap item = entry.toMap();
-                    if (item.value("matched").toBool()) continue;
-                    const QString found =
-                        findCandidateCover(root, item.value("name").toString());
-                    if (!found.isEmpty()) {
-                        item["coverPath"] = found;
-                        // Stand in for a hero only while there isn't one:
-                        // ensureArtwork() may already have fetched real wide
-                        // art for this game, and it outranks the cover.
-                        const QString hero = findCandidateArt(
-                            root, item.value("name").toString(), "hero");
-                        item["heroPath"] = hero.isEmpty() ? found : hero;
-                        entry = item;
-                    }
-                }
-                emit recommendationListChanged();
-            }
-        });
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Hero / logo art for one unowned pick — asynchronous, on demand.
+// ── Live art for one game, now, because its details page just opened.
 //
-// Split from fetchCandidateCovers() on purpose. A cover is drawn on every card
-// in the Discover grid, so it is fetched for the whole list; hero and logo are
-// only ever visible inside GameDetails, so fetching them at list time would
-// download two images per candidate to show at most one pair.
-// ─────────────────────────────────────────────────────────────────────────────
+// Every unowned row is already queued when its list loads; this moves the game
+// a page is open on to the front, so its banner and logo are the next answer
+// rather than wait behind a whole Discover grid. No-op for owned games, whose
+// art is SteamGridDB's under Images/.
 void VortexBridge::ensureArtwork(QString name) {
     name = name.trimmed();
     if (name.isEmpty())
         return;
 
-    // Same order GameDetails resolves gameData in, minus the library: an owned
-    // game already has SteamGridDB art under Images/ and wants none of this.
     QVariantMap item = findGameByName(m_recommendationList, name);
     if (item.isEmpty())
-        item = findGameByName(m_wishlist, name);
-    if (item.isEmpty())
-        item = findGameByName(m_favoriteSnapshots, name);
-    if (item.isEmpty())
-        item = findGameByName(m_playedLedger, name);
+        item = savedRowFor(name);
     if (item.isEmpty() || item.value("matched").toBool())
         return;
 
-    // Everything downstream -- the filename stem, the state key, the rebind --
-    // keys off the item's own name rather than the argument. findGameByName()
-    // also matches case-insensitively and canonically, so a caller passing
-    // "stick fight the game" would otherwise write art under a stem that
-    // readRecommendationJson() never looks up, and it would download again on
-    // every open and never appear.
-    name = item.value("name").toString();
-
-    const fs::path root = candidateImagesDir(m_baseDir);
-    const QHash<QString, std::time_t> state = loadArtworkState(root);
-    const std::time_t now = std::time(nullptr);
-
-    for (const QString &kind : { QStringLiteral("hero"), QStringLiteral("logo") }) {
-        if (!findCandidateArt(root, name, kind).isEmpty())
-            continue;                                     // already on disk
-
-        const QString key = artworkStateKey(name, kind);
-        if (artworkAttemptIsFresh(state.value(key), now))
-            continue;                                     // known to have none
-        if (m_artworkInFlight.contains(key))
-            continue;                                     // page reopened mid-download
-
-        const QStringList urls = artworkUrlChain(item, kind);
-        if (urls.isEmpty()) {
-            // Nothing addressable at all — no Steam appid, and for a hero no
-            // usable cover URL to rewrite either. Stamp it: re-deriving the
-            // same empty chain on every open costs nothing and returns nothing.
-            recordArtworkMiss(name, kind);
-            continue;
-        }
-
-        m_artworkInFlight.insert(key);
-        fetchArtworkFrom(name, kind, urls, 0, true);
-    }
+    // The row's own spelling: findGameByName() matches canonically, and the
+    // live-art cache is keyed on the name every list shares.
+    resolveLiveArtwork(item.value("name").toString(), true);
 }
 
 
@@ -1514,7 +1340,7 @@ void VortexBridge::ensureMetadata(QString name) {
 }
 
 // Writes one resolved id's metadata into every list carrying that name, and
-// emits so an open details page re-reads it. Shaped like rebindArtwork() and
+// emits so an open details page re-reads it. Shaped like applyLiveArtwork() and
 // for the same reason: an unowned game can sit in any of these four lists at
 // once, and the two that persist have to be written back to disk.
 void VortexBridge::applyResolvedMetadata(const QString &name, long long igdbId) {
@@ -1550,87 +1376,296 @@ void VortexBridge::applyResolvedMetadata(const QString &name, long long igdbId) 
     }
 }
 
-void VortexBridge::fetchArtworkFrom(const QString &name, const QString &kind,
-                                    const QStringList &urls, int index,
-                                    bool allDefinitive) {
-    const QString key = artworkStateKey(name, kind);
+// ─────────────────────────────────────────────────────────────────────────────
+// Live art for unowned games.
+//
+// Recommendation, wishlist, favourite and played rows for games that are not
+// installed keep no image files at all. Their art slots hold remote URLs that
+// QML loads directly -- SteamGridDB's CDN when it has the game (the same source
+// owned games use), otherwise Steam's CDN by appid, otherwise IGDB's cover.
+//
+// Only the URLs are kept: in live_artwork.json, keyed by name, so a game is
+// looked up once per machine however many times it reappears in Discover; and
+// in the saved lists' own JSON, which they serialise whole anyway.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    if (index >= urls.size()) {
-        m_artworkInFlight.remove(key);
-        // Only a chain that ran out of *answers* is a real miss. If any attempt
-        // failed to reach its host, the game keeps its chance next time — the
-        // same rule ensure_steamgriddb_images() follows, so launching offline
-        // never writes artwork off for a week.
-        if (allDefinitive)
-            recordArtworkMiss(name, kind);
+// A game SteamGridDB and Steam both had nothing for is asked again after this
+// long, as the old .artwork_state negative cache did; one with art never is --
+// a CDN URL does not go stale.
+static constexpr qint64 kLiveArtEmptyRetrySeconds = 7 * 24 * 60 * 60;
+
+static const char *const kLiveArtKeys[] = { "liveCoverUrl", "liveHeroUrl", "liveLogoUrl" };
+
+static QString liveArtKey(const QString &name) {
+    return name.trimmed().toLower();
+}
+
+static bool liveArtHasAny(const QVariantMap &art) {
+    for (const char *key : kLiveArtKeys)
+        if (!art.value(key).toString().isEmpty())
+            return true;
+    return false;
+}
+
+// Whether a URL is a file:// path into the old CandidateImages/ cache. Rows
+// written by older builds hold these, and the folder is deleted.
+static bool isUnderCandidateRoot(const QString &value, const fs::path &candidateRoot) {
+    if (!value.startsWith(QLatin1String("file:")))
+        return false;
+    const QString rootPath =
+        QDir::cleanPath(QString::fromStdString(fs::absolute(candidateRoot).string()));
+    const QString local = QDir::cleanPath(QUrl(value).toLocalFile());
+    return local.startsWith(rootPath + QLatin1Char('/'), Qt::CaseInsensitive);
+}
+
+// Whether a slot holds a file:// path whose file is no longer there. The ledger
+// keeps the path a game had while it was installed, and removeLocalGameDirectory()
+// deletes the files without touching the row.
+static bool isMissingLocalFile(const QString &value) {
+    return value.startsWith(QLatin1String("file:"))
+        && !QFileInfo::exists(QUrl(value).toLocalFile());
+}
+
+// Repoints one row's art slots. A slot holding real art under Images/ -- an
+// owned or once-owned game -- is kept. One pointing into the old
+// CandidateImages/ always goes, even with nothing to put in its place. An
+// empty, remote or dead-file slot is rebuilt from the live URLs the row
+// carries, so a better answer replaces an earlier stand-in -- but only when
+// there is something to put there, so an owned game's ledger row with no
+// Images/ art and no coverUrl is left as it was.
+static void applyLiveArtFallback(QVariantMap &item, const fs::path &candidateRoot) {
+    const QString coverUrl = item.value("coverUrl").toString();
+    QString cover = item.value("liveCoverUrl").toString();
+    if (cover.isEmpty())
+        cover = coverUrl;
+    QString hero = item.value("liveHeroUrl").toString();
+    if (hero.isEmpty())
+        hero = igdbHeroUrl(coverUrl);
+    const QString logo = item.value("liveLogoUrl").toString();
+
+    auto rebuild = [&](const char *key, const QString &value) {
+        const QString current = item.value(key).toString();
+        if (isUnderCandidateRoot(current, candidateRoot)
+            || ((current.isEmpty() || current.startsWith(QLatin1String("http"))
+                 || isMissingLocalFile(current))
+                && !value.isEmpty()))
+            item[key] = value;
+    };
+    rebuild("coverPath", cover);
+    rebuild("heroPath", hero.isEmpty() ? cover : hero);
+    rebuild("logoPath", logo);
+}
+
+// Whether a row's cover is a real file of its own under Images/, and so needs
+// no lookup.
+static bool hasLocalCover(const QVariantMap &item, const fs::path &candidateRoot) {
+    const QString cover = item.value("coverPath").toString();
+    return cover.startsWith(QLatin1String("file:"))
+        && !isUnderCandidateRoot(cover, candidateRoot)
+        && QFileInfo::exists(QUrl(cover).toLocalFile());
+}
+
+fs::path VortexBridge::liveArtCachePath() const {
+    return m_baseDir / "live_artwork.json";
+}
+
+void VortexBridge::loadLiveArtCache() {
+    m_liveArtCache.clear();
+    QFile file(pathToQString(liveArtCachePath()));
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    for (auto it = root.constBegin(); it != root.constEnd(); ++it) {
+        if (it.value().isObject())
+            m_liveArtCache.insert(it.key(), it.value().toObject().toVariantMap());
+    }
+}
+
+void VortexBridge::saveLiveArtCache() const {
+    QJsonObject root;
+    for (auto it = m_liveArtCache.constBegin(); it != m_liveArtCache.constEnd(); ++it)
+        root.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+    QFile file(pathToQString(liveArtCachePath()));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}
+
+// An entry with art is final. An empty one -- nothing upstream -- is retried
+// once it ages out; a stamp in the future (the clock went backwards) counts
+// as aged out, so a bad clock cannot hold a game's art off indefinitely.
+bool VortexBridge::liveArtCacheIsFresh(const QString &name) const {
+    const auto it = m_liveArtCache.constFind(liveArtKey(name));
+    if (it == m_liveArtCache.constEnd())
+        return false;
+    if (liveArtHasAny(it.value()))
+        return true;
+    const qint64 at = it.value().value("at").toLongLong();
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    return at > 0 && now >= at && now - at < kLiveArtEmptyRetrySeconds;
+}
+
+QVariantMap VortexBridge::savedRowFor(const QString &name) const {
+    QVariantMap row = findGameByName(m_wishlist, name);
+    if (row.isEmpty())
+        row = findGameByName(m_favoriteSnapshots, name);
+    if (row.isEmpty())
+        row = findGameByName(m_playedLedger, name);
+    return row;
+}
+
+void VortexBridge::prepareLiveArtwork(QVariantMap &row, bool urgent) {
+    const QString name = row.value("name").toString();
+    const fs::path legacyRoot = legacyCandidateImagesDir(m_baseDir);
+
+    const auto cached = m_liveArtCache.constFind(liveArtKey(name));
+    if (cached != m_liveArtCache.constEnd()) {
+        for (const char *key : kLiveArtKeys) {
+            const QString url = cached.value().value(key).toString();
+            if (!url.isEmpty())
+                row[key] = url;
+        }
+    } else if (row.value("liveArtResolved").toBool() && !name.isEmpty()) {
+        // Resolved by a build that kept the answer only in the row itself:
+        // adopt it, so the same game showing up in Discover is not asked again.
+        QVariantMap art;
+        for (const char *key : kLiveArtKeys)
+            art[key] = row.value(key).toString();
+        art["at"] = QDateTime::currentSecsSinceEpoch();
+        m_liveArtCache.insert(liveArtKey(name), art);
+        saveLiveArtCache();
+    }
+
+    applyLiveArtFallback(row, legacyRoot);
+    if (!hasLocalCover(row, legacyRoot) && !liveArtCacheIsFresh(name))
+        resolveLiveArtwork(name, urgent);
+}
+
+void VortexBridge::resolveLiveArtwork(const QString &name, bool urgent) {
+    if (name.isEmpty() || liveArtCacheIsFresh(name))
+        return;
+
+    const QString key = liveArtKey(name);
+    if (m_liveArtAsked.contains(key)) {
+        // Queued already: a details page opening on it jumps the line. In
+        // flight, or asked and unanswered this session: nothing to do.
+        const int at = m_liveArtQueue.indexOf(name);
+        if (urgent && at > 0)
+            m_liveArtQueue.move(at, 0);
+        return;
+    }
+    m_liveArtAsked.insert(key);
+    if (urgent)
+        m_liveArtQueue.prepend(name);
+    else
+        m_liveArtQueue.append(name);
+    pumpLiveArtwork();
+}
+
+// A few lookups at once: each is four sequential SteamGridDB requests, and a
+// fresh Discover grid is a dozen-plus games all waiting on theirs.
+static constexpr int kMaxLiveArtWorkers = 3;
+
+void VortexBridge::pumpLiveArtwork() {
+    while (m_liveArtRunning < kMaxLiveArtWorkers && !m_liveArtQueue.isEmpty()) {
+        ++m_liveArtRunning;
+        const QString name = m_liveArtQueue.takeFirst();
+
+        // Blocking WinHTTP, so off the UI thread like ensureMetadata().
+        QThread *thread = QThread::create([this, name]() {
+            const SgdbArtUrls sgdb = steamgriddb_art_urls(name.toStdString());
+            QVariantMap art;
+            art["liveCoverUrl"] = QString::fromStdString(sgdb.grid);
+            art["liveHeroUrl"]  = QString::fromStdString(sgdb.hero);
+            art["liveLogoUrl"]  = QString::fromStdString(sgdb.logo);
+            const bool reachable = sgdb.reachable;
+            QMetaObject::invokeMethod(this, [this, name, art, reachable]() {
+                finishLiveArtwork(name, art, reachable);
+            }, Qt::QueuedConnection);
+        });
+        connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+        thread->start();
+    }
+}
+
+// Fills whatever SteamGridDB had no answer for from Steam's CDN. HEAD, not GET:
+// the question is only whether the URL exists, and an old app 404s on
+// library_hero.jpg -- a URL QML would otherwise draw as a blank banner.
+void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art,
+                                     bool definitive) {
+    QVariantMap row = findGameByName(m_recommendationList, name);
+    if (row.isEmpty())
+        row = savedRowFor(name);
+    const int appId = row.value("steamAppId").toInt();
+
+    QList<QPair<QString, QString>> probes;   // art key -> URL
+    if (appId > 0) {
+        if (art.value("liveHeroUrl").toString().isEmpty())
+            probes.append({ QStringLiteral("liveHeroUrl"),
+                            steamArtUrl(appId, QStringLiteral("library_hero.jpg")) });
+        if (art.value("liveLogoUrl").toString().isEmpty())
+            probes.append({ QStringLiteral("liveLogoUrl"),
+                            steamArtUrl(appId, QStringLiteral("logo.png")) });
+    }
+
+    auto done = [this](const QString &name, const QVariantMap &art, bool definitive) {
+        applyLiveArtwork(name, art, definitive);
+        --m_liveArtRunning;
+        pumpLiveArtwork();
+    };
+
+    if (probes.isEmpty()) {
+        done(name, art, definitive);
         return;
     }
 
     if (!m_network)
         m_network = new QNetworkAccessManager(this);
 
-    QNetworkRequest request { QUrl(urls.at(index)) };
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QNetworkRequest::NoLessSafeRedirectPolicy);
-    QNetworkReply *reply = m_network->get(request);
+    struct Pending {
+        QVariantMap art;
+        bool definitive;
+        int remaining;
+    };
+    auto pending = std::make_shared<Pending>(Pending{ art, definitive, int(probes.size()) });
 
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, name, kind, urls, index, allDefinitive]() {
-        reply->deleteLater();
-
-        const QNetworkReply::NetworkError error = reply->error();
-        const QByteArray data =
-            error == QNetworkReply::NoError ? reply->readAll() : QByteArray();
-
-        if (data.isEmpty()) {
-            // Steam 404s library_hero.jpg for apps older than that layout, so a
-            // miss has to advance the chain rather than end it — IGDB is still
-            // worth asking. A transport failure lands here too and advances the
-            // same way; all it changes is whether the exhausted chain is
-            // allowed to stamp the negative cache.
-            const bool definitive =
-                error == QNetworkReply::NoError                     // 200, no body
-                || error == QNetworkReply::ContentNotFoundError
-                || error == QNetworkReply::ContentAccessDenied
-                || error == QNetworkReply::ContentGoneError
-                || error == QNetworkReply::ContentOperationNotPermittedError;
-            fetchArtworkFrom(name, kind, urls, index + 1,
-                             allDefinitive && definitive);
-            return;
-        }
-
-        const fs::path dir = candidateArtDir(candidateImagesDir(m_baseDir), kind);
-        std::error_code ec;
-        fs::create_directories(dir, ec);
-        if (!ec) {
-            QString ext = QFileInfo(reply->url().path()).suffix().toLower();
-            if (ext != "png" && ext != "jpeg")
-                ext = "jpg";
-            QFile out(pathToQString(
-                dir / (candidateCoverStem(name) + "." + ext.toStdString())));
-            if (out.open(QIODevice::WriteOnly))
-                out.write(data);
-        }
-
-        m_artworkInFlight.remove(artworkStateKey(name, kind));
-        rebindArtwork(name);
-    });
+    for (const auto &[key, url] : probes) {
+        QNetworkRequest request { QUrl(url) };
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                             QNetworkRequest::NoLessSafeRedirectPolicy);
+        QNetworkReply *reply = m_network->head(request);
+        connect(reply, &QNetworkReply::finished, this,
+                [reply, key, url, name, pending, done]() {
+            reply->deleteLater();
+            const QNetworkReply::NetworkError error = reply->error();
+            if (error == QNetworkReply::NoError
+                && reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200)
+                pending->art[key] = url;
+            else if (!isDefinitiveMiss(error))
+                pending->definitive = false;   // offline: try again next launch
+            if (--pending->remaining == 0)
+                done(name, pending->art, pending->definitive);
+        });
+    }
 }
 
-void VortexBridge::recordArtworkMiss(const QString &name, const QString &kind) {
-    const fs::path root = candidateImagesDir(m_baseDir);
-    QHash<QString, std::time_t> state = loadArtworkState(root);
-    state.insert(artworkStateKey(name, kind), std::time(nullptr));
-    saveArtworkState(root, state);
-}
+// Same shape as applyResolvedMetadata(): one game can sit in the recommendation
+// list and all three saved lists at once. Each saved list that changed is
+// written back to disk; the recommendation list is rebuilt every run and only
+// needs the emit.
+void VortexBridge::applyLiveArtwork(const QString &name, const QVariantMap &art,
+                                    bool definitive) {
+    // Only a complete answer is cached; anything less is asked again on the
+    // next launch, with the fallback URLs showing meanwhile.
+    if (definitive) {
+        QVariantMap entry;
+        for (const char *key : kLiveArtKeys)
+            entry[key] = art.value(key).toString();
+        entry["at"] = QDateTime::currentSecsSinceEpoch();
+        m_liveArtCache.insert(liveArtKey(name), entry);
+        saveLiveArtCache();
+    }
 
-void VortexBridge::rebindArtwork(const QString &name) {
-    const fs::path root = candidateImagesDir(m_baseDir);
-    const QString hero = findCandidateArt(root, name, "hero");
-    const QString logo = findCandidateArt(root, name, "logo");
-    if (hero.isEmpty() && logo.isEmpty())
-        return;
-
+    const fs::path legacyRoot = legacyCandidateImagesDir(m_baseDir);
     auto apply = [&](QVariantList &list) {
         bool changed = false;
         for (QVariant &entry : list) {
@@ -1641,10 +1676,16 @@ void VortexBridge::rebindArtwork(const QString &name) {
                                  Qt::CaseInsensitive) != 0)
                 continue;
 
-            if (!hero.isEmpty())
-                item["heroPath"] = hero;   // outranks the cover standing in
-            if (!logo.isEmpty())
-                item["logoPath"] = logo;
+            const QVariantMap before = item;
+            for (auto it = art.constBegin(); it != art.constEnd(); ++it) {
+                if (!it.value().toString().isEmpty())
+                    item[it.key()] = it.value();
+            }
+            if (definitive)
+                item["liveArtResolved"] = true;
+            applyLiveArtFallback(item, legacyRoot);
+            if (item == before)
+                continue;
             entry = item;
             changed = true;
         }
@@ -1655,10 +1696,6 @@ void VortexBridge::rebindArtwork(const QString &name) {
     // so emitting is all an already-open page needs to pick the art up.
     if (apply(m_recommendationList))
         emit recommendationListChanged();
-
-    // These two serialise the whole item map, so saving here is what keeps a
-    // saved game rendering after a restart with no network — the entire reason
-    // the snapshots exist.
     if (apply(m_wishlist)) {
         saveWishlist();
         emit wishlistChanged();
@@ -1757,47 +1794,33 @@ fs::path VortexBridge::favoriteSnapshotPath() const {
     return m_baseDir / "favorite_snapshots.json";
 }
 
-// Points a snapshot's three art slots at whatever is on disk for that name.
+// Points a snapshot's three art slots at whatever Images/ holds for that name.
 //
-// Both art roots are keyed by name, so a game's artwork can always be found
-// again even when no list still carries a row for it. That is the case the
-// snapshot fallback below could not handle: un-hearting a Discover pick deletes
-// its snapshot, and if the recommendations have been reshuffled since, hearting
-// it again rebuilt the snapshot from a map holding nothing but a name -- the
-// card lost its cover while the cached JPEG sat there untouched. Only the
-// details page recovered, because ensureArtwork() rebinds hero and logo but
-// never the cover.
+// Images/ is keyed by name, so a game's artwork can always be found again even
+// when no list still carries a row for it. Re-resolving rather than trusting a
+// stored value also matters on load: the saved paths are absolute file:// URLs
+// and stop working the moment the app is moved to another folder. Same
+// reasoning as loadPlayedLedger().
 //
-// Re-resolving rather than trusting a stored value also matters on load: the
-// saved paths are absolute file:// URLs and stop working the moment the app is
-// moved to another folder. Same reasoning as loadPlayedLedger().
+// The old CandidateImages/ cache is not consulted: it is deleted, and an
+// unowned row gets live URLs from prepareLiveArtwork() instead.
 static void bindArtworkFromCache(const fs::path &baseDir, const QString &name,
                                  QVariantMap &item) {
     if (name.isEmpty()) return;
 
-    // "grid" is the cover. In Images/ each kind is a subfolder; in the
-    // candidate root the cover sits at the top level and only hero and logo
-    // get a subfolder, which is what the empty kind means to findCandidateArt.
+    // "grid" is the cover.
     static const std::pair<const char *, const char *> kArtSlots[] = {
         { "coverPath", "grid" }, { "heroPath", "hero" }, { "logoPath", "logo" }
     };
 
     const fs::path gameDir =
         baseDir / "Images" / steamgriddb_image_folder_name(name.toStdString());
-    const fs::path candidates = candidateImagesDir(baseDir);
 
     for (const auto &slot : kArtSlots) {
-        // Images/ first: a favourite that is installed, or was played and then
-        // uninstalled, has its full-size art there rather than in the cache of
-        // covers downloaded for discovery picks.
-        QString found = findImagePath(gameDir, slot.second);
-        if (found.isEmpty()) {
-            const QString kind = qstrcmp(slot.second, "grid") == 0
-                                 ? QString() : QString::fromLatin1(slot.second);
-            found = findCandidateArt(candidates, name, kind);
-        }
-        // Nothing on disk leaves whatever the row already had -- for an unowned
-        // pick heroPath legitimately holds the cover standing in for a hero.
+        // A favourite that is installed, or was played and then uninstalled,
+        // has its full-size art here.
+        const QString found = findImagePath(gameDir, slot.second);
+        // Nothing on disk leaves whatever the row already had.
         if (!found.isEmpty())
             item[slot.first] = found;
     }
@@ -1817,6 +1840,7 @@ void VortexBridge::loadFavoriteSnapshots() {
         QVariantMap entry = value.toObject().toVariantMap();
         const QString name = entry.value("name").toString();
         bindArtworkFromCache(m_baseDir, name, entry);
+        prepareLiveArtwork(entry);
         // A row written before snapshots were kept across an un-heart can still
         // be holding placeholders. The resolution cache covers anything a scan
         // has already seen; the rest waits for ensureMetadata() and one lookup.
@@ -1873,6 +1897,9 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     // ledger rows, so a title split across two play keys keeps its full total.
     if (snapshot.isEmpty())
         snapshot = findGameByName(playedGames(), name);
+    // Hearted from the Browse page: the details it fetched are the only row.
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(m_browseSnapshots, name);
     if (snapshot.isEmpty())
         snapshot = bareSnapshotFor(name);
 
@@ -1885,6 +1912,7 @@ void VortexBridge::updateFavoriteSnapshot(const QString &name, bool favorited) {
     snapshot["status"] = 1.0;
     snapshot["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
     bindArtworkFromCache(m_baseDir, name, snapshot);
+    prepareLiveArtwork(snapshot);
 
     m_favoriteSnapshots << snapshot;
     saveFavoriteSnapshots();
@@ -2008,6 +2036,7 @@ void VortexBridge::loadWishlist() {
         QVariantMap entry = value.toObject().toVariantMap();
         const QString name = entry.value("name").toString();
         bindArtworkFromCache(m_baseDir, name, entry);
+        prepareLiveArtwork(entry);
         if (metadataIsBlank(entry)) {
             const long long id = igdb_cached_id_for(name.toStdString());
             if (id > 0)
@@ -2079,6 +2108,7 @@ void VortexBridge::loadPlayedLedger() {
             if (!found.isEmpty())
                 entry[slot.first] = found;
         }
+        prepareLiveArtwork(entry);
 
         m_playedLedger << entry;
     }
@@ -2108,12 +2138,15 @@ static long long playedIgdbId(const QString &key, const QString &name) {
 
 // One pass over the history for rows written by an older build.
 //
-// Two things are wrong with them. Rows the stats file seeded carry "Unknown" in
-// every metadata slot -- that is all playtime_stats.txt knows -- and nothing
+// Three things are wrong with them. Rows the stats file seeded carry "Unknown"
+// in every metadata slot -- that is all playtime_stats.txt knows -- and nothing
 // ever went back over them, so a game uninstalled long ago showed a blank
-// details page forever. And rows of any age can carry the dropped-escape
-// spelling of a name or a genre. Rows that already hold real metadata keep it:
-// those came from a live scan, which knows more than the caches do.
+// details page forever. Rows of any age can carry the dropped-escape spelling
+// of a name or a genre. And the oldest carry a playtime label in a format this
+// build no longer writes, which the library grid now shows under every card
+// rather than only in the badge on the Played tab. Rows that already hold real
+// metadata keep it: those came from a live scan, which knows more than the
+// caches do.
 void VortexBridge::backfillPlayedLedgerMetadata() {
     bool changed = false;
 
@@ -2133,6 +2166,26 @@ void VortexBridge::backfillPlayedLedgerMetadata() {
                 json_repair_dropped_escapes(value.toStdString()));
             if (repaired != value)
                 entry[key] = repaired;
+        }
+
+        // "playtime" is a label derived from "playtimeSeconds", and older builds
+        // wrote it in formats formatPlaytimeLabel() never produces -- "5.1
+        // Hours" against 18197 seconds, which is 5h 3m, and "2 Minutes" against
+        // 170. Every writer since goes through formatPlaytimeLabel(), so only
+        // rows that predate it disagree, and re-deriving settles the pair on the
+        // seconds: that is the figure the tab sorts and sums on, and the only
+        // one of the two that was ever authoritative.
+        //
+        // Deliberately not extended to idleTime or totalPlaytime. Both are
+        // derived too, but neither disagrees with its seconds anywhere in the
+        // ledger, and totalPlaytime's input is a sum rather than a stored field
+        // -- recomputing it here would be guessing at a problem that does not
+        // exist.
+        if (entry.contains("playtimeSeconds")) {
+            const QString derived =
+                formatPlaytimeLabel(entry.value("playtimeSeconds").toLongLong());
+            if (entry.value("playtime").toString() != derived)
+                entry["playtime"] = derived;
         }
 
         if (metadataIsBlank(entry)) {
@@ -2351,6 +2404,19 @@ QVariantList VortexBridge::playedGames() const {
         // removed, which would otherwise reappear here as "uninstalled".
         if (isRemovedName(item.value("name").toString()))
             continue;
+        // Marked played by hand while installed: the live row has the real
+        // install path and a working Play button, so it stands in for the
+        // snapshot taken at the click -- keeping the marker and its date.
+        if (item.value("manual").toBool()) {
+            QVariantMap live = findGameByName(m_gameList, item.value("name").toString());
+            if (!live.isEmpty()) {
+                live["installed"] = true;
+                live["manual"]    = true;
+                live["addedAt"]   = item.value("addedAt");
+                fold(live);
+                continue;
+            }
+        }
         item["installed"] = false;
         // Uninstalled, so the details page must not offer Play or Uninstall --
         // launchGameFrom() and uninstallGame() both search m_internalGames and
@@ -2362,13 +2428,21 @@ QVariantList VortexBridge::playedGames() const {
     // Most recently played first, then the biggest total, then the title. The
     // date alone is not enough to order by: everything that is not a Steam game
     // only knows the DAY it was last played (see parseDateToEpoch).
+    //
+    // A game marked played by hand has no date of its own, so it sorts by when
+    // it was marked -- otherwise "Add to Played" would drop it at the bottom of
+    // the tab, where nobody would see that the click worked.
+    const auto sortAt = [](const QVariantMap &item) {
+        const qlonglong at = item.value("lastPlayedAt").toLongLong();
+        return at > 0 ? at : item.value("addedAt").toLongLong();
+    };
     std::sort(merged.begin(), merged.end(),
-              [](const QVariant &a, const QVariant &b) {
+              [&sortAt](const QVariant &a, const QVariant &b) {
         const QVariantMap x = a.toMap();
         const QVariantMap y = b.toMap();
 
-        const qlonglong xAt = x.value("lastPlayedAt").toLongLong();
-        const qlonglong yAt = y.value("lastPlayedAt").toLongLong();
+        const qlonglong xAt = sortAt(x);
+        const qlonglong yAt = sortAt(y);
         if (xAt != yAt) return xAt > yAt;
 
         const qlonglong xSec = x.value("playtimeSeconds").toLongLong();
@@ -2550,6 +2624,8 @@ bool VortexBridge::toggleWishlist(QString name) {
     if (snapshot.isEmpty())
         snapshot = findGameByName(playedGames(), name);
     if (snapshot.isEmpty())
+        snapshot = findGameByName(m_browseSnapshots, name);
+    if (snapshot.isEmpty())
         snapshot = bareSnapshotFor(name);
 
     snapshot.remove("score");
@@ -2561,6 +2637,7 @@ bool VortexBridge::toggleWishlist(QString name) {
     snapshot["wishlisted"] = true;
     snapshot["addedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
     bindArtworkFromCache(m_baseDir, name, snapshot);
+    prepareLiveArtwork(snapshot);
 
     m_wishlist << snapshot;
     saveWishlist();
@@ -2568,6 +2645,746 @@ bool VortexBridge::toggleWishlist(QString name) {
     // Deliberately no loadRecommendations() here: the wishlist is a saved list
     // and has no influence on ranking, so there is nothing to recompute.
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Browse — free search over the whole IGDB catalog
+//
+// IGDB is queried through igdb_query(), which is blocking WinHTTP like every
+// other IGDB call here, so each request runs on its own thread and hands the
+// raw JSON back to the main thread to parse. Steam's reviews need no key and
+// go through m_network like the cover downloads do.
+// ─────────────────────────────────────────────────────────────────────────────
+static QString igdbImageUrl(const QString &imageId, const char *size) {
+    if (imageId.isEmpty())
+        return {};
+    return QStringLiteral("https://images.igdb.com/igdb/image/upload/t_%1/%2.jpg")
+               .arg(QLatin1String(size), imageId);
+}
+
+// Apicalypse strings are double-quoted; the query is whatever the user typed.
+static std::string apicalypseQuoted(const QString &text) {
+    std::string out;
+    for (const char c : text.toStdString()) {
+        if (c == '"' || c == '\\')
+            out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+static QStringList igdbNames(const QJsonValue &value) {
+    QStringList names;
+    for (const QJsonValue &entry : value.toArray()) {
+        const QString name = entry.toObject().value("name").toString();
+        if (!name.isEmpty())
+            names << name;
+    }
+    return names;
+}
+
+// involved_companies is one list with a developer/publisher flag on each
+// entry; `role` picks which of the two to collect.
+static QStringList igdbCompanies(const QJsonValue &value, const char *role) {
+    QStringList names;
+    for (const QJsonValue &entry : value.toArray()) {
+        const QJsonObject company = entry.toObject();
+        if (!company.value(QLatin1String(role)).toBool())
+            continue;
+        const QString name = company.value("company").toObject().value("name").toString();
+        if (!name.isEmpty() && !names.contains(name))
+            names << name;
+    }
+    return names;
+}
+
+static QString hoursLabel(qlonglong seconds) {
+    if (seconds <= 0)
+        return {};
+    const qlonglong hours = (seconds + 1800) / 3600;
+    return hours > 0 ? QString::number(hours) + " Hours" : QStringLiteral("< 1 Hour");
+}
+
+// One grid card per game in an IGDB /games answer. Search results and new
+// releases share this shape, so either can open BrowseDetails.
+static QVariantList browseRows(const QByteArray &json, const QVariantList &library) {
+    QVariantList rows;
+    for (const QJsonValue &value : QJsonDocument::fromJson(json).array()) {
+        const QJsonObject game = value.toObject();
+        const QString name = game.value("name").toString();
+        if (name.isEmpty())
+            continue;
+
+        QVariantMap row;
+        row["igdbId"]   = game.value("id").toVariant().toLongLong();
+        row["name"]     = name;
+        row["coverUrl"] = igdbImageUrl(
+            game.value("cover").toObject().value("image_id").toString(), "cover_big");
+        const qlonglong released = game.value("first_release_date").toVariant().toLongLong();
+        const QDate date = released > 0
+            ? QDateTime::fromSecsSinceEpoch(released).date() : QDate();
+        row["year"]        = date.isValid() ? QString::number(date.year()) : QString();
+        row["releaseDate"] = date.isValid() ? date.toString("d MMM yyyy") : QString();
+        row["developer"] = igdbCompanies(game.value("involved_companies"), "developer")
+                               .value(0);
+        row["genres"]    = igdbNames(game.value("genres")).join(", ");
+        row["rating"]    = game.value("total_rating").toDouble(0.0);
+        row["owned"]     = !findGameByName(library, name).isEmpty();
+        rows << row;
+    }
+    return rows;
+}
+
+// What to tell the user when an igdb_query() for the grid throws.
+static QString browseErrorMessage(const QString &error) {
+    if (error.contains("credentials are not set"))
+        return QStringLiteral("Browse needs IGDB keys. Add them in Settings.");
+    if (error.contains("authentication"))
+        return QStringLiteral("IGDB refused the saved keys. Check them in Settings.");
+    return QStringLiteral("Could not reach IGDB. Check your connection.");
+}
+
+void VortexBridge::searchCatalog(QString query) {
+    query = query.trimmed();
+    if (query.isEmpty()) {
+        clearBrowse();
+        return;
+    }
+    const int seq = ++m_browseSearchSeq;
+
+    m_browseSearching = true;
+    m_browseStatus.clear();
+    emit browseResultsChanged();
+
+    const std::string body =
+        "search \"" + apicalypseQuoted(query) + "\"; "
+        "fields id,name,cover.image_id,first_release_date,total_rating,"
+        "genres.name,involved_companies.company.name,involved_companies.developer; "
+        "where version_parent = null; limit 50;";
+
+    QThread *thread = QThread::create([this, seq, body]() {
+        QByteArray json;
+        QString error;
+        try {
+            json = QByteArray::fromStdString(igdb_query("games", body));
+        } catch (const std::exception &e) {
+            error = QString::fromStdString(e.what());
+        }
+        QMetaObject::invokeMethod(this, [this, seq, json, error]() {
+            applyBrowseResults(seq, json, error);
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::clearBrowse() {
+    ++m_browseSearchSeq;            // anything still in flight is now stale
+    m_browseResults.clear();
+    m_browseSearching = false;
+    m_browseStatus.clear();
+    emit browseResultsChanged();
+}
+
+void VortexBridge::applyBrowseResults(int seq, const QByteArray &json,
+                                      const QString &error) {
+    if (seq != m_browseSearchSeq)
+        return;                     // superseded by a later keystroke
+
+    m_browseSearching = false;
+    m_browseResults.clear();
+
+    if (!error.isEmpty()) {
+        vlog::line("Browse", "Search failed: " + error.toStdString());
+        m_browseStatus = browseErrorMessage(error);
+        emit browseResultsChanged();
+        return;
+    }
+
+    m_browseResults = browseRows(json, m_gameList);
+    m_browseStatus = m_browseResults.isEmpty()
+        ? QStringLiteral("No games found.") : QString();
+    emit browseResultsChanged();
+}
+
+// Recent enough to count as new, and how many IGDB follows a game needs to
+// make the list. Without the hype floor the window is mostly untracked
+// shovelware released the same week.
+static constexpr qint64 kNewReleaseWindowDays = 45;
+static constexpr int    kNewReleaseMinHypes   = 3;
+// A good list is reused for this long before the next visit refetches it.
+static constexpr qint64 kNewReleaseRefreshMs  = 60LL * 60 * 1000;
+
+void VortexBridge::loadNewReleases() {
+    if (m_browseNewReleasesLoading)
+        return;
+    if (m_browseNewReleasesClock.isValid()
+        && m_browseNewReleasesClock.elapsed() < kNewReleaseRefreshMs)
+        return;
+
+    m_browseNewReleasesLoading = true;
+    m_browseNewReleasesStatus.clear();
+    emit browseNewReleasesChanged();
+
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const qint64 since = now - kNewReleaseWindowDays * 24 * 60 * 60;
+    // game_type = 0 is "main game"; see igdb_catalog.py on why not `category`.
+    const std::string body =
+        "fields id,name,cover.image_id,first_release_date,total_rating,"
+        "genres.name,involved_companies.company.name,involved_companies.developer; "
+        "where first_release_date <= " + std::to_string(now) +
+        " & first_release_date >= " + std::to_string(since) +
+        " & game_type = 0 & version_parent = null & cover != null"
+        " & hypes >= " + std::to_string(kNewReleaseMinHypes) + "; "
+        "sort first_release_date desc; limit 60;";
+
+    QThread *thread = QThread::create([this, body]() {
+        QByteArray json;
+        QString error;
+        try {
+            json = QByteArray::fromStdString(igdb_query("games", body));
+        } catch (const std::exception &e) {
+            error = QString::fromStdString(e.what());
+        }
+        QMetaObject::invokeMethod(this, [this, json, error]() {
+            applyNewReleases(json, error);
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::applyNewReleases(const QByteArray &json, const QString &error) {
+    m_browseNewReleasesLoading = false;
+
+    if (!error.isEmpty()) {
+        // The clock is left alone, so the next visit to the tab retries.
+        vlog::line("Browse", "New releases failed: " + error.toStdString());
+        m_browseNewReleasesStatus = browseErrorMessage(error);
+        emit browseNewReleasesChanged();
+        return;
+    }
+
+    m_browseNewReleases = browseRows(json, m_gameList);
+    m_browseNewReleasesStatus = m_browseNewReleases.isEmpty()
+        ? QStringLiteral("No new releases found.") : QString();
+    m_browseNewReleasesClock.start();
+    emit browseNewReleasesChanged();
+}
+
+void VortexBridge::loadBrowseDetails(qlonglong igdbId) {
+    if (igdbId <= 0)
+        return;
+    const int seq = ++m_browseDetailsSeq;
+
+    // The grid row stands in until the full answer lands, so the page opens
+    // on a title and a cover rather than on nothing.
+    QVariantMap seed;
+    for (const QVariantList *list : {&m_browseResults, &m_browseNewReleases}) {
+        for (const QVariant &entry : *list) {
+            const QVariantMap row = entry.toMap();
+            if (row.value("igdbId").toLongLong() == igdbId) {
+                seed = row;
+                break;
+            }
+        }
+        if (!seed.isEmpty())
+            break;
+    }
+    seed["igdbId"] = igdbId;
+    m_browseDetails = seed;
+    m_browseDetailsLoading = true;
+    emit browseDetailsChanged();
+
+    m_browseReviews.clear();
+    m_browseReviewsLoading = false;
+    emit browseReviewsChanged();
+
+    queryBrowseDetails(seq, igdbId);
+}
+
+void VortexBridge::loadBrowseDetailsForGame(QString name) {
+    name = name.trimmed();
+    if (name.isEmpty())
+        return;
+    const int seq = ++m_browseDetailsSeq;
+
+    // The library row first, so an owned game seeds from its own record; the
+    // recommendation row otherwise, which carries everything a Discover pick
+    // has. Mapped to the keys the IGDB answer uses, so the page reads one shape.
+    QVariantMap row = findGameByName(m_gameList, name);
+    if (row.isEmpty())
+        row = findGameByName(m_recommendationList, name);
+
+    const auto known = [](const QString &value) {
+        return (value.isEmpty() || value == "Unknown" || value == "N/A") ? QString() : value;
+    };
+
+    QVariantMap seed;
+    seed["name"]       = row.isEmpty() ? name : row.value("name").toString();
+    seed["coverUrl"]   = row.value("coverPath").toString();
+    seed["developers"] = known(row.value("developer").toString());
+    QStringList genres;
+    for (const QString &genre : known(row.value("genres").toString()).split(',', Qt::SkipEmptyParts))
+        genres << genre.trimmed();
+    seed["genres"]      = genres;
+    seed["ttbNormally"] = known(row.value("timeToBeat").toString());
+    seed["totalRating"] = row.value("rating").toDouble();
+    seed["steamAppId"]  = row.value("steamAppId").toInt();
+    m_browseDetails = seed;
+    m_browseDetailsLoading = true;
+    emit browseDetailsChanged();
+
+    m_browseReviews.clear();
+    m_browseReviewsLoading = false;
+    emit browseReviewsChanged();
+
+    // An owned game already knows its id from the scan; anything else goes
+    // through the offline cache, then one lookup -- ensureMetadata()'s chain.
+    long long igdbId = 0;
+    if (row.value("matched", true).toBool()) {
+        const std::string wanted = make_canonical(seed.value("name").toString().toStdString());
+        for (const BridgeGame &bg : m_internalGames) {
+            if (bg.igdb_id > 0 && make_canonical(bg.name) == wanted) {
+                igdbId = bg.igdb_id;
+                break;
+            }
+        }
+    }
+    if (igdbId <= 0)
+        igdbId = igdb_cached_id_for(seed.value("name").toString().toStdString());
+    if (igdbId > 0) {
+        queryBrowseDetails(seq, igdbId);
+        return;
+    }
+
+    // Blocking HTTPS, so off the UI thread like every other lookup in here.
+    const std::string lookup = seed.value("name").toString().toStdString();
+    QThread *thread = QThread::create([this, seq, lookup]() {
+        long long resolved = 0;
+        try {
+            resolved = igdb_resolve_game(lookup, false).id;
+        } catch (...) {}
+        QMetaObject::invokeMethod(this, [this, seq, resolved]() {
+            if (seq != m_browseDetailsSeq)
+                return;                 // the page has moved on to another game
+            if (resolved > 0)
+                queryBrowseDetails(seq, resolved);
+            else
+                finishUnresolvedBrowseDetails(seq);
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+// IGDB has no answer for this name. The seed is everything there is to show,
+// so it stays as it is -- no error, since none of it is wrong -- and a Steam
+// game still gets its reviews from the app id the library already knows.
+void VortexBridge::finishUnresolvedBrowseDetails(int seq) {
+    if (seq != m_browseDetailsSeq)
+        return;
+    m_browseDetailsLoading = false;
+    emit browseDetailsChanged();
+    const int appId = m_browseDetails.value("steamAppId").toInt();
+    if (appId > 0)
+        fetchSteamReviews(seq, appId);
+}
+
+void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
+    const std::string id = std::to_string(igdbId);
+    const std::string gameBody =
+        "fields id,name,summary,storyline,first_release_date,"
+        "total_rating,total_rating_count,aggregated_rating,aggregated_rating_count,"
+        "rating,rating_count,cover.image_id,screenshots.image_id,artworks.image_id,"
+        "genres.name,themes.name,game_modes.name,player_perspectives.name,"
+        "platforms.name,involved_companies.company.name,"
+        "involved_companies.developer,involved_companies.publisher,"
+        "external_games.uid,external_games.external_game_source; "
+        "where id = " + id + ";";
+    const std::string ttbBody =
+        "fields hastily,normally,completely; where game_id = " + id + ";";
+
+    QThread *thread = QThread::create([this, seq, gameBody, ttbBody]() {
+        QByteArray game, ttb;
+        QString error;
+        try {
+            game = QByteArray::fromStdString(igdb_query("games", gameBody));
+            // Time to beat is a nicety; a failure here must not cost the page.
+            try {
+                ttb = QByteArray::fromStdString(igdb_query("game_time_to_beats", ttbBody));
+            } catch (...) {}
+        } catch (const std::exception &e) {
+            error = QString::fromStdString(e.what());
+        }
+        QMetaObject::invokeMethod(this, [this, seq, game, ttb, error]() {
+            applyBrowseDetails(seq, game, ttb, error);
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
+                                      const QByteArray &ttbJson, const QString &error) {
+    if (seq != m_browseDetailsSeq)
+        return;                     // the page has moved on to another game
+
+    m_browseDetailsLoading = false;
+    const QJsonObject game = QJsonDocument::fromJson(gameJson).array().at(0).toObject();
+    if (!error.isEmpty() || game.isEmpty()) {
+        vlog::line("Browse", "Details failed: " + error.toStdString());
+        m_browseDetails["error"] = QStringLiteral("Could not load this game from IGDB.");
+        emit browseDetailsChanged();
+        // A recommendation's seed can already know its Steam app; the reviews
+        // do not depend on IGDB, so they are still worth showing.
+        const int appId = m_browseDetails.value("steamAppId").toInt();
+        if (appId > 0)
+            fetchSteamReviews(seq, appId);
+        return;
+    }
+
+    const QString name = game.value("name").toString();
+    const qlonglong igdbId = game.value("id").toVariant().toLongLong();
+
+    QVariantMap d;
+    d["igdbId"]    = igdbId;
+    d["name"]      = name;
+    d["summary"]   = game.value("summary").toString();
+    d["storyline"] = game.value("storyline").toString();
+
+    const qlonglong released = game.value("first_release_date").toVariant().toLongLong();
+    if (released > 0) {
+        const QDate date = QDateTime::fromSecsSinceEpoch(released).date();
+        d["releaseDate"] = date.toString("d MMM yyyy");
+        d["year"]        = QString::number(date.year());
+    } else {
+        d["releaseDate"] = QString();
+        d["year"]        = QString();
+    }
+
+    const QStringList developers = igdbCompanies(game.value("involved_companies"), "developer");
+    const QStringList genres  = igdbNames(game.value("genres"));
+    const QStringList themes  = igdbNames(game.value("themes"));
+    const QStringList modes   = igdbNames(game.value("game_modes"));
+    d["developers"]   = developers.join(", ");
+    d["publishers"]   = igdbCompanies(game.value("involved_companies"), "publisher").join(", ");
+    d["genres"]       = genres;
+    d["themes"]       = themes;
+    d["modes"]        = modes;
+    d["perspectives"] = igdbNames(game.value("player_perspectives"));
+    d["platforms"]    = igdbNames(game.value("platforms"));
+
+    d["totalRating"] = game.value("total_rating").toDouble(0.0);
+    d["criticScore"] = game.value("aggregated_rating").toDouble(0.0);
+    d["criticCount"] = game.value("aggregated_rating_count").toInt(0);
+    d["userScore"]   = game.value("rating").toDouble(0.0);
+    d["userCount"]   = game.value("rating_count").toInt(0);
+
+    const QString coverUrl = igdbImageUrl(
+        game.value("cover").toObject().value("image_id").toString(), "cover_big");
+    d["coverUrl"] = coverUrl;
+
+    QVariantList screenshots;
+    for (const QJsonValue &shot : game.value("screenshots").toArray()) {
+        const QString imageId = shot.toObject().value("image_id").toString();
+        if (imageId.isEmpty())
+            continue;
+        QVariantMap one;
+        one["thumb"] = igdbImageUrl(imageId, "screenshot_med");
+        one["full"]  = igdbImageUrl(imageId, "1080p");
+        screenshots << one;
+    }
+    d["screenshots"] = screenshots;
+
+    // Artworks are key art made for banners; screenshots are the fallback,
+    // and both are landscape, unlike the cover GameDetails has to blur.
+    QString heroUrl;
+    const QJsonArray artworks = game.value("artworks").toArray();
+    if (!artworks.isEmpty())
+        heroUrl = igdbImageUrl(artworks.at(0).toObject().value("image_id").toString(), "1080p");
+    if (heroUrl.isEmpty() && !screenshots.isEmpty())
+        heroUrl = screenshots.first().toMap().value("full").toString();
+    d["heroUrl"] = heroUrl;
+
+    // Steam is external_game_source 1 -- the same mapping igdb_resolve_game()
+    // uses for its appid lookup.
+    int steamAppId = 0;
+    for (const QJsonValue &entry : game.value("external_games").toArray()) {
+        const QJsonObject ext = entry.toObject();
+        if (ext.value("external_game_source").toInt() != 1)
+            continue;
+        steamAppId = ext.value("uid").toString().toInt();
+        if (steamAppId > 0)
+            break;
+    }
+    d["steamAppId"] = steamAppId;
+
+    const QJsonObject ttb = QJsonDocument::fromJson(ttbJson).array().at(0).toObject();
+    const qlonglong ttbNormally = ttb.value("normally").toVariant().toLongLong();
+    d["ttbHastily"]    = hoursLabel(ttb.value("hastily").toVariant().toLongLong());
+    d["ttbNormally"]   = hoursLabel(ttbNormally);
+    d["ttbCompletely"] = hoursLabel(ttb.value("completely").toVariant().toLongLong());
+
+    // Owned under a different spelling (Steam's store name, a folder name):
+    // hearts and the played ledger are keyed on the library's own name.
+    const QVariantMap owned = findGameByName(m_gameList, name);
+    d["ownedName"] = owned.value("name").toString();
+
+    m_browseDetails = d;
+    emit browseDetailsChanged();
+
+    // Discover-shaped, so the wishlist, favourite and played paths can store
+    // it exactly as they store a recommendation.
+    QVariantMap snapshot;
+    snapshot["name"]       = name;
+    snapshot["igdbId"]     = igdbId;
+    snapshot["source"]     = "IGDB";
+    snapshot["developer"]  = developers.isEmpty() ? QStringLiteral("Unknown") : developers.first();
+    snapshot["rating"]     = d.value("totalRating");
+    snapshot["genres"]     = genres.isEmpty() ? QStringLiteral("Unknown") : genres.join(", ");
+    const QStringList tags = genres + themes;
+    snapshot["tags"]       = tags.isEmpty() ? QStringLiteral("Unknown") : tags.join(", ");
+    snapshot["timeToBeat"] = ttbNormally > 0
+                             ? QString::number(ttbNormally / 3600) + " Hours"
+                             : QStringLiteral("N/A");
+    snapshot["steamAppId"] = steamAppId;
+    snapshot["coverUrl"]   = coverUrl;
+    snapshot["coverPath"]  = coverUrl;
+    snapshot["heroPath"]   = heroUrl.isEmpty() ? coverUrl : heroUrl;
+    snapshot["logoPath"]   = QString();
+    snapshot["releasedAt"] = d.value("releaseDate");
+    snapshot["playtime"]   = "Not in library";
+    snapshot["lastPlayed"] = "N/A";
+    snapshot["installDir"] = QString();
+    snapshot["status"]     = 0.0;
+    snapshot["matched"]    = false;
+
+    bool replaced = false;
+    for (QVariant &entry : m_browseSnapshots) {
+        if (entry.toMap().value("igdbId").toLongLong() == igdbId) {
+            entry = snapshot;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced)
+        m_browseSnapshots << snapshot;
+
+    QVariantMap meta;
+    meta["igdbId"]     = igdbId;
+    meta["developer"]  = snapshot.value("developer");
+    meta["rating"]     = d.value("totalRating");
+    meta["ttbSeconds"] = ttbNormally;
+    meta["genres"]     = genres;
+    meta["themes"]     = themes;
+    meta["modes"]      = modes;
+    m_browseMetadata.insert(QString::fromStdString(make_canonical(name.toStdString())), meta);
+
+    if (steamAppId > 0)
+        fetchSteamReviews(seq, steamAppId);
+}
+
+void VortexBridge::fetchSteamReviews(int seq, int appId) {
+    m_browseReviewsLoading = true;
+    emit browseReviewsChanged();
+
+    if (!m_network) m_network = new QNetworkAccessManager(this);
+
+    QUrl url(QStringLiteral("https://store.steampowered.com/appreviews/%1").arg(appId));
+    url.setQuery(QStringLiteral("json=1&language=english&filter=all"
+                                "&purchase_type=all&num_per_page=10"));
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, "VortexLauncher/1.0");
+
+    QNetworkReply *reply = m_network->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
+        reply->deleteLater();
+        if (seq != m_browseDetailsSeq)
+            return;
+
+        m_browseReviewsLoading = false;
+        QVariantMap result;
+        const QJsonObject root = reply->error() == QNetworkReply::NoError
+            ? QJsonDocument::fromJson(reply->readAll()).object() : QJsonObject();
+
+        if (root.value("success").toInt() != 1) {
+            result["error"] = QStringLiteral("Steam reviews are unavailable right now.");
+            m_browseReviews = result;
+            emit browseReviewsChanged();
+            return;
+        }
+
+        const QJsonObject summary = root.value("query_summary").toObject();
+        result["summary"]  = summary.value("review_score_desc").toString();
+        result["positive"] = summary.value("total_positive").toInt();
+        result["negative"] = summary.value("total_negative").toInt();
+        result["total"]    = summary.value("total_reviews").toInt();
+
+        QVariantList reviews;
+        for (const QJsonValue &value : root.value("reviews").toArray()) {
+            const QJsonObject review = value.toObject();
+            const QString text = review.value("review").toString().trimmed();
+            if (text.isEmpty())
+                continue;
+            QVariantMap one;
+            one["text"]    = text;
+            one["votedUp"] = review.value("voted_up").toBool();
+            one["votesUp"] = review.value("votes_up").toInt();
+            one["date"]    = QDateTime::fromSecsSinceEpoch(
+                review.value("timestamp_created").toVariant().toLongLong())
+                .date().toString("d MMM yyyy");
+            const int minutes = review.value("author").toObject()
+                                    .value("playtime_forever").toInt();
+            one["hours"]   = QString::number(minutes / 60.0, 'f', 1);
+            reviews << one;
+        }
+        result["reviews"] = reviews;
+        m_browseReviews = result;
+        emit browseReviewsChanged();
+    });
+}
+
+bool VortexBridge::isFavorite(QString name) const {
+    return !name.isEmpty() && get_game_preference(name.toStdString()) > 0.0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Add to Played — history Vortex never saw
+//
+// The played ledger only ever learned about games from recorded playtime, so a
+// game finished on a console or a friend's PC could never appear. These rows
+// are flagged `manual`, carry no playtime, and are the only ledger rows that
+// can be taken back off: recorded play is history, a click is a claim.
+// ─────────────────────────────────────────────────────────────────────────────
+QVariantMap VortexBridge::snapshotFromLists(const QString &name) const {
+    QVariantMap snapshot = findGameByName(m_gameList, name);
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(m_browseSnapshots, name);
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(m_recommendationList, name);
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(m_wishlist, name);
+    if (snapshot.isEmpty())
+        snapshot = findGameByName(m_favoriteSnapshots, name);
+    if (snapshot.isEmpty())
+        snapshot = bareSnapshotFor(name);
+    return snapshot;
+}
+
+QString VortexBridge::playedState(QString name) const {
+    const QVariantMap row = findGameByName(playedGames(), name);
+    if (row.isEmpty())
+        return QStringLiteral("none");
+    if (row.value("playtimeSeconds").toLongLong() > 0)
+        return QStringLiteral("tracked");
+    return row.value("manual").toBool() ? QStringLiteral("manual")
+                                        : QStringLiteral("none");
+}
+
+bool VortexBridge::togglePlayed(QString name) {
+    name = name.trimmed();
+    if (name.isEmpty())
+        return false;
+
+    const QString state = playedState(name);
+    if (state == QLatin1String("tracked"))
+        return false;
+
+    const std::string wanted = make_canonical(name.toStdString());
+
+    if (state == QLatin1String("manual")) {
+        for (int i = m_playedLedger.size() - 1; i >= 0; --i) {
+            const QVariantMap row = m_playedLedger[i].toMap();
+            if (row.value("manual").toBool()
+                && make_canonical(row.value("name").toString().toStdString()) == wanted)
+                m_playedLedger.removeAt(i);
+        }
+        savePlayedLedger();
+        writeManualPlayed();
+        emit playedGamesChanged();
+        return false;
+    }
+
+    QVariantMap row = snapshotFromLists(name);
+    for (const char *key : { "score", "reason", "inspiredBy", "section",
+                             "similarity", "installed", "wishlisted" })
+        row.remove(key);
+    const QString rowName = row.value("name").toString().isEmpty()
+                            ? name : row.value("name").toString();
+
+    // The IGDB id is what lets the recommender find the game's genres, and
+    // what keeps the key apart from a stats-seeded igdb_ row for the same id.
+    qlonglong igdbId = row.value("igdbId").toLongLong();
+    if (igdbId <= 0)
+        igdbId = igdb_cached_id_for(rowName.toStdString());
+
+    row["key"] = igdbId > 0
+        ? QStringLiteral("manual_igdb_%1").arg(igdbId)
+        : QStringLiteral("manual_") + QString::fromStdString(wanted);
+    row["name"]            = rowName;
+    row["igdbId"]          = igdbId;
+    row["manual"]          = true;
+    row["addedAt"]         = static_cast<qlonglong>(QDateTime::currentSecsSinceEpoch());
+    row["playtimeSeconds"] = 0;
+    row["playtime"]        = formatPlaytimeLabel(0);
+    row["lastPlayed"]      = QStringLiteral("N/A");
+    row["lastPlayedAt"]    = 0;
+    row["installDir"]      = QString();
+    row["matched"]         = false;
+    row["status"]          = 0.0;
+    bindArtworkFromCache(m_baseDir, rowName, row);
+    prepareLiveArtwork(row);
+
+    // Browse already holds the full IGDB record; game_metadata.txt is where
+    // sync_local_data.py reads genres from, and a game with none would add
+    // nothing to the taste profile.
+    QVariantMap meta = m_browseMetadata.value(QString::fromStdString(wanted));
+    if (meta.isEmpty())
+        meta = m_browseMetadata.value(
+            QString::fromStdString(make_canonical(rowName.toStdString())));
+    if (igdbId > 0 && !meta.isEmpty()) {
+        const auto toStd = [](const QVariant &list) {
+            std::vector<std::string> out;
+            for (const QString &item : list.toStringList())
+                out.push_back(item.toStdString());
+            return out;
+        };
+        GameMetadata data;
+        data.igdb_id              = igdbId;
+        data.developer            = meta.value("developer").toString().toStdString();
+        data.rating               = meta.value("rating").toDouble();
+        data.time_to_beat_seconds = meta.value("ttbSeconds").toLongLong();
+        data.all_genres           = toStd(meta.value("genres"));
+        data.themes               = toStd(meta.value("themes"));
+        data.game_modes           = toStd(meta.value("modes"));
+        save_game_metadata(data);
+    }
+
+    m_playedLedger << row;
+    savePlayedLedger();
+    writeManualPlayed();
+    emit playedGamesChanged();
+    // No loadRecommendations(), same as a heart: the next refresh picks it up.
+    return true;
+}
+
+void VortexBridge::writeManualPlayed() const {
+    std::ofstream out(m_baseDir / "manual_played.txt");
+    if (!out) return;
+
+    out << "# Games marked played by hand from the Browse page.\n";
+    out << "# Written by the launcher; read by analytics/sync_local_data.py.\n";
+    out << "# Format: NAME|IGDB_ID|ADDED_AT_EPOCH\n";
+    for (const QVariant &entry : m_playedLedger) {
+        const QVariantMap row = entry.toMap();
+        if (!row.value("manual").toBool())
+            continue;
+        QString name = row.value("name").toString();
+        name.replace('|', ' ');
+        out << name.toStdString() << "|" << row.value("igdbId").toLongLong()
+            << "|" << row.value("addedAt").toLongLong() << "\n";
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3138,6 +3955,11 @@ void VortexBridge::explainGameToLog(const QString &name,
 // waits for the game to close, records the play session, then refreshes the list
 // so the playtime display updates.
 void VortexBridge::launchGameFrom(QString name, QString origin) {
+    // A second press while the first launch is still going would start the
+    // game twice and record two overlapping sessions.
+    if (m_launchingGames.contains(name) || m_runningGames.contains(name))
+        return;
+
     // The ground truth the recommender never had: which surface produced this
     // launch. Without it, a game started from the Recommendations tab is
     // indistinguishable from one started from the library.
@@ -3165,7 +3987,14 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
     vlog::line("Play", "launching " + found.name + " (" + found.source +
                        ", from " + origin.toStdString() + ")");
 
-    QThread *thread = QThread::create([this, found, ptKey]() {
+    setLaunchState(name, true, false);
+    const auto markRunning = [this, name]() {
+        QMetaObject::invokeMethod(this, [this, name]() {
+            setLaunchState(name, false, true);
+        }, Qt::QueuedConnection);
+    };
+
+    QThread *thread = QThread::create([this, found, ptKey, name, markRunning]() {
         std::time_t sessionStart = 0;
         std::time_t sessionEnd   = 0;
         bool        played       = false;
@@ -3183,7 +4012,7 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
             // the game is actually up, or the wait for it counts as idle.
             played = monitor_steam_session(found.appid, found.installDir,
                                            &sessionStart, &sessionEnd,
-                                           &idleSeconds);
+                                           &idleSeconds, markRunning);
         } else {
             sessionStart = std::time(nullptr);
             // launchGame() in game_manager blocks until the process exits, so
@@ -3191,11 +4020,17 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
             // measure idle the same way the Steam one does.
             IdleTracker idle;
             idle.start();
-            ::launchGame(found.gamePath);
+            ::launchGame(found.gamePath, markRunning);
             idleSeconds = idle.stop();
             sessionEnd  = std::time(nullptr);
             played      = sessionEnd > sessionStart;
         }
+
+        // The button goes back to PLAY now, not after the sync below, which
+        // can take a few seconds and has nothing to do with the game.
+        QMetaObject::invokeMethod(this, [this, name]() {
+            setLaunchState(name, false, false);
+        }, Qt::QueuedConnection);
 
         if (!played) {
             // A Steam launch that never started, or a process that exited
@@ -3285,28 +4120,149 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
     thread->start();
 }
 
+void VortexBridge::setLaunchState(const QString &name, bool launching, bool running) {
+    m_launchingGames.removeAll(name);
+    m_runningGames.removeAll(name);
+    if (launching) m_launchingGames.append(name);
+    if (running)   m_runningGames.append(name);
+    emit launchStateChanged();
+}
+
+void VortexBridge::quitGame(QString name) {
+    if (!m_runningGames.contains(name))
+        return;
+    for (const BridgeGame &bg : m_internalGames) {
+        if (QString::fromStdString(bg.name) != name)
+            continue;
+        // A local game's installDir is its folder; fall back to the exe's own
+        // in case a record ever arrives without one.
+        const fs::path dir = !bg.installDir.empty() ? bg.installDir
+                                                    : bg.gamePath.parent_path();
+        vlog::line("Play", "quitting " + bg.name);
+        // Blocks through the grace period, so off the UI thread. The launch
+        // thread notices the exit and flips the button back to PLAY.
+        QThread *thread = QThread::create([dir]() { quit_games_in_dir(dir); });
+        connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+        thread->start();
+        return;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // uninstallGame — uses real installDir from m_internalGames.
 // ─────────────────────────────────────────────────────────────────────────────
 void VortexBridge::uninstallGame(QString name) {
     for (const BridgeGame &bg : m_internalGames) {
         if (QString::fromStdString(bg.name) == name) {
-            if (bg.source == "Steam") {
-                uninstall_steam_game_by_appid(bg.appid);
-            } else {
-                int possibleSteamAppId = get_steam_appid_for_install_dir(bg.installDir);
-                if (possibleSteamAppId > 0) {
-                    uninstall_steam_game_by_appid(possibleSteamAppId);
-                } else {
-                    std::error_code ec;
-                    fs::remove_all(bg.installDir, ec);
-                }
+            int steamAppId = bg.source == "Steam"
+                                 ? bg.appid
+                                 : get_steam_appid_for_install_dir(bg.installDir);
+            if (steamAppId > 0) {
+                // Steam does the removal itself, after its own prompt, so a
+                // re-scan now would still find the game. Wait for it instead.
+                if (uninstall_steam_game_by_appid(steamAppId))
+                    watchSteamUninstall(steamAppId);
+                return;
             }
+            std::error_code ec;
+            fs::remove_all(bg.installDir, ec);
             // Re-scan so the removed game disappears from the grid.
             loadGames();
             return;
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// watchSteamUninstall — re-scan once Steam has actually removed the game.
+//
+// steam://uninstall returns as soon as Steam's confirm dialog is up; the
+// manifest only goes after the player confirms there. Polled rather than
+// watched with QFileSystemWatcher because the game can sit in any of Steam's
+// libraries. The poll gives up after a while so a dialog the player cancelled
+// does not keep a timer alive for the rest of the session.
+// ─────────────────────────────────────────────────────────────────────────────
+void VortexBridge::watchSteamUninstall(int appid) {
+    if (m_pendingSteamUninstalls.contains(appid))
+        return;
+    m_pendingSteamUninstalls.insert(appid);
+
+    constexpr int kPollMs   = 2000;
+    constexpr int kGiveUpMs = 30 * 60 * 1000;
+
+    auto *timer = new QTimer(this);
+    timer->setInterval(kPollMs);
+    auto elapsed = std::make_shared<QElapsedTimer>();
+    elapsed->start();
+    connect(timer, &QTimer::timeout, this, [this, timer, elapsed, appid]() {
+        const bool gone = !is_steam_app_installed(appid);
+        if (!gone && elapsed->elapsed() < kGiveUpMs)
+            return;
+        timer->stop();
+        timer->deleteLater();
+        m_pendingSteamUninstalls.remove(appid);
+        if (gone) {
+            vlog::line("Library", "Steam removed app " + std::to_string(appid)
+                                      + " -- rescanning");
+            loadGames();
+        }
+    });
+    timer->start();
+}
+
+// fromLocalFile, not a hand-built "file:///" string, so a '#' or '%' in the
+// path is escaped instead of being read as a fragment or an escape.
+bool VortexBridge::openInstallFolder(QString path) {
+    if (path.isEmpty() || !QFileInfo(path).isDir())
+        return false;
+    return QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setGameExecutable — overrule the scanner's pick of which .exe a local game
+// runs.
+//
+// exe_cache.txt is the scanner's own record and it is last-line-wins (see
+// scan_directory_for_games), so appending one line is all it takes for the
+// choice to survive every later scan. The in-memory row is patched as well so
+// Play uses the new exe straight away, in place for the same scroll-position
+// reason as updatePreference().
+// ─────────────────────────────────────────────────────────────────────────────
+QString VortexBridge::setGameExecutable(QString installDir, QString exeUrl) {
+    const QUrl url(exeUrl);
+    const QString exe = url.isLocalFile() ? url.toLocalFile() : exeUrl;
+    const QFileInfo info(exe);
+    if (exe.isEmpty() || !info.isFile()
+        || info.suffix().compare("exe", Qt::CaseInsensitive) != 0)
+        return QString();
+
+    for (int i = 0; i < static_cast<int>(m_internalGames.size()); ++i) {
+        BridgeGame &bg = m_internalGames[i];
+        if (bg.source != "Local"
+            || QString::compare(QString::fromStdString(bg.installDir.string()),
+                                installDir, Qt::CaseInsensitive) != 0)
+            continue;
+
+        const fs::path exePath =
+            QDir::toNativeSeparators(info.absoluteFilePath()).toStdString();
+
+        std::ofstream out(app_data_path("exe_cache.txt"), std::ios::app);
+        if (!out.is_open())
+            return QString();
+        out << bg.installDir.string() << "=" << exePath.string() << "\n";
+        out.close();
+
+        bg.gamePath = exePath;
+        const QString newPath = QString::fromStdString(exePath.string());
+        if (i < m_gameList.size()) {
+            QVariantMap row = m_gameList[i].toMap();
+            row["gamePath"] = newPath;
+            m_gameList[i] = row;
+        }
+        vlog::line("Library", bg.name + " now launches " + exePath.string());
+        return newPath;
+    }
+    return QString();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3757,7 +4713,7 @@ void VortexBridge::validateCredentials(QString igdbClientId,
             // A key that now works deserves the fetch it was previously
             // denied, without making the user restart.
             if (igdbOk) {
-                m_catalogAutoFetchTried = false;
+                m_catalogAutoFetchClock.invalidate();
                 maybeAutoFetchCatalog();
             }
         }, Qt::QueuedConnection);
@@ -3862,19 +4818,42 @@ void VortexBridge::refreshCatalog() {
     thread->start();
 }
 
-// Start the one-time catalog download if this install has never had one.
+// The catalog is refreshed in the background once it is this old, so new
+// releases and rating changes reach Discover. Matches CATALOG_REFRESH_DAYS in
+// recommend.py, which reports the age this is compared against.
+static constexpr double kCatalogRefreshDays = 5.0;
+
+// Minimum gap between automatic attempts. Called after every recommendation
+// run -- every heart, every mood change -- so without it a fetch that keeps
+// failing (offline, IGDB down) would be retried on each one. Long enough to
+// stop that, short enough that a launcher left open for days still refreshes.
+static constexpr qint64 kCatalogAutoFetchRetryMs = 6LL * 60 * 60 * 1000;
+
+// Start a catalog download in the background when Discover needs one: the
+// install has never had a catalog, or the one it has is kCatalogRefreshDays old.
 //
-// Discover is empty without it, and the first-run wizard's offer is easy to
-// skip -- which is exactly what happened on the machine this was written for:
-// the log showed a working library, working artwork, and a Discover section
-// with nothing in it and no explanation.
+// The first case exists because the first-run wizard's offer is easy to skip
+// -- which is exactly what happened on the machine this was written for: the
+// log showed a working library, working artwork, and a Discover section with
+// nothing in it and no explanation.
 //
 // Deliberately silent when credentials are missing. That is not a failure, it
 // is a user who has not entered keys yet, and the wizard and the Discover
 // empty state both already say so.
 void VortexBridge::maybeAutoFetchCatalog() {
-    if (m_catalogRefreshing || m_catalogAutoFetchTried) return;
-    m_catalogAutoFetchTried = true;
+    if (m_catalogRefreshing) return;
+    if (m_catalogAutoFetchClock.isValid()
+        && m_catalogAutoFetchClock.elapsed() < kCatalogAutoFetchRetryMs)
+        return;
+
+    const bool empty = m_discoverCandidateCount == 0 && m_catalogAgeDays < 0;
+    const bool stale = m_catalogAgeDays >= kCatalogRefreshDays;
+    if (!empty && !stale) return;
+
+    // Only a real attempt starts the retry window. Checked after the
+    // empty/stale test, so a fresh catalog never pushes back the next
+    // refresh by six hours.
+    m_catalogAutoFetchClock.start();
 
     if (!has_secret(kIgdbId) || !has_secret(kIgdbSecret)) {
         vlog::line("Catalog",
@@ -3883,14 +4862,17 @@ void VortexBridge::maybeAutoFetchCatalog() {
         return;
     }
 
-    // Only when there is nothing to lose. A populated catalog is refreshed on
-    // demand from Settings, never automatically -- re-downloading 5,700 games
-    // on every launch would be indefensible.
-    if (m_discoverCandidateCount > 0) return;
-
-    vlog::line("Catalog",
-               "empty on this install; starting the one-time download "
-               "in the background");
+    // The old catalog stays in place until the new one is stored, in a single
+    // transaction, so Discover keeps its picks for the whole download.
+    if (stale) {
+        vlog::line("Catalog",
+                   "catalog is " + std::to_string(static_cast<int>(m_catalogAgeDays)) +
+                   " days old; refreshing in the background");
+    } else {
+        vlog::line("Catalog",
+                   "empty on this install; starting the one-time download "
+                   "in the background");
+    }
     refreshCatalog();
 }
 

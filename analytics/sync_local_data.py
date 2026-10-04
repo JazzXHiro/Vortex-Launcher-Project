@@ -5,6 +5,7 @@ Sources (all next to the executable / repo root):
     game_metadata.txt     IGDB_ID=Developer|Rating|TimeToBeat|AllGenres|MainGenres
     playtime_sessions.log GAME_KEY | NAME | DURATION | START | END
     preferences.json      {"Game Name": 1}     (favourites only)
+    manual_played.txt     NAME|IGDB_ID|ADDED_AT_EPOCH  (marked played by hand)
 
 Two things here are load-bearing and easy to undo by accident:
 
@@ -133,6 +134,80 @@ def synthesize_steam_sessions(game_id, game_key, total_seconds, last_played_epoc
             "synthetic": True,
         })
     return out
+
+# --- Games marked played by hand --------------------------------------------
+#
+# "Add to Played" on the Browse page is for a game played somewhere Vortex
+# never saw -- a console, another PC. There is no session to read, so each one
+# becomes a single synthetic session: long enough to count as engaged, which is
+# what puts it into the taste profile and keeps it out of the candidates.
+#
+# The id depends on the game alone, never on when it was marked, so the row can
+# be found again and retracted when the mark is taken back off.
+
+def manual_session_uuid(canonical):
+    return str(uuid.uuid5(_NS, "manual-played|" + canonical))
+
+
+def parse_manual_played():
+    """[(name, igdb_id, added_at_epoch)] from the launcher's export.
+
+    igdb_id is a string, matching the keys of parse_metadata(); "0" when the
+    launcher never learned one.
+    """
+    path = get_file_path("manual_played.txt")
+    if not os.path.exists(path):
+        return []
+
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            name = repair_mojibake(parts[0].strip())
+            if not name:
+                continue
+            igdb_id = str(_int_or_zero(parts[1])) if len(parts) > 1 else "0"
+            added_at = _int_or_zero(parts[2]) if len(parts) > 2 else 0
+            out.append((name, igdb_id, added_at))
+    return out
+
+
+def manual_played_sessions(manual, game_id_for, skip_game_ids, now=None):
+    """One synthetic session per hand-marked game with no real history.
+
+    manual        -- [(name, igdb_id, added_at_epoch)] from parse_manual_played()
+    game_id_for   -- canonical name -> game_id, or None when the game is unknown
+    skip_game_ids -- games with observed or Steam-derived sessions already;
+                     those carry real evidence and need no invented row
+
+    The session ends when the game was marked. That is the only date there is,
+    and it is a lower bound on recency rather than an invention -- the user
+    played it no later than that.
+    """
+    out = []
+    for name, _igdb_id, added_at in manual:
+        canonical = make_canonical(name)
+        game_id = game_id_for(canonical)
+        if not game_id or game_id in skip_game_ids:
+            continue
+        try:
+            end = datetime.fromtimestamp(added_at) if added_at > 0 else (now or datetime.now())
+        except (OverflowError, OSError, ValueError):
+            end = now or datetime.now()
+        duration = SYNTHETIC_SESSION_SECONDS
+        out.append({
+            "session_id": manual_session_uuid(canonical),
+            "game_id": game_id,
+            "start": end - timedelta(seconds=duration),
+            "end": end,
+            "duration": duration,
+            "synthetic": True,
+        })
+    return out
+
 
 def parse_igdb_cache():
     cache = {}
@@ -326,6 +401,13 @@ def collect_games_and_sessions():
         return gid
 
     for game_name, igdb_id in igdb_cache.items():
+        upsert_game(game_name, igdb_id)
+
+    # Marked played by hand. Usually absent from igdb_cache.txt -- they were
+    # found on the Browse page, not scanned -- and without a row of their own
+    # the synthetic session below would have no game to attach to. The
+    # launcher writes their metadata to game_metadata.txt when they are marked.
+    for game_name, igdb_id, _added_at in parse_manual_played():
         upsert_game(game_name, igdb_id)
 
     sessions = []
@@ -624,10 +706,39 @@ def sync_data():
         derived.extend(synthesize_steam_sessions(
             game_id, canonical, total_seconds, last_played))
 
+    manual = parse_manual_played()
+
+    def game_id_for(canonical):
+        cur.execute("SELECT game_id FROM games WHERE canonical_name = ?", (canonical,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    manual_rows = manual_played_sessions(
+        manual, game_id_for,
+        observed_game_ids | {d["game_id"] for d in derived})
+
+    # Retract marks that were taken back off. Only synthetic rows are looked
+    # at, and only one whose id is exactly the manual id for its own game is
+    # deleted, so Steam-derived sessions can never be caught by this.
+    # A mark on a game Vortex has since watched being played goes too: observed
+    # play always wins, the same rule the Steam-derived rows follow.
+    wanted_manual = {make_canonical(name) for name, _, _ in manual}
+    retracted = 0
+    for session_id, game_id, canonical in cur.execute("""
+            SELECT s.session_id, s.game_id, g.canonical_name
+              FROM sessions s JOIN games g ON g.game_id = s.game_id
+             WHERE s.synthetic = 1 AND s.user_id = ?
+        """, (user_id,)).fetchall():
+        if canonical in wanted_manual and game_id not in observed_game_ids:
+            continue
+        if session_id == manual_session_uuid(canonical):
+            cur.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            retracted += 1
+
     # Deterministic session ids let us upsert instead of deleting every session
     # for the user and reinserting on each game exit.
     added = []
-    for s in sessions + derived:
+    for s in sessions + derived + manual_rows:
         # active_seconds / idle_seconds / activity_ratio have been in the schema
         # all along and were never written; the launcher measures idle now, so
         # they carry a real figure. They stay NULL for anything with no idle
@@ -657,7 +768,13 @@ def sync_data():
         print(f"  derived {len(derived)} sessions from Steam playtime "
               f"for {len({d['game_id'] for d in derived})} games")
 
-    material = is_material(cur, user_id, added)
+    if manual_rows or retracted:
+        print(f"  {len(manual_rows)} game(s) marked played by hand"
+              + (f", {retracted} unmarked" if retracted else ""))
+
+    # A retraction removes an engaged session, which always moves the profile;
+    # is_material() only ever sees additions.
+    material = is_material(cur, user_id, added) or retracted > 0
 
     events = ingest_feedback_events(cur, user_id)
 

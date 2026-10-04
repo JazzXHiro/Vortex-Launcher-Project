@@ -18,6 +18,9 @@ struct IgdbGameInfo {
     // How the game is played, as opposed to what it is (genres) or what it is
     // about (themes). Exactly six values exist in IGDB.
     std::vector<std::string> game_modes;
+    // False for an entry hanging off another game -- a DLC, update, episode or
+    // edition (IGDB parent_game / version_parent). Used only to rank results.
+    bool standalone = true;
 };
 
 // Queries the IGDB API and returns the canonical game name and ID for the given
@@ -72,3 +75,12 @@ CredentialCheck igdb_probe_credentials(const std::string &clientId,
 // message: keys being PRESENT and keys WORKING are different questions, and
 // the app was only ever able to answer the first.
 bool igdb_last_auth_ok();
+
+// One raw Apicalypse request against api.igdb.com/v4/<endpoint>, returning the
+// JSON body untouched. For callers that parse with a real JSON library (the
+// Browse tab in the bridge) and want fields the resolver above never asks for.
+//
+// Blocking -- call it off the UI thread. Throws std::runtime_error when the
+// credentials are missing, Twitch refuses them, or the request fails; a 401 is
+// retried once with a fresh token first.
+std::string igdb_query(const std::string &endpoint, const std::string &body);

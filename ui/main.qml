@@ -13,6 +13,32 @@ Window {
     property string activeTab: "Library"
     property var api: vortexApi
 
+    // The top bar's search box. One query for whichever tab is showing, and
+    // cleared on every tab switch -- a filter left over from another list
+    // would make this one look half empty for no visible reason.
+    property string searchText: ""
+    readonly property bool searchable:
+        root.activeTab === "Library" || root.activeTab === "Favorites"
+        || root.activeTab === "Wishlist" || root.activeTab === "Played"
+
+    // Same rule as make_canonical() in game_manager.cpp: lowercase
+    // alphanumerics only, so "stick fight the" finds "Stick Fight: The Game".
+    function canonical(text) {
+        return String(text || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+    }
+
+    function matchesSearch(names) {
+        const query = root.searchText.trim().toLowerCase()
+        if (query === "") return true
+        const wanted = root.canonical(query)
+        for (let i = 0; i < names.length; i++) {
+            const name = String(names[i] || "")
+            if (name.toLowerCase().indexOf(query) >= 0) return true
+            if (wanted !== "" && root.canonical(name).indexOf(wanted) >= 0) return true
+        }
+        return false
+    }
+
     // True once RESET LIKES has been clicked and is showing its confirm step.
     property bool resetLikesArmed: false
 
@@ -94,6 +120,8 @@ Window {
         }
         if (root.activeTab === "Wishlist")
             return wishlistGrid
+        if (root.activeTab === "Browse")
+            return browsePage.grid
         // Library, Favorites and Played are the same grid with a different
         // model. Played reuses it rather than declaring its own so the cards
         // cannot drift out of step with the library's size.
@@ -111,9 +139,16 @@ Window {
             grid.currentIndex = 0
             return
         }
+        // Browse's new-releases rail is one row: up and down have nowhere to
+        // go along it. GridView has no orientation, so grids never stop here.
+        if (grid.orientation === ListView.Horizontal
+            && (direction === "up" || direction === "down"))
+            return
 
-        // Same column count GridView itself lays out with.
-        const columns = Math.max(1, Math.floor(grid.width / grid.cellWidth))
+        // The grid's own count. Re-deriving it from width/cellWidth worked
+        // only while cellWidth was fixed; now that the cells stretch, the
+        // grid is the one thing that knows.
+        const columns = Math.max(1, grid.columns)
         let target = grid.currentIndex
 
         if (direction === "left") {
@@ -181,6 +216,10 @@ Window {
             tileMenu.navigate(direction)
             return
         }
+        if (browseDetails.visible) {
+            browseDetails.navigate(direction)
+            return
+        }
         if (detailPopup.visible) {
             detailPopup.navigate(direction)
             return
@@ -203,6 +242,10 @@ Window {
             tileMenu.activateFocused()
             return
         }
+        if (browseDetails.visible) {
+            browseDetails.activateFocusedAction()
+            return
+        }
         if (detailPopup.visible) {
             detailPopup.activateFocusedAction()
             return
@@ -219,8 +262,23 @@ Window {
         if (!game)
             return
 
-        // Unowned picks open too — the details page falls back to
-        // recommendationList and shows Check on Steam instead of Play.
+        // Browse results open their own page: they are IGDB rows, not games
+        // any of the lists GameDetails resolves from would know about.
+        if (root.activeTab === "Browse") {
+            browseDetails.focusedAction = 0
+            browseDetails.openFor(game)
+            return
+        }
+
+        // Recommendations open the Browse-style page too, by name: both the
+        // library and Discover picks, owned or not. It shows Play or Check on
+        // Steam itself.
+        if (root.activeTab === "Recommendations") {
+            browseDetails.focusedAction = 0
+            browseDetails.openForGame(game.name, "Recommendations")
+            return
+        }
+
         detailPopup.launchOrigin = root.activeTab
         detailPopup.focusedAction = 0
         // liveName is the library delegate's resolved title; the Discover
@@ -232,17 +290,45 @@ Window {
         detailPopup.open()
     }
 
+    // Start a game from its card, without going through the details page.
+    // Origin is the tab it was started from, the same thing GameDetails passes,
+    // so the recommender records where the launch came from.
+    function playGame(name) {
+        if (!root.api || !name)
+            return
+        root.api.launchGameFrom(name, root.activeTab)
+    }
+
+    // X — the pad's equivalent of the PLAY button on a card. A still opens the
+    // details page and R3 still opens the tile menu; this is the shortcut past
+    // both. Guarded like the others: whatever is open on top owns the input.
+    function controllerPlay() {
+        root.padActive = true
+        if (root.padBlocked || moodOverlay.visible
+            || detailPopup.visible || tileMenu.visible || browseDetails.visible)
+            return
+        if (root.activeTab === "Recommendations" || root.activeTab === "Wishlist"
+            || root.activeTab === "Browse")
+            return
+        if (gameGrid.currentIndex < 0 || !gameGrid.currentItem)
+            return
+        // The delegate decides: it no-ops for a Played row whose files are gone.
+        gameGrid.currentItem.play()
+    }
+
     // R3 — the pad's equivalent of clicking a card's overflow button. Only the
     // library grid has one; the recommendation and wishlist cards are unchanged.
     function controllerOptions() {
         root.padActive = true
-        if (root.padBlocked || moodOverlay.visible || detailPopup.visible)
+        if (root.padBlocked || moodOverlay.visible || detailPopup.visible
+            || browseDetails.visible)
             return
         if (tileMenu.visible) {                      // pressing it again closes it
             tileMenu.close()
             return
         }
-        if (root.activeTab === "Recommendations" || root.activeTab === "Wishlist")
+        if (root.activeTab === "Recommendations" || root.activeTab === "Wishlist"
+            || root.activeTab === "Browse")
             return
         if (gameGrid.currentIndex < 0 || !gameGrid.currentItem)
             return
@@ -264,6 +350,12 @@ Window {
             // details page, and only closes the menu once there is none.
             if (!tileMenu.handleBack())
                 tileMenu.close()
+            return
+        }
+        if (browseDetails.visible) {
+            // A screenshot open full size is the level to come back from.
+            if (!browseDetails.handleBack())
+                browseDetails.close()
             return
         }
         if (detailPopup.visible) {
@@ -288,13 +380,14 @@ Window {
     }
 
     // Select button — step through the tabs. This used to be a two-way toggle
-    // between Library and Recommendations; with four tabs a toggle would leave
-    // Favorites and Wishlist unreachable from the pad entirely.
-    readonly property var tabs: ["Library", "Recommendations", "Favorites", "Wishlist", "Played"]
+    // between Library and Recommendations; with more tabs a toggle would leave
+    // the rest unreachable from the pad entirely.
+    readonly property var tabs: ["Library", "Recommendations", "Browse", "Favorites", "Wishlist", "Played"]
 
     function toggleRecommendations() {
         root.padActive = true
-        if (root.padBlocked || detailPopup.visible || moodOverlay.visible)
+        if (root.padBlocked || detailPopup.visible || moodOverlay.visible
+            || browseDetails.visible)
             return
 
         const i = root.tabs.indexOf(root.activeTab)
@@ -310,6 +403,12 @@ Window {
 
     onActiveFilterChanged: gameGrid.currentIndex = root.padActive ? 0 : -1
     onActiveTabChanged: {
+        root.searchText = ""
+        // Typing is the only thing to do on an empty Browse tab, so the box
+        // takes the keyboard straight away. The pad never reads keys, so this
+        // costs a controller user nothing.
+        if (root.activeTab === "Browse" && !root.padActive)
+            browsePage.focusSearch()
         const grid = root.currentGrid()
         if (root.padActive && grid.currentIndex < 0 && grid.count > 0)
             grid.currentIndex = 0
@@ -324,6 +423,7 @@ Window {
         function onFilterNext()             { root.cycleFilter(1) }
         function onToggleRecommendations()  { root.toggleRecommendations() }
         function onOptions()                { root.controllerOptions() }
+        function onPlay()                   { root.controllerPlay() }
     }
 
     // The tile overflow menu. One instance for the whole grid -- see TileMenu.qml.
@@ -373,6 +473,10 @@ Window {
         }
     }
 
+    BrowseDetails {
+        id: browseDetails
+    }
+
     SettingsWindow {
         id: settingsWindow
         onRequestAddDirectory: {
@@ -396,7 +500,11 @@ Window {
             firstRunWizard.open()
     }
 
-    // Shared by the top-bar "+ FOLDER" shortcut and the settings panel.
+    // Opened from the settings panel's Directories section, which is now the
+    // only way in — the top bar's "+ FOLDER" shortcut duplicated it and went.
+    // fromSettings is therefore always true today; it stays because it is what
+    // routes the result back to the panel, and unpicking it would fork the
+    // dialog's one code path for no gain.
     FolderDialog {
         id: localFolderDialog
         title: "Add Local Game Folder"
@@ -435,7 +543,7 @@ Window {
                 Layout.alignment: Qt.AlignLeft
 
                 Repeater {
-                    model: ["Library", "Recommendations", "Favorites", "Wishlist", "Played"]
+                    model: ["Library", "Recommendations", "Browse", "Favorites", "Wishlist", "Played"]
                     delegate: Rectangle {
                         id: tabButton
                         required property string modelData
@@ -484,70 +592,6 @@ Window {
                 Layout.fillWidth: true
             }
 
-            Row {
-                spacing: 15
-                Layout.alignment: Qt.AlignHCenter
-                visible: root.activeTab === "Library"
-
-                Repeater {
-                    model: ["All", "Steam", "Local"]
-                    delegate: Rectangle {
-                        id: filterButton
-                        required property string modelData
-
-                        readonly property bool active: root.activeFilter === filterButton.modelData
-                        readonly property bool hovered:
-                            filterArea.containsMouse && root.mouseInControl && !filterButton.active
-
-                        width: 120; height: 35; radius: 17
-                        color: filterButton.active ? Theme.accent : (filterButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
-                        border.color: filterButton.hovered ? Theme.borderStrong : Theme.borderControl
-
-                        Behavior on color { ColorAnimation { duration: 150 } }
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: filterButton.modelData.toUpperCase()
-                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                            color: filterButton.active ? Theme.textInverse : (filterButton.hovered ? Theme.textBody : Theme.textMuted)
-                        }
-
-                        MouseArea {
-                            id: filterArea
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.activeFilter = filterButton.modelData
-                        }
-                    }
-                }
-            }
-
-            Rectangle {
-                id: addFolderButton
-                readonly property bool hovered: addFolderArea.containsMouse && root.mouseInControl
-
-                implicitWidth: 150; implicitHeight: 35; radius: 17
-                visible: root.activeTab === "Library"
-                color: addFolderButton.hovered ? Theme.accent : Theme.bgRaised
-                border.color: addFolderButton.hovered ? Theme.focusRing : Theme.borderControl
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "+ FOLDER"
-                    font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                    color: addFolderButton.hovered ? Theme.textInverse : Theme.textMuted
-                }
-
-                MouseArea {
-                    id: addFolderArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: localFolderDialog.open()
-                }
-            }
-
             // ─────────────────────────────────────────────────────────────
             // Scan progress
             //
@@ -581,30 +625,11 @@ Window {
                     font.letterSpacing: 1
                 }
 
-                // Determinate whenever a total is known; the first phase has no
-                // count yet, so it shows a plain sweep rather than a bar
-                // pinned at zero, which reads as stuck.
-                Rectangle {
+                // The count beside it carries the progress; the bar only says
+                // "still working".
+                LoadingBar {
                     anchors.verticalCenter: parent.verticalCenter
-                    width: 110; height: 3; radius: 2
-                    color: Theme.bgEmphasis
-
-                    Rectangle {
-                        height: parent.height
-                        radius: parent.radius
-                        color: Theme.accent
-                        width: scanStrip.total > 0
-                               ? parent.width * Math.min(1, scanStrip.done / scanStrip.total)
-                               : parent.width * 0.25
-                        Behavior on width { NumberAnimation { duration: 200 } }
-
-                        SequentialAnimation on x {
-                            running: scanStrip.visible && scanStrip.total === 0
-                            loops: Animation.Infinite
-                            NumberAnimation { from: 0; to: 82; duration: 900; easing.type: Easing.InOutQuad }
-                            NumberAnimation { from: 82; to: 0; duration: 900; easing.type: Easing.InOutQuad }
-                        }
-                    }
+                    running: scanStrip.visible
                 }
 
                 Text {
@@ -613,6 +638,76 @@ Window {
                     text: scanStrip.done + " / " + scanStrip.total
                     color: Theme.textFaint
                     font.pixelSize: 11
+                }
+            }
+
+            // Search within the tab -- not on Recommendations, which is a ranked
+            // list rather than a collection to look things up in. Bound both
+            // ways through root.searchText so a tab switch clears the box.
+            SearchField {
+                id: librarySearch
+                Layout.alignment: Qt.AlignVCenter
+                visible: root.searchable
+                placeholderText: root.activeTab === "Library"
+                                 ? "Search installed games"
+                                 : "Search " + root.activeTab.toLowerCase()
+                text: root.searchText
+                onTextChanged: root.searchText = librarySearch.text
+            }
+
+            Shortcut {
+                sequence: "Ctrl+F"
+                enabled: (root.searchable || root.activeTab === "Browse")
+                         && !detailPopup.visible && !browseDetails.visible
+                         && !moodOverlay.visible
+                onActivated: root.activeTab === "Browse" ? browsePage.focusSearch()
+                                                         : librarySearch.focusField()
+            }
+
+            // Sits after the scan strip rather than beside the tabs.
+            // Only one of these three is ever visible at once — filters on
+            // Library, reset on Favorites, refresh on Recommendations — so
+            // they share the same slot on the right.
+            Row {
+                spacing: 15
+                Layout.alignment: Qt.AlignVCenter
+                visible: root.activeTab === "Library"
+
+                Repeater {
+                    model: ["All", "Steam", "Local"]
+                    delegate: Rectangle {
+                        id: filterButton
+                        required property string modelData
+
+                        readonly property bool active: root.activeFilter === filterButton.modelData
+                        readonly property bool hovered:
+                            filterArea.containsMouse && root.mouseInControl && !filterButton.active
+
+                        // Hugs its label, like the tab pills above, rather
+                        // than padding every filter out to one fixed width.
+                        width: filterLabel.implicitWidth + 52
+                        height: 35; radius: 17
+                        color: filterButton.active ? Theme.accent : (filterButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
+                        border.color: filterButton.hovered ? Theme.borderStrong : Theme.borderControl
+
+                        Behavior on color { ColorAnimation { duration: 150 } }
+
+                        Text {
+                            id: filterLabel
+                            anchors.centerIn: parent
+                            text: filterButton.modelData.toUpperCase()
+                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                            color: filterButton.active ? Theme.textInverse : (filterButton.hovered ? Theme.textBody : Theme.textMuted)
+                        }
+
+                        MouseArea {
+                            id: filterArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.activeFilter = filterButton.modelData
+                        }
+                    }
                 }
             }
 
@@ -761,15 +856,35 @@ Window {
         StackLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            // Library and Favorites share page 0 — same cards, different model.
+            // Library, Favorites and Played share page 0 — same cards,
+            // different model.
             currentIndex: root.activeTab === "Recommendations" ? 1
-                        : root.activeTab === "Wishlist" ? 2 : 0
+                        : root.activeTab === "Wishlist" ? 2
+                        : root.activeTab === "Browse" ? 3 : 0
 
             // Game grid
             GridView {
                 id: gameGrid
                 clip: true
-                cellWidth: 280; cellHeight: 440
+                // Elastic gutters. A GridView fits floor(width/cellWidth)
+                // columns and abandons the remainder at the right edge -- a
+                // whole card's width of dead space at some sizes. Taking the
+                // count from a minimum and dividing the width back out spends
+                // the remainder on the gutters instead, and the card itself
+                // never changes size.
+                //
+                // 280 rather than 300: the minimum only decides how many
+                // columns fit, and 300 was one short on a 1536-wide desktop --
+                // four columns with 124px between them. 280 buys the fifth and
+                // pulls the gutters back to ~51.
+                readonly property int minCellWidth: 280
+                readonly property int columns:
+                    Math.max(1, Math.floor(gameGrid.width / gameGrid.minCellWidth))
+
+                cellWidth: gameGrid.width > 0
+                           ? Math.floor(gameGrid.width / gameGrid.columns)
+                           : gameGrid.minCellWidth
+                cellHeight: 440
 
                 ScrollBar.vertical: VortexScrollBar { }
 
@@ -779,7 +894,21 @@ Window {
                 currentIndex: -1
                 Text {
                     anchors.centerIn: parent
+                    visible: gameGrid.count === 0 && root.searchText.trim() !== ""
+                    text: "NO MATCHES FOR \u201C" + root.searchText.trim() + "\u201D"
+                    width: gameGrid.width - 80
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideMiddle
+                    color: Theme.textGhost
+                    font.pixelSize: 16
+                    font.bold: true
+                    font.letterSpacing: 2
+                }
+
+                Text {
+                    anchors.centerIn: parent
                     visible: gameGrid.count === 0 && root.activeTab === "Favorites"
+                             && root.searchText.trim() === ""
                     text: "NO FAVORITES YET\nOpen a game and tap the heart"
                     horizontalAlignment: Text.AlignHCenter
                     color: Theme.textGhost
@@ -791,6 +920,7 @@ Window {
                 Text {
                     anchors.centerIn: parent
                     visible: gameGrid.count === 0 && root.activeTab === "Played"
+                             && root.searchText.trim() === ""
                     text: "NOTHING PLAYED YET\nLaunch a game and it lands here for good"
                     horizontalAlignment: Text.AlignHCenter
                     color: Theme.textGhost
@@ -839,17 +969,33 @@ Window {
                 // than a second copy of the card markup.
                 model: {
                     if (!root.api) return [];
+                    let list;
                     if (root.activeTab === "Favorites")
-                        return root.api.favoriteGames || [];
+                        list = root.api.favoriteGames || [];
                     // Everything ever played, installed or not. Comes from the
                     // bridge already ordered and de-duplicated -- see
                     // VortexBridge::playedGames().
-                    if (root.activeTab === "Played")
-                        return root.api.playedGames || [];
-                    if (!root.api.gameList) return [];
-                    if (root.activeFilter === "All") return root.api.gameList;
-                    return root.api.gameList.filter(function(game) {
-                        return game.source === root.activeFilter;
+                    else if (root.activeTab === "Played")
+                        list = root.api.playedGames || [];
+                    else if (!root.api.gameList)
+                        list = [];
+                    else if (root.activeFilter === "All")
+                        list = root.api.gameList;
+                    else
+                        list = root.api.gameList.filter(function(game) {
+                            return game.source === root.activeFilter;
+                        });
+
+                    if (root.searchText.trim() === "")
+                        return list;
+                    // The live title as well as the snapshot's: pass 2 renames
+                    // a local game in place without republishing the list, so
+                    // the card can show a name modelData never had (see
+                    // liveDetails below).
+                    return list.filter(function(game) {
+                        const live = game.installDir
+                            ? root.api.gameDetailsForInstallDir(game.installDir) : null;
+                        return root.matchesSearch([game.name, live ? live.name : ""]);
                     });
                 }
 
@@ -861,13 +1007,15 @@ Window {
                     // Mouse hover and controller focus light the card the same
                     // way, but only whichever input is currently driving.
                     //
-                    // The overflow button counts as being on the card. It sits
-                    // above cardArea and takes the hover off it, and since the
-                    // button only shows while the card is lit, leaving it out
-                    // here made the two chase each other: hover the button, the
-                    // card unlights, the button vanishes, the card lights again.
+                    // The overflow button and the play button both count as
+                    // being on the card. They sit above cardArea and take the
+                    // hover off it, and since both only show while the card is
+                    // lit, leaving either out made the two chase each other:
+                    // hover the button, the card unlights, the button vanishes,
+                    // the card lights again.
                     readonly property bool highlighted:
-                        ((cardArea.containsMouse || overflowArea.containsMouse)
+                        ((cardArea.containsMouse || overflowArea.containsMouse
+                          || playArea.containsMouse)
                          && root.mouseInControl)
                         || (gameDelegate.GridView.isCurrentItem && root.padInControl)
 
@@ -903,7 +1051,71 @@ Window {
                             ? gameDelegate.liveDetails.name
                             : (gameDelegate.modelData.name || "")
 
-                    width: 240; height: 400
+                    // The three facts the caption under the title carries.
+                    // Same live-row-first rule as liveName above: a session that
+                    // just ended shows its new total without a rescan.
+                    readonly property string playtimeLabel:
+                        (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
+                            ? gameDelegate.liveDetails.playtime
+                            : (gameDelegate.modelData.playtime || "0m")
+
+                    // Live row first, like liveName and playtimeLabel above.
+                    // modelData is the snapshot the card was published with, and
+                    // during a cold scan that snapshot carries "Unknown" for
+                    // every metadata slot until IGDB resolves the title. Reading
+                    // it directly meant the caption stayed blank until something
+                    // rebuilt the grid; through liveDetails it fills itself in
+                    // as the scan lands, which is what artRevision is for.
+                    readonly property string sourceLabel:
+                        (gameDelegate.liveDetails && gameDelegate.liveDetails.source)
+                            ? gameDelegate.liveDetails.source
+                            : (gameDelegate.modelData.source || "")
+
+                    readonly property bool fromSteam:
+                        gameDelegate.sourceLabel === "Steam"
+
+                    // applyGameMetadata() hands over the whole comma-separated
+                    // list ("Role-playing (RPG), Simulator, Strategy"); only the
+                    // first one fits under a 240px card.
+                    //
+                    // IGDB spells its genres out in full, and the long ones
+                    // elide mid-word into "Role-playing (RP..." at this width.
+                    // Where it carries an abbreviation in brackets that is both
+                    // shorter and what anyone actually calls the genre, so
+                    // prefer it: "Role-playing (RPG)" reads as "RPG".
+                    readonly property string genreLabel: {
+                        const live = gameDelegate.liveDetails
+                        const g = ((live && live.genres)
+                                   ? live.genres
+                                   : gameDelegate.modelData.genres) || ""
+                        if (g === "" || g === "Unknown") return ""
+                        const first = g.split(",")[0].trim()
+                        const abbreviated = first.match(/\(([^)]+)\)/)
+                        return abbreviated ? abbreviated[1] : first
+                    }
+
+                    // Launching something that is no longer on the disk fails
+                    // with nothing to show for it. Played is the only grid that
+                    // holds any -- everywhere else every row is installed.
+                    readonly property bool launchable:
+                        root.activeTab !== "Played"
+                        || gameDelegate.modelData.installed === true
+
+                    // 415, not the old 400: the caption line is the fourth row
+                    // of text the comment on the badges below used to rule out.
+                    // cellHeight is 440 and already had the room.
+                    width: 240; height: 415
+
+                    // Started by the card's own PLAY button and, for the pad,
+                    // by root.controllerPlay() reaching through currentItem --
+                    // the same shape as openTileMenu() below, and for the same
+                    // reason: the delegate is what knows whether this row can
+                    // be launched and what it is actually called.
+                    function play() {
+                        if (!gameDelegate.launchable)
+                            return
+                        root.playGame(gameDelegate.liveName)
+                    }
 
                     // Opened by the card's own button and, for the pad, by
                     // root.controllerOptions() reaching through currentItem.
@@ -915,6 +1127,11 @@ Window {
                     Column {
                         anchors.centerIn: parent
                         spacing: 12
+                        // Above cardArea, so the play button drawn on the
+                        // artwork can take its own clicks. Nothing else in here
+                        // holds a MouseArea, so the card stays clickable
+                        // everywhere the button is not.
+                        z: 1
 
                         Rectangle {
                             id: capsuleContainer
@@ -946,65 +1163,185 @@ Window {
                                 Text { text: "NO ART"; color: Theme.textGhost; font.bold: true }
                             }
 
-                            // ── Played tab markers ──────────────────────────
+                            // ── Source mark ─────────────────────────────────
                             //
-                            // Both sit ON the art rather than under the title.
-                            // A fourth caption line would push the card past
-                            // the 400px the library lays out with, and the
-                            // whole point is that the two tabs' grids are the
-                            // same size.
-                            Rectangle {
-                                visible: root.activeTab === "Played"
-                                anchors.left: parent.left
-                                anchors.bottom: parent.bottom
-                                anchors.margins: 10
-                                width: playtimePill.implicitWidth + 18
-                                height: 24
-                                radius: 12
-                                color: Theme.overlayBadge
-                                border.color: Theme.borderControl
+                            // On the artwork rather than in the caption, which
+                            // leaves the caption for the two facts that have to
+                            // be read rather than recognised. White for both, so
+                            // Steam and local read as one set of marks and not
+                            // as two logos competing with the cover behind them.
+                            Item {
+                                anchors { left: parent.left; top: parent.top; margins: 5 }
+                                width: 30; height: 30
+                                opacity: 0.6
 
-                                Text {
-                                    id: playtimePill
-                                    anchors.centerIn: parent
-                                    // The live row when the game is still
-                                    // installed, so a session that just ended
-                                    // shows its new total without a rescan.
-                                    text: (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
-                                          ? gameDelegate.liveDetails.playtime
-                                          : (gameDelegate.modelData.playtime || "0m")
-                                    color: Theme.textBody
-                                    font.pixelSize: 11
-                                    font.bold: true
+                                // Library only, though this delegate also
+                                // serves Favorites and Played. Those two are
+                                // already narrowed to games you know, and
+                                // Played carries the marker that earns its
+                                // place there -- the green installed dot in
+                                // the caption, for the rows whose files are
+                                // gone. Library is the one grid you scan whole.
+                                visible: root.activeTab === "Library"
+
+                                // Steam's own colours, unfiltered. The mark is
+                                // a filled disc whose meaning is the contrast
+                                // between the pipe glyph and the circle behind
+                                // it, so anything that flattens it -- whitening
+                                // it especially -- costs the glyph the ground it
+                                // reads against. It is the one spot of colour on
+                                // an otherwise monochrome card, which is the
+                                // trade for it being recognisable at 30px.
+                                Image {
+                                    anchors.fill: parent
+                                    source: "assets/steam.png"
+                                    // Decoded at the size it is drawn, the way
+                                    // the Check on Steam button does it. The
+                                    // asset is 600x600: handed over whole, the
+                                    // GPU bilinear-samples a 20x reduction every
+                                    // frame and the glyph crawls with aliasing.
+                                    sourceSize.width: 30
+                                    sourceSize.height: 30
+                                    fillMode: Image.PreserveAspectFit
+                                    smooth: true
+                                    visible: gameDelegate.fromSteam
+                                }
+
+                                // The save mark off the design canvas, flattened
+                                // to white on transparent at build time rather
+                                // than by an effect at run time: it is a solid
+                                // silhouette, so the whitening the Steam disc
+                                // could not survive costs this one nothing, and
+                                // baking it keeps a framebuffer off every card.
+                                Image {
+                                    anchors.fill: parent
+                                    source: "assets/local.png"
+                                    sourceSize.width: 30
+                                    sourceSize.height: 30
+                                    fillMode: Image.PreserveAspectFit
+                                    smooth: true
+                                    visible: !gameDelegate.fromSteam
                                 }
                             }
 
-                            // Marks what is still on the disk. The uninstalled
-                            // ones are the majority of an old library, so the
-                            // badge goes on the exception.
-                            Rectangle {
-                                visible: root.activeTab === "Played"
-                                         && gameDelegate.modelData.installed === true
-                                // Top-LEFT: the top-right corner belongs to the
-                                // overflow button, which appears over the art
-                                // the moment the card is hovered or focused.
-                                anchors.left: parent.left
-                                anchors.top: parent.top
-                                anchors.margins: 10
-                                width: installedTag.implicitWidth + 16
-                                height: 22
-                                radius: 11
-                                color: Theme.overlayPositive
-                                border.color: Theme.positive
+                            // ── Focus treatment ───────────────────────
+                            //
+                            // The strip and the play button arrive with the
+                            // overflow button, on the same condition, so the
+                            // whole card resolves in one step.
+                            //
+                            // The playtime pill and the INSTALLED badge used to
+                            // live down here. They are in the caption now, which
+                            // is what freed the bottom of the cover.
+                            Item {
+                                // Flush with the capsule's own edges rather
+                                // than the content box inside its border: the
+                                // strip is meant to read as the bottom of the
+                                // card, so it spans the full width and sits on
+                                // the bottom edge. It paints over the border
+                                // along the way, which its 0.5 opacity lets
+                                // through.
+                                anchors.fill: parent
 
-                                Text {
-                                    id: installedTag
-                                    anchors.centerIn: parent
-                                    text: "INSTALLED"
-                                    color: Theme.positiveText
-                                    font.pixelSize: 9
-                                    font.bold: true
-                                    font.letterSpacing: 1
+                                visible: opacity > 0
+                                opacity: (gameDelegate.highlighted
+                                          || overflowButton.menuOpen) ? 1.0 : 0.0
+                                Behavior on opacity { NumberAnimation { duration: 150 } }
+
+                                // The canvas blurs this strip, but a CSS filter
+                                // blurs the element's own content rather than
+                                // the backdrop, and the content is a smooth
+                                // gradient -- so the blur is very nearly a
+                                // no-op and a plain Rectangle stands in for it.
+                                // Worth the substitution: a MultiEffect here
+                                // would cost a framebuffer on every card in the
+                                // grid to soften two edges.
+                                Rectangle {
+                                    id: focusScrim
+                                    anchors {
+                                        left: parent.left
+                                        right: parent.right
+                                        bottom: parent.bottom
+                                    }
+                                    height: 140
+
+                                    // Square, because the artwork underneath is
+                                    // square: clip on a rounded Rectangle clips
+                                    // to the bounding box, not the rounded
+                                    // shape, so the cover fills the corners the
+                                    // capsule's own radius only appears to cut.
+                                    // Rounding the strip pulled it off those
+                                    // corners and left a crescent of bare art.
+
+                                    // Transparent at the top so the cover reads
+                                    // straight into the wash, solid at the
+                                    // bottom so the pill has full contrast under
+                                    // it. No blanket opacity: the fade is in the
+                                    // gradient, which keeps the bottom edge
+                                    // properly opaque instead of leaving bright
+                                    // artwork showing through it.
+                                    gradient: Gradient {
+                                        GradientStop { position: 0.0; color: "transparent" }
+                                        GradientStop { position: 1.0; color: Theme.artScrim }
+                                    }
+                                }
+
+                                // The white pill this had before the artboard
+                                // pass: centred across the card rather than
+                                // filling a corner of it.
+                                //
+                                // Pinned near the bottom edge rather than to the
+                                // wash's centre: the wash is 140 tall now, and
+                                // its centre would float the pill a third of the
+                                // way up the cover. Down here it sits on the
+                                // solid end of the gradient, which is what gives
+                                // the white its contrast.
+                                Rectangle {
+                                    id: playButton
+                                    readonly property bool hovered:
+                                        playArea.containsMouse && root.mouseInControl
+
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    anchors.bottom: parent.bottom
+                                    anchors.bottomMargin: 16
+                                    width: 104; height: 32; radius: 16
+
+                                    // Nothing to launch on a Played row whose
+                                    // files are gone; the strip still reads fine
+                                    // without it.
+                                    visible: gameDelegate.launchable
+
+                                    color: playButton.hovered ? Theme.bgPressed : Theme.accent
+                                    Behavior on color { ColorAnimation { duration: 120 } }
+
+                                    Row {
+                                        anchors.centerIn: parent
+                                        spacing: 7
+
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: "▶"
+                                            color: Theme.textInverse
+                                            font.pixelSize: 10
+                                        }
+
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: "PLAY"
+                                            color: Theme.textInverse
+                                            font.pixelSize: 11
+                                            font.bold: true
+                                            font.letterSpacing: 1
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: playArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: gameDelegate.play()
+                                    }
                                 }
                             }
 
@@ -1012,13 +1349,70 @@ Window {
                             Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
                         }
 
-                        Text {
+                        Column {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            text: gameDelegate.liveName
-                            color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
-                            font.pixelSize: 15; font.weight: Font.DemiBold
-                            horizontalAlignment: Text.AlignHCenter
-                            elide: Text.ElideRight; width: 220
+                            spacing: 4
+
+                            Text {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                text: gameDelegate.liveName
+                                color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
+                                font.pixelSize: 15; font.weight: Font.DemiBold
+                                horizontalAlignment: Text.AlignHCenter
+                                elide: Text.ElideRight; width: 220
+                            }
+
+                            // ── Caption ─────────────────────────────────────
+                            //
+                            // playtime · source · genre. This is where the two
+                            // badges that used to sit on the artwork went. The
+                            // covers are the point of the grid, and enough of
+                            // them are missing in a real library that the
+                            // caption often has to carry the card on its own.
+                            Row {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                spacing: 7
+
+                                // Still the exception it always was: only the
+                                // Played tab holds games that are gone from the
+                                // disk, so only it earns the marker.
+                                Rectangle {
+                                    visible: root.activeTab === "Played"
+                                             && gameDelegate.modelData.installed === true
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: 6; height: 6; radius: 3
+                                    color: Theme.positive
+                                }
+
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    // "0m" is what the bridge returns for a game
+                                    // that was never launched. An em dash says
+                                    // that; a zero reads like a measurement.
+                                    text: gameDelegate.playtimeLabel === "0m"
+                                          ? "—" : gameDelegate.playtimeLabel
+                                    color: Theme.textMuted
+                                    font.pixelSize: 11
+                                }
+
+                                Text {
+                                    visible: gameDelegate.genreLabel !== ""
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: "·"
+                                    color: Theme.textGhost
+                                    font.pixelSize: 11
+                                }
+
+                                Text {
+                                    visible: gameDelegate.genreLabel !== ""
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: gameDelegate.genreLabel
+                                    color: Theme.textMuted
+                                    font.pixelSize: 11
+                                    elide: Text.ElideRight
+                                    width: Math.min(implicitWidth, 90)
+                                }
+                            }
                         }
                     }
 
@@ -1066,9 +1460,10 @@ Window {
                             top: parent.top
                             right: parent.right
                             topMargin: 4
-                            rightMargin: 2
+                            rightMargin: 5
                         }
                         width: 32; height: 32; radius: 16
+                        z: 2                     // above the lifted column
 
                         // Semi-opaque rather than solid: the cover art stays
                         // readable underneath it.
@@ -1078,7 +1473,7 @@ Window {
 
                         visible: opacity > 0
                         opacity: (gameDelegate.highlighted || overflowButton.menuOpen)
-                                 ? 1.0 : 0.0
+                                 ? 0.6 : 0.0
                         Behavior on opacity { NumberAnimation { duration: 150 } }
                         Behavior on color { ColorAnimation { duration: 120 } }
 
@@ -1149,9 +1544,18 @@ Window {
                                 if (!root.api) return "Recommendations not loaded"
                                 if (downloadingCatalog) {
                                     const n = root.api.catalogFetched
-                                    return root.api.catalogPhase
+                                    // Discover already has picks: this is the
+                                    // periodic refresh, not first-time setup,
+                                    // and the current picks stay until it ends.
+                                    const list = root.api.recommendationList || []
+                                    const refreshing = list.some(function (item) {
+                                        return item.section === "discover"
+                                    })
+                                    return (refreshing ? "Updating catalog in the background"
+                                                       : root.api.catalogPhase)
                                          + (n > 0 ? " — " + n + " games downloaded"
-                                                  : " — this runs once, a few minutes")
+                                                  : refreshing ? ""
+                                                               : " — this runs once, a few minutes")
                                 }
                                 if (blocker !== "") return blocker
                                 return root.api.recommendationStatus
@@ -1323,15 +1727,24 @@ Window {
                                         // scrolls, so an inner scroll area would
                                         // fight it.
                                         height: Math.ceil(sectionColumn.picks.length
-                                                          / Math.max(1, Math.floor(width / 280))) * 488
+                                                          / sectionGrid.columns) * sectionGrid.cellHeight
                                         interactive: false
                                         // Same art size and column pitch as the
-                                        // library grid; the card is 448 tall
-                                        // (360 art + 88 caption) inside a 488
-                                        // cell, which is the library's 400-in-440
-                                        // with the two extra caption lines added
-                                        // to both numbers.
-                                        cellWidth: 280
+                                        // library grid -- including its elastic
+                                        // gutters, so the two tabs line up at
+                                        // any width. The card is 448 tall (360
+                                        // art + 88 caption) inside a 488 cell,
+                                        // which is the library's 400-in-440 with
+                                        // the two extra caption lines added to
+                                        // both numbers.
+                                        readonly property int minCellWidth: 280
+                                        readonly property int columns:
+                                            Math.max(1, Math.floor(sectionGrid.width
+                                                                   / sectionGrid.minCellWidth))
+
+                                        cellWidth: sectionGrid.width > 0
+                                                   ? Math.floor(sectionGrid.width / sectionGrid.columns)
+                                                   : sectionGrid.minCellWidth
                                         cellHeight: 488
                                         model: sectionColumn.picks
 
@@ -1559,8 +1972,8 @@ Window {
                                                 anchors.fill: parent
                                                 hoverEnabled: true
                                                 cursorShape: Qt.PointingHandCursor
-                                                // Unowned picks open too: the details page
-                                                // resolves them from recommendationList.
+                                                // Opens the Browse-style page, owned or
+                                                // not: it resolves the pick by name.
                                                 onClicked: {
                                                     if (root.padActive) {
                                                         root.recFocus = sectionColumn.modelData.key
@@ -1570,9 +1983,9 @@ Window {
                                                         root.api.logRecommendationClick(
                                                             recommendationDelegate.modelData.name,
                                                             recommendationDelegate.index + 1)
-                                                    detailPopup.launchOrigin = "Recommendations"
-                                                    detailPopup.selectedGameName = recommendationDelegate.modelData.name
-                                                    detailPopup.open()
+                                                    browseDetails.openForGame(
+                                                        recommendationDelegate.modelData.name,
+                                                        "Recommendations")
                                                 }
                                             }
                                         }
@@ -1606,9 +2019,23 @@ Window {
                     id: wishlistGrid
                     anchors.fill: parent
                     clip: true
-                    cellWidth: 300
-                    cellHeight: 430
-                    model: root.api && root.api.wishlistGames ? root.api.wishlistGames : []
+                    // Elastic gutters, as on the library grid above.
+                    readonly property int minCellWidth: 280
+                    readonly property int columns:
+                        Math.max(1, Math.floor(wishlistGrid.width / wishlistGrid.minCellWidth))
+
+                    cellWidth: wishlistGrid.width > 0
+                               ? Math.floor(wishlistGrid.width / wishlistGrid.columns)
+                               : wishlistGrid.minCellWidth
+                    cellHeight: 440
+                    model: {
+                        const list = root.api && root.api.wishlistGames ? root.api.wishlistGames : []
+                        if (root.searchText.trim() === "")
+                            return list
+                        return list.filter(function(game) {
+                            return root.matchesSearch([game.name])
+                        })
+                    }
 
                     ScrollBar.vertical: VortexScrollBar { }
 
@@ -1639,7 +2066,20 @@ Window {
 
                     Text {
                         anchors.centerIn: parent
-                        visible: wishlistGrid.count === 0
+                        visible: wishlistGrid.count === 0 && root.searchText.trim() !== ""
+                        text: "NO MATCHES FOR \u201C" + root.searchText.trim() + "\u201D"
+                        width: wishlistGrid.width - 80
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideMiddle
+                        color: Theme.textGhost
+                        font.pixelSize: 16
+                        font.bold: true
+                        font.letterSpacing: 2
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        visible: wishlistGrid.count === 0 && root.searchText.trim() === ""
                         text: "NOTHING WISHLISTED YET\nOpen a Discover pick and tap Add to Wishlist"
                         horizontalAlignment: Text.AlignHCenter
                         color: Theme.textGhost
@@ -1657,16 +2097,18 @@ Window {
                             (wishlistArea.containsMouse && root.mouseInControl)
                             || (wishlistDelegate.GridView.isCurrentItem && root.padInControl)
 
-                        width: 260
-                        height: 400
+                        // Same card as the library grid: 240x360 art in a
+                        // 240x415 cell, so switching tabs doesn't resize them.
+                        width: 240
+                        height: 415
 
                         Column {
                             anchors.centerIn: parent
-                            spacing: 10
+                            spacing: 12
 
                             Rectangle {
-                                width: 260
-                                height: 320
+                                width: 240
+                                height: 360
                                 radius: 12
                                 color: Theme.bgSurface
                                 border.width: 2
@@ -1694,25 +2136,30 @@ Window {
                                 Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
                             }
 
-                            Text {
+                            Column {
                                 anchors.horizontalCenter: parent.horizontalCenter
-                                width: 240
-                                text: wishlistDelegate.modelData.name
-                                color: wishlistDelegate.highlighted ? Theme.textPrimary : Theme.textBody
-                                font.pixelSize: 15
-                                font.weight: Font.DemiBold
-                                horizontalAlignment: Text.AlignHCenter
-                                elide: Text.ElideRight
-                            }
+                                spacing: 4
 
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                width: 240
-                                text: wishlistDelegate.modelData.developer || ""
-                                color: Theme.textFaint
-                                font.pixelSize: 11
-                                horizontalAlignment: Text.AlignHCenter
-                                elide: Text.ElideRight
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    width: 220
+                                    text: wishlistDelegate.modelData.name
+                                    color: wishlistDelegate.highlighted ? Theme.textPrimary : Theme.textBody
+                                    font.pixelSize: 15
+                                    font.weight: Font.DemiBold
+                                    horizontalAlignment: Text.AlignHCenter
+                                    elide: Text.ElideRight
+                                }
+
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    width: 220
+                                    text: wishlistDelegate.modelData.developer || ""
+                                    color: Theme.textFaint
+                                    font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignHCenter
+                                    elide: Text.ElideRight
+                                }
                             }
                         }
 
@@ -1731,6 +2178,18 @@ Window {
                         }
                     }
                 }
+            }
+
+            // ── Browse ──────────────────────────────────────────────────────
+            // The whole IGDB catalog rather than the user's own lists. See
+            // BrowsePage.qml; results open BrowseDetails, not GameDetails.
+            BrowsePage {
+                id: browsePage
+                igdbConfigured: root.igdbConfigured
+                padActive: root.padActive
+                padInControl: root.padInControl
+                onOpenRequested: (item) => browseDetails.openFor(item)
+                onSettingsRequested: settingsWindow.open()
             }
         }
     }

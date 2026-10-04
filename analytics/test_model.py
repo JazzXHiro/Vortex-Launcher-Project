@@ -147,6 +147,74 @@ def test_keyword_filters():
     return ok
 
 
+def test_refresh_keeps_history():
+    print("\n-- a catalog refresh keeps impression history --")
+    import os
+    import tempfile
+    import igdb_catalog
+    from db import get_connection
+
+    # A throwaway database: store() opens its own connection, so point it here
+    # rather than at the real one.
+    path = os.path.join(tempfile.mkdtemp(), "refresh.sqlite3")
+    real_connection = igdb_catalog.get_connection
+    igdb_catalog.get_connection = lambda: get_connection(path)
+    try:
+        conn = get_connection(path)
+        conn.execute("INSERT INTO users VALUES ('u', 'local_user')")
+        # kept: refetched. dropped: not refetched. played: not refetched but has
+        # a session, so it must survive anyway.
+        for gid, canon in [("g-kept", "kept"), ("g-dropped", "dropped"),
+                           ("g-played", "played")]:
+            conn.execute("INSERT INTO games (game_id, source, name, canonical_name, rating) "
+                         "VALUES (?, 'IGDB_Catalog', ?, ?, 50)", (gid, canon, canon))
+            conn.execute("INSERT INTO recommendation_events "
+                         "(event_id, run_id, user_id, game_id, event_type) "
+                         "VALUES (?, 'r1', 'u', ?, 'impression')", ("e-" + gid, gid))
+        conn.execute("INSERT INTO sessions (session_id, user_id, game_id) "
+                     "VALUES ('s1', 'u', 'g-played')")
+        conn.commit()
+
+        def record(canon, rating):
+            return {"game_id": "fresh-" + canon, "canonical_name": canon, "name": canon,
+                    "external_id": "1", "developer": "Dev", "genres": ["RPG"],
+                    "themes": [], "game_modes": [], "keywords": [], "tags": ["RPG"],
+                    "rating": rating, "total_rating_count": 20, "game_length": None,
+                    "steam_appid": None, "released_at": None, "cover_url": None}
+
+        inserted, refreshed, _, removed = igdb_catalog.store(
+            [record("kept", 90), record("new", 80)])
+
+        rows = dict(conn.execute(
+            "SELECT canonical_name, game_id FROM games").fetchall())
+        events = {r[0] for r in conn.execute(
+            "SELECT game_id FROM recommendation_events").fetchall()}
+        rating = conn.execute(
+            "SELECT rating FROM games WHERE canonical_name = 'kept'").fetchone()[0]
+        conn.close()
+
+        ok = check((inserted, refreshed, removed) == (1, 1, 1),
+                   f"1 inserted, 1 refreshed, 1 removed, got "
+                   f"{(inserted, refreshed, removed)}")
+        ok &= check(rows.get("kept") == "g-kept",
+                    "a refetched game keeps its game_id")
+        ok &= check("g-kept" in events,
+                    "a refetched game keeps its impressions (fatigue survives)")
+        ok &= check(rating == 90, "a refetched game takes the new rating")
+        ok &= check("dropped" not in rows and "g-dropped" not in events,
+                    "a game the fetch no longer returns is removed with its events")
+        ok &= check(rows.get("played") == "g-played" and "g-played" in events,
+                    "a game with play history survives even when not refetched")
+        ok &= check("new" in rows, "a newly fetched game is inserted")
+        ok &= check(igdb_catalog.store([]) == (0, 0, 0, 0)
+                    and "kept" in dict(get_connection(path).execute(
+                        "SELECT canonical_name, game_id FROM games").fetchall()),
+                    "an empty fetch leaves the catalog untouched")
+        return ok
+    finally:
+        igdb_catalog.get_connection = real_connection
+
+
 if __name__ == "__main__":
     results = [
         test_atomic_labels(),
@@ -155,6 +223,7 @@ if __name__ == "__main__":
         test_keywords_in_document(),
         test_unknown_dropped(),
         test_keyword_filters(),
+        test_refresh_keeps_history(),
     ]
     print(f"\n{'ALL PASSED' if all(results) else 'FAILURES PRESENT'}")
     sys.exit(0 if all(results) else 1)

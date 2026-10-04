@@ -572,3 +572,51 @@ void ensure_steamgriddb_images(const std::vector<std::string> &game_names,
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   vlog::phase_done("Artwork (SteamGridDB)", elapsed, n_ok, n_cached, n_skipped, n_failed);
 }
+
+SgdbArtUrls steamgriddb_art_urls(const std::string &name) {
+  SgdbArtUrls urls;
+  if (name.empty())
+    return urls;
+
+  const string api_key = get_secret("STEAMGRIDDB_API_KEY");
+  if (api_key.empty() || api_key == "YOUR_API_KEY_HERE")
+    return urls; // no key is an answer, not an outage
+
+  const wstring headers = L"Authorization: Bearer " + widen_ascii(api_key);
+
+  // A 404 is SteamGridDB saying it has nothing; anything else -- no status at
+  // all, a refused key, a rate limit, a 5xx -- says nothing about the game, so
+  // the caller must be free to ask again.
+  auto get = [&](const string &path, string &body) {
+    try {
+      body = https_get(L"www.steamgriddb.com", widen_ascii(path), headers);
+      return true;
+    } catch (const std::exception &e) {
+      const int status = http_status_from_error(e.what());
+      if (status == 401 || status == 403)
+        s_last_auth_ok = false;
+      if (status != 404)
+        urls.reachable = false;
+      return false;
+    }
+  };
+
+  string search;
+  if (!get("/api/v2/search/autocomplete/" + url_encode(name), search))
+    return urls;
+  const string id = extract_json_value(search, "id", true);
+  if (id.empty())
+    return urls;
+  s_last_auth_ok = true;
+
+  // Same three endpoints, same first-result choice, as
+  // ensure_steamgriddb_images(): the URL is the whole answer here.
+  string body;
+  if (get("/api/v2/grids/game/" + id + "?dimensions=600x900", body))
+    urls.grid = extract_json_value(body, "url");
+  if (get("/api/v2/heroes/game/" + id, body))
+    urls.hero = extract_json_value(body, "url");
+  if (get("/api/v2/logos/game/" + id, body))
+    urls.logo = extract_json_value(body, "url");
+  return urls;
+}

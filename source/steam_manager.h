@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ctime>
+#include <functional>
 #include <filesystem>
 #include <vector>
 #include <string>
@@ -24,6 +25,12 @@ std::vector<SteamGame> read_installed_steam_games(bool resolve_igdb = true);
 bool launch_steam_game_by_appid(int appid);
 bool uninstall_steam_game_by_appid(int appid);
 int get_steam_appid_for_install_dir(const fs::path& installDir);
+
+// True while any Steam library still holds appmanifest_<appid>.acf -- the same
+// file read_installed_steam_games() discovers games by, so the two agree on
+// what "installed" means. steam://uninstall only opens Steam's own confirm
+// dialog; the manifest goes once the player confirms and Steam removes it.
+bool is_steam_app_installed(int appid);
 
 // ── Steam's own playtime ─────────────────────────────────────────────────────
 // Steam records lifetime playtime per app in userdata/<id>/config/localconfig.vdf.
@@ -66,6 +73,9 @@ bool is_steam_game_running(int appid);
 // input. Sampling belongs in here rather than at the call site because it must
 // not begin until the game is actually up -- the wait in phase 1 can run for
 // two minutes, and none of it is time the player was idle in a game.
+//
+// onStarted, when given, fires the moment phase 1 sees the game come up.
 bool monitor_steam_session(int appid, const fs::path& installDir,
                            std::time_t* outStart, std::time_t* outEnd,
-                           long long* outIdleSeconds = nullptr);
+                           long long* outIdleSeconds = nullptr,
+                           const std::function<void()>& onStarted = {});

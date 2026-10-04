@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -26,5 +27,13 @@ void scan_directory_for_games(const fs::path &gameDir,
                               std::vector<temp_GameEntry> &outGames,
                               bool resolve_igdb = true);
 
-int launchGame(const fs::path &gamePath);
+// Blocks until the game exits. onStarted, when given, fires once the process
+// is up and has drawn its first window (or ten seconds have passed), which is
+// when the UI swaps LAUNCHING for QUIT.
+int launchGame(const fs::path &gamePath,
+               const std::function<void()> &onStarted = {});
 bool is_game_running_in_dir(const fs::path &installDir);
+// Closes every process running from installDir: WM_CLOSE to its windows first
+// so the game can save, then TerminateProcess on whatever is still up after
+// graceSeconds. Blocks for up to that long. Returns how many it found.
+int quit_games_in_dir(const fs::path &installDir, int graceSeconds = 5);

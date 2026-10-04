@@ -129,6 +129,17 @@ QtObject {
     readonly property color steamAccent:     "#66c0f4"
 
     // ─────────────────────────────────────────────────────────────────────────
+    // The wash across the bottom of a card's artwork
+    //
+    // A focused card fades from its cover into this, which is what the play
+    // button sits on. Deep enough to carry white at full contrast, and its own
+    // blue rather than steamBg's -- that navy means "this came from Steam"
+    // everywhere else in the app and should not start meaning "hovered".
+    // ─────────────────────────────────────────────────────────────────────────
+
+    readonly property color artScrim:        "#16324e"
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Moods
     //
     // main.qml paints the mood cards and SettingsWindow.qml lists the same four

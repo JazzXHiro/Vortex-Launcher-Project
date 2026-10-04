@@ -126,6 +126,9 @@ begin
   DeleteFile(AppDir + '\wishlist.json');
   DeleteFile(AppDir + '\favorite_snapshots.json');
   DeleteFile(AppDir + '\played_games.json');
+  DeleteFile(AppDir + '\manual_played.txt');
+  DeleteFile(AppDir + '\removed_games.json');
+  DeleteFile(AppDir + '\live_artwork.json');
   DeleteFile(AppDir + '\installed_games.txt');
   DeleteFile(AppDir + '\local_game_dirs.txt');
   DeleteFile(AppDir + '\igdb_cache.txt');

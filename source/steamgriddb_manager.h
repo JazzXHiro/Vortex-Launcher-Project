@@ -39,6 +39,19 @@ CredentialCheck steamgriddb_probe_key(const std::string& api_key);
 // games that happen to have no art.
 bool steamgriddb_last_auth_ok();
 
+// SteamGridDB's own CDN URLs for one game's grid, hero and logo, without
+// downloading any of them -- for games that are shown but never owned
+// (wishlist, favourites, played history), whose art loads live by URL.
+// Empty fields mean no art of that kind. `reachable` is false when any request
+// failed for a reason other than SteamGridDB answering "not found", so the
+// caller knows the empty fields are not a definitive answer. No API key counts
+// as reachable with nothing found. Blocking; call it off the UI thread.
+struct SgdbArtUrls {
+  std::string grid, hero, logo;
+  bool reachable = true;
+};
+SgdbArtUrls steamgriddb_art_urls(const std::string& game_name);
+
 // Deletes the artwork folders of `game_names`, skipping any name that also
 // appears in `keep_names` (compared case-insensitively). Artwork is keyed by
 // game name, not by install location, so a game still reachable from another

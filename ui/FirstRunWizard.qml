@@ -428,22 +428,22 @@ Popup {
                         Layout.preferredWidth: 190
                         Layout.preferredHeight: 42
                         radius: 10
-                        color: wizardRoot.api.isCatalogRefreshing()
+                        color: wizardRoot.api.catalogRefreshing
                                    ? Theme.bgRaised
                                    : (catalogArea.containsMouse ? Theme.accent : Theme.bgRaised)
                         border.width: 1
-                        border.color: wizardRoot.api.isCatalogRefreshing()
+                        border.color: wizardRoot.api.catalogRefreshing
                                           ? Theme.borderControl
                                           : (catalogArea.containsMouse ? Theme.focusRing : Theme.borderControl)
 
                         Text {
                             anchors.centerIn: parent
-                            text: wizardRoot.api.isCatalogRefreshing()
+                            text: wizardRoot.api.catalogRefreshing
                                       ? "Downloading…"
                                       : "Download catalog"
                             font.pixelSize: 14
                             font.bold: true
-                            color: wizardRoot.api.isCatalogRefreshing()
+                            color: wizardRoot.api.catalogRefreshing
                                        ? Theme.textMuted
                                        : (catalogArea.containsMouse ? Theme.textInverse : Theme.textPrimary)
                         }
@@ -452,7 +452,7 @@ Popup {
                             id: catalogArea
                             anchors.fill: parent
                             hoverEnabled: true
-                            enabled: !wizardRoot.api.isCatalogRefreshing()
+                            enabled: !wizardRoot.api.catalogRefreshing
                             cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                             onClicked: {
                                 wizardRoot.statusIsError = false;
@@ -465,7 +465,7 @@ Popup {
                     }
 
                     BusyIndicator {
-                        running: wizardRoot.api.isCatalogRefreshing()
+                        running: wizardRoot.api.catalogRefreshing
                         visible: running
                         implicitWidth: 28
                         implicitHeight: 28

@@ -142,6 +142,10 @@ $PersonalFiles = @(
     # The played-games ledger: every game the developer has ever launched,
     # with hours and artwork paths. Same class of data as wishlist.json.
     'played_games.json',
+    # Games marked played by hand on the Browse page, games removed from the
+    # library, and the artwork URLs looked up for them -- all specific to the
+    # developer's library, like the ledger above.
+    'manual_played.txt', 'removed_games.json', 'live_artwork.json',
     'playtime_sessions.log', 'playtime_stats.txt',
     'preferences.json', 'settings.json',
     'igdb_cache.txt', 'exe_cache.txt', 'game_metadata.txt',

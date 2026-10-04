@@ -10,7 +10,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # 1. Find the Qt6 packages used by the C++ entry point and QML files.
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 QuickLayouts QuickDialogs2 QuickEffects)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 QuickLayouts QuickDialogs2 QuickEffects QuickShapes)
 
 # 2. Tell the compiler to look in the 'source' folder for your friend's headers (.h)
 include_directories(source)
@@ -87,6 +87,7 @@ qt_add_qml_module(VortexLauncher
         QtQuick.Controls
         QtQuick.Dialogs
         QtQuick.Effects
+        QtQuick.Shapes
         QtQuick.Layouts
     QML_FILES
         ui/Theme.qml
@@ -96,8 +97,22 @@ qt_add_qml_module(VortexLauncher
         ui/SettingsWindow.qml
         ui/TileMenu.qml
         ui/VortexScrollBar.qml
+        ui/SearchField.qml
+        ui/BrowsePage.qml
+        ui/BrowseDetails.qml
+        ui/LoadingBar.qml
     RESOURCES
         ui/assets/steam.png
+        ui/assets/local.png
+        ui/assets/thumb_up.png
+        ui/assets/thumb_down.png
+        ui/assets/arrow_left.png
+        ui/assets/arrow_right.png
+        ui/assets/trash.png
+        ui/assets/trash_open.png
+        ui/assets/play.png
+        ui/assets/quit.png
+        ui/assets/quit_hover.png
 )
 
 # 6. Link everything
@@ -111,6 +126,8 @@ target_link_libraries(VortexLauncher PRIVATE
     Qt6::QuickDialogs2
     # MultiEffect, for the blurred details-page banner in GameDetails.qml.
     Qt6::QuickEffects
+    # RadialGradient behind each Steam review card in BrowseDetails.qml.
+    Qt6::QuickShapes
     Qt6::QuickLayouts
 )
 
@@ -126,16 +143,27 @@ endif()
 # The launcher runs the analytics scripts from "analytics/" next to the executable
 # (see app_paths.h — all runtime data resolves against the exe directory), so keep
 # that copy in sync with the sources on every build.
-# Note: copy_directory overwrites same-named files but never deletes extras, so
-# runtime output such as recommendations.json is refreshed from source here and
-# any database created beside the scripts is left alone.
-add_custom_command(TARGET VortexLauncher POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/analytics"
-            "$<TARGET_FILE_DIR:VortexLauncher>/analytics"
-    COMMENT "Copying analytics scripts next to VortexLauncher"
+# This is a target rather than a POST_BUILD step because POST_BUILD only runs
+# when VortexLauncher relinks, so an edit to a .py file alone never reached the
+# build tree. A custom target with no outputs runs on every build, and
+# VortexLauncher depends on it so building only that target still syncs.
+# Only scripts and templates are copied (see cmake/SyncAnalytics.cmake). The
+# database, model files, recommendations, .env and token cache beside the exe
+# are the user's runtime state, and a stale copy left in the source folder by a
+# test run must never overwrite them. Files removed from the source are not
+# deleted from the build tree.
+# The destination is spelled out instead of $<TARGET_FILE_DIR:VortexLauncher>:
+# under cmake_minimum_required(3.16) that expression would make this target
+# depend on VortexLauncher, which is a cycle.
+add_custom_target(sync_analytics ALL
+    COMMAND "${CMAKE_COMMAND}"
+            "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/analytics"
+            "-DDST=${CMAKE_CURRENT_BINARY_DIR}/analytics"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SyncAnalytics.cmake"
+    COMMENT "Syncing analytics scripts next to VortexLauncher"
     VERBATIM
 )
+add_dependencies(VortexLauncher sync_analytics)
 
 if(WIN32)
     target_link_libraries(VortexLauncher PRIVATE winhttp)

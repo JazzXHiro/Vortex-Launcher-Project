@@ -8,6 +8,7 @@ just produces a meaningless order. The symptom was an entire section of the
 recommendations list showing "nan" instead of a score.
 """
 
+import os
 import sys
 
 import numpy as np
@@ -605,11 +606,24 @@ def test_every_mood_label_resolves():
     # The check that would have caught `hand drawn` (space) against IGDB's
     # `hand-drawn`, and the three dead labels shipped before it: Simulation,
     # Story Rich, Casual. A label matching nothing steers nothing, silently.
+    #
+    # Checked for existence first: get_connection() CREATES a database that is
+    # missing, so a source checkout with no data used to grow an empty
+    # vortex.sqlite3 here -- which the build then copies over the real one
+    # beside the executable -- and every label read as dead. The real data
+    # lives in the build's analytics/; run this from there, or set DB_PATH.
+    from db import DB_PATH
+    if not os.path.exists(DB_PATH):
+        print(f"SKIP  no database at {DB_PATH}")
+        return True
     try:
         from recommend import load_frames
         games, _ = load_frames()
     except Exception as exc:
         print(f"SKIP  database unavailable ({type(exc).__name__})")
+        return True
+    if games.empty:
+        print("SKIP  database has no games yet")
         return True
 
     games = games.reset_index(drop=True)

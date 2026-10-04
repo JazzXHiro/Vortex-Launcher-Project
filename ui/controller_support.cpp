@@ -103,6 +103,7 @@ signals:
     void filterNext();             // RT
     void toggleRecommendations();  // Back / Select
     void options();                // R3 — the focused card's overflow menu
+    void play();                   // X — start the focused card's game
     void connectedChanged();
     void padInControlChanged();
 
@@ -333,9 +334,12 @@ void ControllerSupport::poll() {
     if (pressed & XINPUT_GAMEPAD_A)    emit accept();
     if (pressed & XINPUT_GAMEPAD_B)    emit cancel();
     if (pressed & XINPUT_GAMEPAD_BACK) emit toggleRecommendations();
-    // R3 rather than one of the face buttons: A and B are taken, and X/Y are
+    // R3 rather than one of the face buttons: A and B are taken, and X/Y were
     // worth keeping free for actions rather than spending on a menu.
     if (pressed & XINPUT_GAMEPAD_RIGHT_THUMB) emit options();
+    // X is the action that was being saved for: start the focused card's game
+    // without the round trip through the details page. A still opens details.
+    if (pressed & XINPUT_GAMEPAD_X)    emit play();
 
     // ── Triggers: analog, so edges come from the thresholds above ────────────
     const bool leftNow = triggerHeld(pad.bLeftTrigger, m_leftTriggerHeld);

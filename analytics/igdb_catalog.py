@@ -420,56 +420,86 @@ def normalise(row, lengths):
 # Store
 # --------------------------------------------------------------------------
 
-def clear_catalog(cur):
-    """Drop the previous catalog so a refresh REPLACES rather than appends.
+def prune_catalog(cur, fresh_canonicals):
+    """Delete catalog rows the latest fetch no longer returned.
 
-    Without this the insert below (ON CONFLICT DO NOTHING, no delete path) only
-    ever grows the table, so tightening the query changes nothing that is
-    already stored -- the console-only games this filter now excludes would sit
-    in the database forever and keep taking Discover slots.
+    The refresh updates surviving rows in place (see store()), so this only has
+    to remove what dropped out -- a game that lost its PC listing, fell under
+    MIN_RATING_COUNT, or was excluded by a tightened query. Without a delete
+    path at all, the console-only games an earlier filter change excluded would
+    sit in the database forever and keep taking Discover slots.
+
+    This used to delete EVERY catalog row and re-insert the fetch. That wiped
+    the impression history recommend.py's fatigue penalty reads, so fatigue
+    restarted from empty on every refresh -- harmless while refreshes were rare
+    and manual, not once the launcher began refreshing every five days. Rows
+    that survive keep their game_id, and with it their history.
 
     Order matters: the foreign keys are ON DELETE NO ACTION, so anything
     pointing at a catalog row has to go first.
 
-    Games referenced by `sessions` are deliberately spared. A row with play
-    history is a game the user actually ran, and a catalog refresh must never
-    destroy that.
+    Games referenced by `sessions` are deliberately spared, along with their
+    events. A row with play history is a game the user actually ran, and a
+    catalog refresh must never destroy that.
     """
-    cur.execute("""
-        DELETE FROM recommendation_events
-         WHERE game_id IN (SELECT game_id FROM games WHERE source = 'IGDB_Catalog')
-    """)
-    events = cur.rowcount
+    cur.execute("CREATE TEMP TABLE fresh_catalog (canonical_name TEXT PRIMARY KEY)")
+    cur.executemany("INSERT OR IGNORE INTO fresh_catalog VALUES (?)",
+                    [(c,) for c in fresh_canonicals])
 
-    cur.execute("""
-        DELETE FROM recommendations_cache
-         WHERE recommended_game IN (SELECT game_id FROM games WHERE source = 'IGDB_Catalog')
-    """)
-
-    cur.execute("""
-        DELETE FROM games
+    stale = """
+        SELECT game_id FROM games
          WHERE source = 'IGDB_Catalog'
+           AND canonical_name NOT IN (SELECT canonical_name FROM fresh_catalog)
            AND game_id NOT IN (SELECT game_id FROM sessions WHERE game_id IS NOT NULL)
-    """)
-    return cur.rowcount, events
+    """
+    cur.execute(f"DELETE FROM recommendation_events WHERE game_id IN ({stale})")
+    events = cur.rowcount
+    cur.execute(f"DELETE FROM recommendations_cache WHERE recommended_game IN ({stale})")
+    cur.execute(f"DELETE FROM games WHERE game_id IN ({stale})")
+    removed = cur.rowcount
+
+    cur.execute("DROP TABLE fresh_catalog")
+    return removed, events
 
 
 def store(records):
+    # An empty fetch would prune the entire catalog. Nothing upstream should
+    # produce one -- fetch_catalog raises on HTTP errors -- but an IGDB query
+    # that silently matches nothing has happened before (the `category` field),
+    # and keeping a stale catalog beats replacing it with none.
+    if not records:
+        print("[warn] the fetch returned no usable games; keeping the existing "
+              "catalog unchanged.", file=sys.stderr)
+        return 0, 0, 0, 0
+
     conn = get_connection()
     cur = conn.cursor()
     now = datetime.now()
 
-    removed, dropped_events = clear_catalog(cur)
-    if removed:
-        print(f"Cleared {removed} previous catalog rows.")
-    if dropped_events:
-        # Fatigue in recommend.py is driven by these; it restarts from empty.
-        print(f"  ({dropped_events} impression rows went with them, so "
-              f"recommendation fatigue starts fresh.)")
-
     inserted = 0
+    refreshed = 0
     enriched = 0
     for r in records:
+        # A game already in the catalog is refreshed in place: everything IGDB
+        # can have changed, but never game_id, which impression history and
+        # the fatigue penalty hang off.
+        cur.execute("""
+            UPDATE games
+               SET external_id = ?, name = ?, developer = ?, genres = ?, tags = ?,
+                   themes = ?, game_modes = ?, keywords = ?, rating = ?,
+                   total_rating_count = ?, game_length = ?, steam_appid = ?,
+                   released_at = ?, cover_url = ?, fetched_at = ?
+             WHERE canonical_name = ? AND source = 'IGDB_Catalog'
+        """, (r["external_id"], r["name"], r["developer"],
+              encode_list(r["genres"]), encode_list(r["tags"]),
+              encode_list(r["themes"]), encode_list(r["game_modes"]),
+              encode_list(r["keywords"]), r["rating"], r["total_rating_count"],
+              r["game_length"], r["steam_appid"], r["released_at"],
+              r["cover_url"], now, r["canonical_name"]))
+        if cur.rowcount:
+            refreshed += 1
+            continue
+
         # A canonical_name already present belongs to the user's own library.
         # The owned row must never be downgraded to a discovery candidate --
         # hence no name/source/installed in the UPDATE -- but we DO take its
@@ -507,10 +537,20 @@ def store(records):
             else:
                 enriched += 1
 
+    # After the upserts and in the same transaction, so a failure part-way
+    # leaves the previous catalog exactly as it was.
+    removed, dropped_events = prune_catalog(
+        cur, [r["canonical_name"] for r in records])
+
     conn.commit()
     cur.close()
     conn.close()
-    return inserted, enriched
+
+    if removed:
+        print(f"Removed {removed} catalog games the fetch no longer returned"
+              + (f" ({dropped_events} impression rows with them)."
+                 if dropped_events else "."))
+    return inserted, refreshed, enriched, removed
 
 
 def backfill_owned_labels(token):
@@ -539,9 +579,17 @@ def backfill_owned_labels(token):
 
     # The keyword vocabulary the catalog settled on, so owned rows are held to
     # the same filtered set rather than importing IGDB's full 7,418.
+    #
+    # json_each, not unnest(): this was Postgres SQL that survived the move to
+    # SQLite, where it raised "no such function: unnest" AFTER store() had
+    # committed. The catalog landed, but the script exited non-zero, so the
+    # launcher reported every refresh as failed and retried it under each
+    # Python candidate -- three full downloads per refresh.
     cur.execute("""
-        SELECT DISTINCT unnest(keywords) FROM games
-         WHERE source = 'IGDB_Catalog' AND keywords IS NOT NULL
+        SELECT DISTINCT kw.value
+          FROM games, json_each(games.keywords) AS kw
+         WHERE games.source = 'IGDB_Catalog'
+           AND games.keywords IS NOT NULL AND json_valid(games.keywords)
     """)
     vocabulary = {row[0] for row in cur.fetchall()}
 
@@ -633,9 +681,11 @@ def main():
           f"{KEYWORD_MIN_SHARE:.1%}-{KEYWORD_MAX_SHARE:.0%} frequency band "
           f"({per_game:.1f} per game)")
 
-    inserted, enriched = store(records)
-    print(f"Inserted {inserted} new catalog rows "
-          f"({len(records) - inserted} already present as owned games).")
+    inserted, refreshed, enriched, _ = store(records)
+    # Starts with "Inserted": vortex_bridge.cpp keys its "Saving catalog"
+    # progress phase off that word.
+    print(f"Inserted {inserted} new catalog rows, refreshed {refreshed} in place "
+          f"({len(records) - inserted - refreshed} already present as owned games).")
     if enriched:
         print(f"Backfilled labels onto {enriched} owned games from the catalog.")
 

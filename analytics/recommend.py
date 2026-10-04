@@ -48,7 +48,13 @@ DISCOVER_N = 12
 # calibrated at 10 (25% churn / 96% quality library, 37% / 99% discover), so
 # the basis stays fixed and only the number of slots changes.
 TEMPERATURE_BASIS_N = 10
-CATALOG_STALE_DAYS = 30
+
+# The launcher refreshes the catalog in the background once it is this old (see
+# maybeAutoFetchCatalog in vortex_bridge.cpp, which reads catalog_age_days from
+# the sidecar). The stale warning shares the number: past it, a refresh should
+# already have happened, so the warning now means the refresh is failing.
+CATALOG_REFRESH_DAYS = 5
+CATALOG_STALE_DAYS = CATALOG_REFRESH_DAYS
 
 OWNED_SOURCES = ("Local", "Steam")
 
@@ -84,7 +90,7 @@ def _write_json(path, payload):
 
 
 def write_output(items, run_id, mood, status, candidate_count=0, curated=False,
-                 ignore_played=False, ignore_liked=False):
+                 ignore_played=False, ignore_liked=False, catalog_age_days=None):
     _write_json(OUTPUT_PATH, items)
     _write_json(META_PATH, {
         "run_id": run_id,
@@ -100,6 +106,10 @@ def write_output(items, run_id, mood, status, candidate_count=0, curated=False,
         "status": status,
         "candidate_count": candidate_count,
         "returned": len(items),
+        # Days since the discovery catalog was fetched, or null when there is
+        # none. The launcher starts a background refresh from this.
+        "catalog_age_days": (round(catalog_age_days, 2)
+                             if catalog_age_days is not None else None),
     })
 
 
@@ -207,6 +217,31 @@ def load_favorites():
     return {game_uuid(name) for name in parse_preferences()}
 
 
+def _catalog_mask(games):
+    if "source" not in games.columns:
+        return pd.Series([False] * len(games), index=games.index)
+    return games["source"].astype(str) == "IGDB_Catalog"
+
+
+def catalog_age_days(games):
+    """Days since the discovery catalog was last fetched, or None if unknown.
+
+    Measured over catalog rows only. igdb_catalog.py is the only writer of
+    fetched_at today, but an owned row picking one up later must not make an
+    old catalog look fresh.
+    """
+    if "fetched_at" not in games.columns:
+        return None
+    mask = _catalog_mask(games)
+    if not mask.any():
+        return None
+    fetched = pd.to_datetime(games.loc[mask, "fetched_at"], errors="coerce").dropna()
+    if fetched.empty:
+        return None
+    age = datetime.now() - fetched.max().to_pydatetime()
+    return max(age / timedelta(days=1), 0.0)
+
+
 def warn_if_catalog_stale(games):
     """Report the state of the discovery catalog: missing, stale, or current.
 
@@ -215,10 +250,11 @@ def warn_if_catalog_stale(games):
     a catalog that was never fetched produces an empty Discover section and
     said nothing about why, so it looked like the feature was broken rather
     than unpopulated.
+
+    Returns the catalog's age in days (None when unknown) so main() can hand
+    it to the launcher without computing it twice.
     """
-    catalog_rows = 0
-    if "source" in games.columns:
-        catalog_rows = int((games["source"].astype(str) == "IGDB_Catalog").sum())
+    catalog_rows = int(_catalog_mask(games).sum())
 
     if catalog_rows == 0:
         print("[warn] the discovery catalog is empty, so Discover has nothing to "
@@ -226,17 +262,16 @@ def warn_if_catalog_stale(games):
               "       Fetch it with: python igdb_catalog.py --refresh "
               "(needs IGDB credentials, takes a few minutes).",
               file=sys.stderr)
-        return
+        return None
 
-    if "fetched_at" not in games.columns:
-        return
-    fetched = pd.to_datetime(games["fetched_at"], errors="coerce").dropna()
-    if fetched.empty:
-        return
-    age = datetime.now() - fetched.max().to_pydatetime()
-    if age > timedelta(days=CATALOG_STALE_DAYS):
-        print(f"[warn] candidate catalog is {age.days} days old ({catalog_rows} "
-              f"games); run: python igdb_catalog.py --refresh", file=sys.stderr)
+    age = catalog_age_days(games)
+    if age is not None and age > CATALOG_STALE_DAYS:
+        # The launcher refreshes at CATALOG_REFRESH_DAYS, so reaching this
+        # means that refresh has not succeeded -- the log above it says why.
+        print(f"[warn] candidate catalog is {int(age)} days old ({catalog_rows} "
+              f"games) and the background refresh has not replaced it; "
+              f"run: python igdb_catalog.py --refresh", file=sys.stderr)
+    return age
 
 
 def build_recommendations(games, sessions, favorites, mood,
@@ -654,7 +689,7 @@ def main():
         print(f"[error] database unavailable: {exc}", file=sys.stderr)
         return 1
 
-    warn_if_catalog_stale(games)
+    catalog_age = warn_if_catalog_stale(games)
 
     items, candidates = build_recommendations(
         games, sessions, load_favorites(), mood,
@@ -662,7 +697,8 @@ def main():
         curated=curated, ignore_played=ignore_played, ignore_liked=ignore_liked)
     status = "ok" if items else "no candidates"
     write_output(items, run_id, mood, status, candidates, curated=curated,
-                 ignore_played=ignore_played, ignore_liked=ignore_liked)
+                 ignore_played=ignore_played, ignore_liked=ignore_liked,
+                 catalog_age_days=catalog_age)
     if run_id:
         record_served(items, run_id, mood)
     notes = "".join([", curated" if curated else "",

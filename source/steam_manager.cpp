@@ -391,7 +391,8 @@ static bool steam_app_active(int appid, const fs::path &installDir) {
 
 bool monitor_steam_session(int appid, const fs::path &installDir,
                            std::time_t *outStart, std::time_t *outEnd,
-                           long long *outIdleSeconds) {
+                           long long *outIdleSeconds,
+                           const std::function<void()> &onStarted) {
     const int  kStartupTimeoutSeconds = 120;
     const auto kPollInterval          = std::chrono::seconds(2);
 
@@ -414,6 +415,8 @@ bool monitor_steam_session(int appid, const fs::path &installDir,
     }
 
     const std::time_t start = std::time(nullptr);
+    if (onStarted)
+        onStarted();
 
     // Phase 2 — wait for it to go away, sampling input the whole time. The
     // tracker runs its own thread rather than riding this loop so that the
@@ -571,6 +574,20 @@ bool uninstall_steam_game_by_appid(int appid) {
 #else
   return true;
 #endif
+}
+
+bool is_steam_app_installed(int appid) {
+  fs::path steamPath;
+  if (!get_steam_path_from_registry(steamPath))
+    return false;
+
+  const string manifest = "appmanifest_" + std::to_string(appid) + ".acf";
+  for (const auto &lib : parse_libraryfolders_vdf(steamPath)) {
+    std::error_code ec;
+    if (fs::exists(lib / "steamapps" / manifest, ec))
+      return true;
+  }
+  return false;
 }
 
 int get_steam_appid_for_install_dir(const fs::path& installDir) {

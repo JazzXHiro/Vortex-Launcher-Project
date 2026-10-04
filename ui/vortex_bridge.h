@@ -2,6 +2,8 @@
 #define VORTEX_BRIDGE_H
 
 #include <QObject>
+#include <QElapsedTimer>
+#include <QHash>
 #include <QSet>
 #include <QStringList>
 #include <QVariantList>
@@ -103,16 +105,44 @@ class VortexBridge : public QObject {
     // the total is not knowable in advance.
     Q_PROPERTY(QString catalogPhase   READ catalogPhase   NOTIFY catalogProgressChanged)
     Q_PROPERTY(int     catalogFetched READ catalogFetched NOTIFY catalogProgressChanged)
+    Q_PROPERTY(bool    catalogRefreshing READ isCatalogRefreshing NOTIFY catalogRefreshingChanged)
 
     // One sentence naming what is actually broken, or empty when nothing is.
     // Rendered on the Recommendations header because that line is always
     // visible, unlike the sections beneath it.
     Q_PROPERTY(QString authBlocker READ authBlocker NOTIFY credentialsChanged)
 
+    // ---- Browse ----------------------------------------------------------
+    // Free search over the whole IGDB catalog, not just the ~5,700 titles the
+    // recommender downloaded. Results are covers and a few facts; the details
+    // page asks for everything else when it opens, and Steam's reviews after
+    // that once IGDB has said which Steam app the game is.
+    Q_PROPERTY(QVariantList browseResults   READ browseResults   NOTIFY browseResultsChanged)
+    Q_PROPERTY(bool         browseSearching READ browseSearching NOTIFY browseResultsChanged)
+    // Why the result list is empty, or "" when it is not (or nothing was asked).
+    Q_PROPERTY(QString      browseStatus    READ browseStatus    NOTIFY browseResultsChanged)
+    Q_PROPERTY(QVariantMap  browseDetails        READ browseDetails        NOTIFY browseDetailsChanged)
+    Q_PROPERTY(bool         browseDetailsLoading READ browseDetailsLoading NOTIFY browseDetailsChanged)
+    Q_PROPERTY(QVariantMap  browseReviews        READ browseReviews        NOTIFY browseReviewsChanged)
+    Q_PROPERTY(bool         browseReviewsLoading READ browseReviewsLoading NOTIFY browseReviewsChanged)
+    // What the tab shows before anything is typed: recent releases, newest
+    // first, in the same row shape as browseResults.
+    Q_PROPERTY(QVariantList browseNewReleases        READ browseNewReleases        NOTIFY browseNewReleasesChanged)
+    Q_PROPERTY(bool         browseNewReleasesLoading READ browseNewReleasesLoading NOTIFY browseNewReleasesChanged)
+    Q_PROPERTY(QString      browseNewReleasesStatus  READ browseNewReleasesStatus  NOTIFY browseNewReleasesChanged)
+
+    // Where each launch is, by game name, for the Play button: launching from
+    // the press until the game is up, running until it exits. A name is in at
+    // most one of the two.
+    Q_PROPERTY(QStringList launchingGames READ launchingGames NOTIFY launchStateChanged)
+    Q_PROPERTY(QStringList runningGames   READ runningGames   NOTIFY launchStateChanged)
+
 public:
     explicit VortexBridge(QObject *parent = nullptr);
 
     QVariantList gameList()    const { return m_gameList;    }
+    QStringList  launchingGames() const { return m_launchingGames; }
+    QStringList  runningGames()   const { return m_runningGames;   }
     QVariantList recommendationList() const { return m_recommendationList; }
     QVariantList favoriteGames() const;
     // The saved entries only. m_wishlist also holds rows whose entry has been
@@ -137,6 +167,16 @@ public:
     QString      catalogPhase()   const { return m_catalogPhase; }
     int          catalogFetched() const { return m_catalogFetched; }
     QString      authBlocker() const;
+    QVariantList browseResults()   const { return m_browseResults; }
+    bool         browseSearching() const { return m_browseSearching; }
+    QString      browseStatus()    const { return m_browseStatus; }
+    QVariantMap  browseDetails()        const { return m_browseDetails; }
+    bool         browseDetailsLoading() const { return m_browseDetailsLoading; }
+    QVariantMap  browseReviews()        const { return m_browseReviews; }
+    bool         browseReviewsLoading() const { return m_browseReviewsLoading; }
+    QVariantList browseNewReleases()        const { return m_browseNewReleases; }
+    bool         browseNewReleasesLoading() const { return m_browseNewReleasesLoading; }
+    QString      browseNewReleasesStatus()  const { return m_browseNewReleasesStatus; }
 
     // The current map for one game by name, including artwork and metadata
     // that landed after the list was published. Reference artRevision in the
@@ -200,6 +240,10 @@ public:
     // Takes the origin explicitly rather than defaulting it: Q_INVOKABLE default
     // parameters are unreliable across moc versions.
     Q_INVOKABLE void   launchGameFrom(QString name, QString origin);
+    // Closes a running game: asks its windows to close, then terminates what
+    // is left a few seconds later. The launch thread sees it exit and records
+    // the session as usual.
+    Q_INVOKABLE void   quitGame(QString name);
     Q_INVOKABLE void   logRecommendationClick(QString name, int rank);
     Q_INVOKABLE void   uninstallGame(QString name);
 
@@ -209,6 +253,13 @@ public:
     // alongside the name because it is the only identity that survives pass 2
     // renaming a local game (see gameDetailsForInstallDir).
     Q_INVOKABLE void   removeFromLibrary(QString name, QString installDir);
+
+    // Opens a game's install folder in Explorer. False if the folder is gone.
+    Q_INVOKABLE bool   openInstallFolder(QString path);
+
+    // Points a local game at a different .exe and records it in exe_cache.txt
+    // so the choice survives rescans. Returns the new path, "" if refused.
+    Q_INVOKABLE QString setGameExecutable(QString installDir, QString exeUrl);
 
     // Puts one back. Needs a full rescan: the game is gone from
     // m_internalGames, and only the scan can rebuild it from the disk.
@@ -230,12 +281,10 @@ public:
     Q_INVOKABLE bool   toggleWishlist(QString name);
     Q_INVOKABLE bool   isWishlisted(QString name) const;
 
-    // Hero and logo art for one unowned pick, fetched when its details page
-    // opens rather than alongside the list. Covers are drawn on every Discover
-    // card and so are fetched for the whole list; hero and logo are only ever
-    // visible inside GameDetails, so doing them at list time would download two
-    // images per candidate to show at most one pair. No-op for owned games,
-    // which already have SteamGridDB art under Images/.
+    // Called when a details page opens on an unowned game: moves its live-art
+    // lookup to the front of the queue, so the page's banner and logo URLs are
+    // the next answer. No-op for owned games, which already have SteamGridDB
+    // art under Images/, and for games whose URLs are already cached.
     Q_INVOKABLE void   ensureArtwork(QString name);
 
     // Developer, genres, rating and time-to-beat for one unowned pick, on the
@@ -243,6 +292,39 @@ public:
     // already carries them and this no-ops; the case it exists for is a
     // favourite that outlived every list and has only a name to go on.
     Q_INVOKABLE void   ensureMetadata(QString name);
+
+    // ---- Browse ----------------------------------------------------------
+    // Runs one IGDB search off the UI thread. A newer call supersedes an older
+    // one still in flight, whose answer is then dropped -- typing fast must
+    // never leave the results of an earlier prefix on screen.
+    Q_INVOKABLE void   searchCatalog(QString query);
+    Q_INVOKABLE void   clearBrowse();
+    // Fetches recent releases for the empty search box. Cheap to call often:
+    // it does nothing while a fetch is running or within an hour of a good one.
+    Q_INVOKABLE void   loadNewReleases();
+
+    // Everything the Browse details page shows for one IGDB id, then Steam's
+    // reviews for it when IGDB knows its Steam app. Also keeps a snapshot of
+    // the game, so wishlisting, hearting or marking it played from that page
+    // stores full metadata rather than a bare name.
+    Q_INVOKABLE void   loadBrowseDetails(qlonglong igdbId);
+    // The same page for a recommendation, which knows only its name. The row
+    // seeds the page at once; the IGDB id is resolved from the library, the
+    // offline cache or a lookup, and the full answer replaces the seed when it
+    // lands. A name IGDB has no answer for keeps the seed.
+    Q_INVOKABLE void   loadBrowseDetailsForGame(QString name);
+
+    // Whether preferences.json holds a heart for exactly this name.
+    Q_INVOKABLE bool   isFavorite(QString name) const;
+
+    // "Add to Played", for a game played somewhere Vortex never saw. Adds a
+    // manual row to the played ledger, or takes one back off; a game with
+    // real recorded playtime cannot be un-played, and returns false.
+    // Exported to manual_played.txt so the recommender counts it as played.
+    Q_INVOKABLE bool   togglePlayed(QString name);
+
+    // "tracked" (real playtime), "manual" (added by hand), or "none".
+    Q_INVOKABLE QString playedState(QString name) const;
 
     // ---- First-run credentials -------------------------------------------
     // Vortex runs with no credentials at all: the Steam library, playtime and
@@ -279,6 +361,7 @@ public:
     Q_INVOKABLE bool   isCatalogRefreshing() const { return m_catalogRefreshing; }
 
 signals:
+    void launchStateChanged();
     void wishlistChanged();
     void playedGamesChanged();
     void removedGamesChanged();
@@ -308,6 +391,10 @@ signals:
     // rather than a generic failure, because the usual cause is a mistyped
     // client secret and the message says so.
     void catalogRefreshFinished(bool ok, QString details);
+    void browseResultsChanged();
+    void browseDetailsChanged();
+    void browseReviewsChanged();
+    void browseNewReleasesChanged();
 
 private:
     QVariantList            m_gameList;
@@ -326,13 +413,18 @@ private:
     bool                    m_rescanQueued = false;  // scan requested while one was running
     bool                    m_isRecommendationLoading = false;
     bool                    m_catalogRefreshing = false;
-    bool                    m_catalogAutoFetchTried = false;
+    // When maybeAutoFetchCatalog() last started a fetch. Invalid until the
+    // first one, and invalidated again when credentials start working.
+    QElapsedTimer           m_catalogAutoFetchClock;
     QString                 m_catalogPhase;
     int                     m_catalogFetched = 0;
     // How many unowned candidates the last run had to choose from. Zero means
     // the catalog was never fetched, which is what maybeAutoFetchCatalog() acts
     // on.
     int                     m_discoverCandidateCount = 0;
+    // Days since the catalog was fetched, from the last run's sidecar; -1 when
+    // unknown. maybeAutoFetchCatalog() refreshes once this reaches 5.
+    double                  m_catalogAgeDays = -1.0;
     // Optimistic until a real call says otherwise, so a launcher that has not
     // contacted IGDB yet does not accuse the user of having bad keys.
     bool                    m_igdbAuthOk = true;
@@ -350,6 +442,14 @@ private:
     // would emit a notify per game and re-run every bound expression in the
     // grid dozens of times a second.
     class QTimer           *m_artNotifyTimer = nullptr;
+    // Appids handed to Steam's uninstall and not yet seen gone; see
+    // watchSteamUninstall(). Stops a second press from starting a second poll.
+    QSet<int>               m_pendingSteamUninstalls;
+    void watchSteamUninstall(int appid);
+    // Main thread only; the launch thread posts its changes over.
+    QStringList             m_launchingGames;
+    QStringList             m_runningGames;
+    void setLaunchState(const QString &name, bool launching, bool running);
     bool                    m_recommendationQueued = false;  // coalesced by the debounce timer
     // Neutral (see MOOD_LABELS in analytics/scoring.py). With no mood chosen
     // yet, apply none rather than silently using Chill's weights.
@@ -442,25 +542,40 @@ private:
     // does not link libpq, so Python ingests the log into Postgres.
     void        appendFeedbackEvent(const QVariantMap &fields);
 
-    // Downloads cover art for unowned picks after the list is already visible,
-    // fetching only cache misses.
-    void        fetchCandidateCovers();
+    // Live art for every unowned row -- recommendations, wishlist, favourites,
+    // played. None of them keep image files on disk: prepareLiveArtwork()
+    // points a row's art slots at remote URLs (from the cache when it has the
+    // game) and queues resolveLiveArtwork() for the rest, which looks up
+    // SteamGridDB's URLs, falling back to Steam's CDN probed with HEAD.
+    // applyLiveArtwork() caches the answer and writes it into every row of
+    // that name. `urgent` puts a game at the front of the queue -- a visible
+    // Discover pick, or the one a details page just opened on.
+    void        prepareLiveArtwork(QVariantMap &row, bool urgent = false);
+    void        resolveLiveArtwork(const QString &name, bool urgent = false);
+    void        pumpLiveArtwork();
+    void        finishLiveArtwork(const QString &name, const QVariantMap &art,
+                                  bool definitive);
+    void        applyLiveArtwork(const QString &name, const QVariantMap &art,
+                                 bool definitive);
+    QVariantMap savedRowFor(const QString &name) const;
 
-    // Backs ensureArtwork(). fetchArtworkFrom() walks one kind's URL fallback
-    // chain, one entry per call, re-entering itself from the reply handler;
-    // allDefinitive carries whether every attempt so far failed for a reason
-    // upstream actually gave (a 404), so a run of connection errors never ends
-    // up stamping the negative cache.
-    void        fetchArtworkFrom(const QString &name, const QString &kind,
-                                 const QStringList &urls, int index,
-                                 bool allDefinitive);
-    void        recordArtworkMiss(const QString &name, const QString &kind);
+    // live_artwork.json: the URLs each lookup found, keyed by lower-cased
+    // name, so a game is asked about once per machine rather than once per
+    // run of the recommender.
+    fs::path    liveArtCachePath() const;
+    void        loadLiveArtCache();
+    void        saveLiveArtCache() const;
+    bool        liveArtCacheIsFresh(const QString &name) const;
+    QHash<QString, QVariantMap> m_liveArtCache;
 
-    // Points heroPath/logoPath at whatever is now on disk for one game, in
-    // every list that carries it, and emits so the open details page re-reads.
-    void        rebindArtwork(const QString &name);
+    // Names (lower-cased) asked about this session, the ones still waiting,
+    // and how many lookups are running. Capped: a played history can hold
+    // dozens of unowned rows, and each lookup is four SteamGridDB requests.
+    QSet<QString>           m_liveArtAsked;
+    QStringList             m_liveArtQueue;
+    int                     m_liveArtRunning = 0;
 
-    // The metadata counterpart of rebindArtwork(): writes one resolved IGDB
+    // The metadata counterpart of applyLiveArtwork(): writes one resolved IGDB
     // id's fields into every list holding that name, and emits for each.
     void        applyResolvedMetadata(const QString &name, long long igdbId);
 
@@ -472,14 +587,49 @@ private:
     // one more request per unresolvable title.
     QSet<QString>           m_metadataAsked;
 
-    // "<stem>|<kind>" of each download in flight, so reopening a details page
-    // mid-download does not start a second request for the same image.
-    QSet<QString>           m_artworkInFlight;
     class QNetworkAccessManager *m_network = nullptr;
     // Coalesces bursts of refresh requests. A member, not a function-local
     // static: the static was parented to `this` and would dangle if a second
     // bridge were ever constructed.
     class QTimer *m_debounce = nullptr;
+
+    // ---- Browse ------------------------------------------------------------
+    QVariantList            m_browseResults;
+    bool                    m_browseSearching = false;
+    QString                 m_browseStatus;
+    QVariantMap             m_browseDetails;
+    bool                    m_browseDetailsLoading = false;
+    QVariantMap             m_browseReviews;
+    bool                    m_browseReviewsLoading = false;
+    QVariantList            m_browseNewReleases;
+    bool                    m_browseNewReleasesLoading = false;
+    QString                 m_browseNewReleasesStatus;
+    // Started on each successful fetch; invalid until the first one.
+    QElapsedTimer           m_browseNewReleasesClock;
+    // Bumped per request; a reply carrying an older number is stale.
+    int                     m_browseSearchSeq  = 0;
+    int                     m_browseDetailsSeq = 0;
+    // Discover-shaped rows for every details page opened this session, so the
+    // wishlist, favourite and played paths have something to snapshot from.
+    QVariantList            m_browseSnapshots;
+    // Raw IGDB facts keyed by canonical name, for save_game_metadata() when a
+    // browse game is marked played: the recommender needs its genres.
+    QHash<QString, QVariantMap> m_browseMetadata;
+
+    void        applyBrowseResults(int seq, const QByteArray &json, const QString &error);
+    void        applyNewReleases(const QByteArray &json, const QString &error);
+    void        applyBrowseDetails(int seq, const QByteArray &game, const QByteArray &ttb,
+                                   const QString &error);
+    void        fetchSteamReviews(int seq, int appId);
+    void        queryBrowseDetails(int seq, qlonglong igdbId);
+    void        finishUnresolvedBrowseDetails(int seq);
+
+    // The best renderable row for an unowned game, from whichever list holds
+    // one. Shared by the wishlist, favourite and played snapshot paths.
+    QVariantMap snapshotFromLists(const QString &name) const;
+
+    // NAME|IGDB_ID|ADDED_AT for every manual played row, for sync_local_data.py.
+    void        writeManualPlayed() const;
 
     // Runs recommend.py immediately. Public callers go through
     // loadRecommendations(), which debounces -- every heart click used to spawn
