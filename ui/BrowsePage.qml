@@ -37,13 +37,39 @@ Item {
         page.api && page.api.browseNewReleases ? page.api.browseNewReleases : []
     readonly property bool newLoading: !!page.api && page.api.browseNewReleasesLoading
 
+    // The views' models, handed over here rather than bound, so answerStamp
+    // is always set before the cards for an answer are made. Cards made just
+    // after it rise and fade in one after another; cards made later, by
+    // scrolling, simply appear.
+    property var gridModel: []
+    property var railModel: []
+    property double answerStamp: 0
+    function showAnswer() {
+        page.answerStamp = Date.now()
+        page.gridModel = page.showingNew ? [] : page.results
+        page.railModel = page.showingNew ? page.newReleases : []
+    }
+    onResultsChanged: page.showAnswer()
+    onNewReleasesChanged: page.showAnswer()
+    onShowingNewChanged: page.showAnswer()
+
     // The bridge ignores repeat calls, so every way onto the tab can ask.
     function refreshNew() {
         if (page.api && page.visible && page.igdbConfigured)
             page.api.loadNewReleases()
     }
-    Component.onCompleted: page.refreshNew()
-    onVisibleChanged: page.refreshNew()
+    Component.onCompleted: {
+        page.showAnswer()
+        page.refreshNew()
+    }
+    // Coming back to the tab replays the pop-in of whichever view is up. Its
+    // cards are kept while the tab is away, so there is no new answer to stamp.
+    signal shown()
+    onVisibleChanged: {
+        page.refreshNew()
+        if (page.visible)
+            page.shown()
+    }
     onIgdbConfiguredChanged: page.refreshNew()
 
     // Waits out a burst of typing before asking IGDB. Each keystroke would
@@ -84,8 +110,11 @@ Item {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            visible: page.showingNew ? page.newReleases.length > 0
-                                     : page.results.length > 0 && !page.searching
+            // Faded rather than hidden, so it keeps its room and the grid
+            // under it does not jump down as an answer arrives.
+            opacity: (page.showingNew ? page.newReleases.length > 0
+                                      : page.results.length > 0 && !page.searching) ? 1.0 : 0.0
+            Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
             text: page.showingNew
                   ? "NEW RELEASES"
                   : page.results.length + (page.results.length === 1 ? " RESULT" : " RESULTS")
@@ -98,7 +127,9 @@ Item {
     Column {
         anchors.centerIn: parent
         spacing: 18
-        visible: page.grid.count === 0
+        opacity: page.grid.count === 0 ? 1.0 : 0.0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
@@ -164,7 +195,7 @@ Item {
         cellHeight: 440
         visible: !page.showingNew
         // Empty while the rail is up, so each card belongs to one view only.
-        model: page.showingNew ? [] : page.results
+        model: page.gridModel
         currentIndex: -1
         delegate: resultCard
 
@@ -209,7 +240,7 @@ Item {
         rightMargin: newRail.popRoom + 16
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        model: page.showingNew ? page.newReleases : []
+        model: page.railModel
         currentIndex: -1
         delegate: resultCard
 
@@ -329,6 +360,49 @@ Item {
             // On the rail the card spans its height, leaving the pop room
             // above and below the centred cover.
             height: resultDelegate.compact ? newRail.height : 415
+
+            // Part of a fresh answer: rise and fade in, a beat after the card
+            // before it, as BrowseDetails' sections do.
+            transform: Translate { id: enterShift }
+            function popIn(beat) {
+                enterPause.duration = Math.max(0, Math.min(beat, 12)) * 40
+                enterAnim.stop()
+                resultDelegate.opacity = 0
+                enterShift.y = 18
+                enterAnim.start()
+            }
+            Component.onCompleted: {
+                if (Date.now() - page.answerStamp <= 250)
+                    resultDelegate.popIn(resultDelegate.index)
+            }
+            // A tab switch back: counted from the first card in view, so a
+            // scrolled rail or grid does not wait out the cards before it.
+            Connections {
+                target: page
+                function onShown() {
+                    if (page.showingNew)
+                        resultDelegate.popIn(Math.floor((resultDelegate.x - newRail.contentX)
+                                                        / newRail.pitch))
+                    else
+                        resultDelegate.popIn(resultDelegate.index
+                            - Math.floor(browseGrid.contentY / browseGrid.cellHeight)
+                              * browseGrid.columns)
+                }
+            }
+            SequentialAnimation {
+                id: enterAnim
+                PauseAnimation { id: enterPause }
+                ParallelAnimation {
+                    NumberAnimation {
+                        target: resultDelegate; property: "opacity"
+                        to: 1.0; duration: 380; easing.type: Easing.OutCubic
+                    }
+                    NumberAnimation {
+                        target: enterShift; property: "y"
+                        to: 0; duration: 380; easing.type: Easing.OutCubic
+                    }
+                }
+            }
 
             Column {
                 anchors.centerIn: parent

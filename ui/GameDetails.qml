@@ -2,7 +2,6 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Dialogs
-import QtQuick.Effects
 import Vortex
 
 Popup {
@@ -44,6 +43,16 @@ Popup {
     // row in place, which does not re-run findGameData(), so the menu reads
     // this until the page moves to another game.
     property string exeOverride: ""
+
+    // Title rename. editingTitle swaps the heading for an input; renaming
+    // marks the selectedGameName change a commit makes, so it is not handled as
+    // the user opening a different game.
+    property bool editingTitle: false
+    property bool renaming: false
+    readonly property bool canRename:
+        detailsRoot.isOwned && !!detailsRoot.api && !detailsRoot.api.isLoading
+        && !detailsRoot.gameLaunching && !detailsRoot.gameRunning
+        && !!detailsRoot.gameData && !!detailsRoot.gameData.installDir
 
     // Windows' own icon font. Win11 ships Segoe Fluent Icons, Win10 only MDL2;
     // the codepoints are shared.
@@ -133,9 +142,51 @@ Popup {
         detailsRoot.armedChoice = -1
     }
 
+    function beginRename() {
+        if (!detailsRoot.canRename || detailsRoot.editingTitle) return
+        detailsRoot.cancelUninstall()
+        titleEdit.text = detailsRoot.gameData.name
+        detailsRoot.editingTitle = true
+        titleEdit.forceActiveFocus()
+        titleEdit.selectAll()
+    }
+
+    function cancelRename() {
+        detailsRoot.editingTitle = false
+    }
+
+    // Moves the page onto a renamed row without treating it as a new game.
+    function followRename(installDir) {
+        const live = detailsRoot.api.gameDetailsForInstallDir(installDir)
+        if (!live || !live.name) return
+        if (live.name !== detailsRoot.selectedGameName) {
+            detailsRoot.renaming = true
+            detailsRoot.selectedGameName = live.name
+            detailsRoot.renaming = false
+        }
+        detailsRoot.gameData = live
+    }
+
+    // Empty puts the scanned title back; the bridge decides what that is, so
+    // the page reads the name back rather than assuming the input's.
+    function commitRename() {
+        if (!detailsRoot.editingTitle) return
+        detailsRoot.editingTitle = false
+        if (!detailsRoot.gameData || !detailsRoot.api) return
+        const typed = titleEdit.text.trim()
+        if (typed === detailsRoot.gameData.name) return
+        const installDir = detailsRoot.gameData.installDir
+        if (detailsRoot.api.renameGame(installDir, typed))
+            detailsRoot.followRename(installDir)
+    }
+
     // Back while armed drops the confirm row instead of the whole page; the
     // caller keeps the page open when this returns true.
     function handleBack() {
+        if (detailsRoot.editingTitle) {
+            detailsRoot.cancelRename()
+            return true
+        }
         if (!detailsRoot.uninstallArmed)
             return false
         detailsRoot.cancelUninstall()
@@ -143,6 +194,8 @@ Popup {
     }
 
     function navigate(direction) {
+        if (detailsRoot.editingTitle)
+            return
         if (detailsRoot.uninstallArmed) {
             // Armed, the pad only picks between DELETE and CANCEL.
             if (direction !== "left" && direction !== "right")
@@ -173,7 +226,7 @@ Popup {
     }
 
     function activateFocusedAction() {
-        if (!detailsRoot.gameData || !detailsRoot.api)
+        if (!detailsRoot.gameData || !detailsRoot.api || detailsRoot.editingTitle)
             return
         if (detailsRoot.uninstallArmed) {
             if (detailsRoot.armedChoice === detailsRoot.armedDelete)
@@ -277,6 +330,12 @@ Popup {
             detailsRoot.wishlistRevision++;
         }
         function onPlayedGamesChanged() { detailsRoot.refreshGameData(); }
+        // A rename rewrites the row in place, then again once its new art and
+        // metadata land; neither notifies gameList.
+        function onGameRowChanged(installDir) {
+            if (detailsRoot.gameData && detailsRoot.gameData.installDir === installDir)
+                detailsRoot.followRename(installDir);
+        }
     }
 
     // A Discover pick resolves to its recommendationList entry, and that
@@ -312,11 +371,15 @@ Popup {
     // Never carry an armed confirm across games or across an open/close cycle.
     onOpened: {
         detailsRoot.cancelUninstall()
+        detailsRoot.cancelRename()
         body.contentY = 0
     }
 
     onSelectedGameNameChanged: {
+        if (detailsRoot.renaming)
+            return;   // same game, new title -- followRename() sets gameData
         detailsRoot.cancelUninstall();
+        detailsRoot.cancelRename();
         detailsRoot.exeOverride = "";
         detailsRoot.gameData = findGameData();
         if (detailsRoot.gameData && detailsRoot.api) {
@@ -340,7 +403,11 @@ Popup {
     x: (parent.width - width) / 2; y: (parent.height - height) / 2
     modal: true; focus: true
     padding: 0
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    // While the title is being edited, Escape belongs to the input (cancel)
+    // and a click outside only ends the edit.
+    closePolicy: detailsRoot.editingTitle
+                 ? Popup.NoAutoClose
+                 : Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
     background: Rectangle {
         color: Theme.bgPanel
@@ -376,6 +443,8 @@ Popup {
         id: action
         property string label
         property string glyph
+        // Draws HeartIcon in the glyph's place.
+        property bool heart: false
         property bool active: false
         property bool focused: false
         property color activeColor: Theme.positiveDim
@@ -430,6 +499,12 @@ Popup {
                 color: action.glyphColor
                 font.pixelSize: 18
             }
+            HeartIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: action.heart
+                color: action.glyphColor
+                size: 18
+            }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: action.label
@@ -468,396 +543,252 @@ Popup {
                 onHeightChanged: detailsRoot.updateTitleDock()
 
                 // ── Hero ────────────────────────────────────────────────────
-                // Steam's library header: the art across the top, its lower part
-                // frosting into a band that carries the title and the actions.
-                Rectangle {
+                // Steam's library header (FrostedHero.qml); what is declared
+                // inside goes into its frosted band.
+                FrostedHero {
                     id: heroBanner
                     width: parent.width
                     height: Math.max(460, Math.round(body.height * 0.6))
-                    color: Theme.bgRaised
-                    radius: 20
-                    // Layer + clip keeps the images inside the window's curved edges.
-                    layer.enabled: true
-                    clip: true
+                    heroSource: detailsRoot.heroSource
+                    logoSource: detailsRoot.logoSource
+                    coverSource: detailsRoot.coverSource
 
-                    // 16:10 is the loosest thing anyone ships as a banner and the
-                    // tightest portrait cover is 3:4, so 1.6 separates the two with
-                    // room to spare. This stays false until the image reports a size,
-                    // so the banner starts blurred — the safe way round, since
-                    // un-blurring late is invisible and stretching early is the bug.
-                    readonly property bool heroIsWide:
-                        heroBackdrop.status === Image.Ready
-                        && heroBackdrop.implicitWidth > heroBackdrop.implicitHeight * 1.6
-
-                    // Real wide art is already the right shape and stays sharp at
-                    // the opacity this page has always used. Portrait art is
-                    // blurred instead and carries a little more of the frame, since
-                    // once blurred it is only there to be colour.
-                    readonly property real backdropOpacity: heroBanner.heroIsWide ? 0.4 : 0.55
-
-                    // Where the band starts. The blur begins just above the title
-                    // (blurLead) and builds up over blurFade, so it is fully
-                    // frosted a little way into the band and has no edge of its own.
-                    readonly property real bandTop: heroBanner.height - band.height
-                    readonly property int blurLead: 40
-                    readonly property int blurFade: 100
-                    readonly property real fadeTop: heroBanner.bandTop - heroBanner.blurLead
-                    readonly property real fadeEnd: heroBanner.fadeTop + heroBanner.blurFade
-
-                    // How many strengths of blur the fade is built from. Each is
-                    // a little stronger than the last and starts a little lower,
-                    // so the art goes soft gradually instead of crossfading from
-                    // sharp straight to fully frosted, which reads as a seam.
-                    readonly property int blurSteps: 5
-                    readonly property real blurStep: heroBanner.blurFade / (heroBanner.blurSteps + 1)
-
-                    // A y inside the banner as a gradient position.
-                    function frac(y) {
-                        return Math.max(0, Math.min(1, y / Math.max(1, heroBanner.height)))
-                    }
-
-                    // Drawn through the MultiEffects below, never directly — hiding
-                    // the source item is how MultiEffect is given something to work on.
-                    Image {
-                        id: heroBackdrop
-                        anchors.fill: parent
-                        visible: false
-                        asynchronous: true
-                        fillMode: Image.PreserveAspectCrop
-                        source: detailsRoot.heroSource
-                    }
-
-                    MultiEffect {
-                        anchors.fill: parent
-                        source: heroBackdrop
-                        blurEnabled: !heroBanner.heroIsWide
-                        blur: 1.0
-                        blurMax: 48
-                        opacity: heroBanner.backdropOpacity
-                        Behavior on opacity { NumberAnimation { duration: 200 } }
-                    }
-
-                    // The progressive frost: one layer per blur strength, weakest
-                    // first. Each fades in over two steps starting one step below
-                    // the last, so neighbouring strengths overlap and blend, and
-                    // all of them are solid by fadeEnd.
-                    Repeater {
-                        model: heroBanner.blurSteps
-                        delegate: Item {
-                            id: frostLayer
-                            required property int index
-                            readonly property real rampStart:
-                                heroBanner.fadeTop + frostLayer.index * heroBanner.blurStep
-                            readonly property real rampEnd:
-                                Math.min(heroBanner.fadeEnd, frostLayer.rampStart + 2 * heroBanner.blurStep)
-
-                            anchors.fill: parent
-
-                            // The blurred copy, composed over the banner's own fill
-                            // so it replaces what is under it rather than stacking
-                            // on it -- translucent copies stacked would brighten.
-                            Item {
-                                id: frostSource
-                                anchors.fill: parent
-                                visible: false
-
-                                Rectangle {
-                                    anchors.fill: parent
-                                    color: heroBanner.color
-                                }
-                                MultiEffect {
-                                    anchors.fill: parent
-                                    source: heroBackdrop
-                                    blurEnabled: true
-                                    // Squared, so the early steps stay subtle and
-                                    // the softening gathers pace toward the band.
-                                    blur: Math.pow((frostLayer.index + 1) / heroBanner.blurSteps, 2)
-                                    blurMax: 64
-                                    opacity: heroBanner.backdropOpacity
-                                }
-                            }
-
-                            // Clear above this layer's ramp, solid below it.
-                            Rectangle {
-                                id: frostMask
-                                anchors.fill: parent
-                                visible: false
-                                layer.enabled: true
-                                gradient: Gradient {
-                                    GradientStop {
-                                        position: heroBanner.frac(frostLayer.rampStart)
-                                        color: "transparent"
-                                    }
-                                    GradientStop {
-                                        position: heroBanner.frac(frostLayer.rampEnd)
-                                        color: "white"
-                                    }
-                                }
-                            }
-
-                            MultiEffect {
-                                anchors.fill: parent
-                                source: frostSource
-                                maskEnabled: true
-                                maskSource: frostMask
-                                // The lower edge runs from min*(1+spread)-spread to
-                                // min*(1+spread), so 0.5 with a spread of 1 maps the
-                                // mask's alpha 0..1 straight through. A threshold of
-                                // 0 would put that edge below zero and pass the whole
-                                // mask, frosting the entire hero.
-                                maskThresholdMin: 0.5
-                                maskSpreadAtMin: 1.0
-                            }
-                        }
-                    }
-
-                    // Darkens the band for the text on it and melts its foot into
-                    // the panel, so the page below continues with no seam. Eased
-                    // in over the same distance as the blur, gently at first.
-                    Rectangle {
-                        anchors.fill: parent
-                        gradient: Gradient {
-                            GradientStop {
-                                position: heroBanner.frac(heroBanner.fadeTop)
-                                color: "transparent"
-                            }
-                            GradientStop {
-                                position: heroBanner.frac(heroBanner.fadeTop + heroBanner.blurFade * 0.5)
-                                color: Qt.alpha(Theme.bgPanel, 0.15)
-                            }
-                            GradientStop {
-                                position: heroBanner.frac(heroBanner.fadeEnd)
-                                color: Qt.alpha(Theme.bgPanel, 0.55)
-                            }
-                            GradientStop { position: 1.0; color: Theme.bgPanel }
-                        }
-                    }
-
-                    // Centre art, in order of preference: the logo when there is one
-                    // (Steam's logo.png fills this slot for unowned picks now), else
-                    // the sharp portrait over its own blur, else nothing — real wide
-                    // art reads perfectly well on its own. Both sit centred in the
-                    // clear part above the band.
-                    Image {
-                        anchors.centerIn: parent
-                        anchors.verticalCenterOffset: -band.height / 2
-                        width: parent.width * 0.4
-                        height: Math.min(parent.height * 0.4, heroBanner.bandTop * 0.7)
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                        visible: detailsRoot.logoSource !== ""
-                        source: detailsRoot.logoSource
-                    }
-
-                    Image {
-                        anchors.centerIn: parent
-                        anchors.verticalCenterOffset: -band.height / 2
-                        height: Math.max(0, heroBanner.bandTop - 48)
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                        visible: detailsRoot.logoSource === "" && !heroBanner.heroIsWide
-                        // heroSource first: when it is portrait it is IGDB's 540x720,
-                        // which downscales into this slot, where the 264x352 cover
-                        // would have to be stretched up to fill it.
-                        source: !visible ? ""
-                              : (detailsRoot.heroSource !== "" ? detailsRoot.heroSource
-                                                               : detailsRoot.coverSource)
-                    }
-
-                    // ── The band ────────────────────────────────────────────
-                    Column {
-                        id: band
-                        anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                                  leftMargin: 40; rightMargin: 40 }
-                        bottomPadding: 28
-                        spacing: 14
+                    // Double-click the title to rename an owned game. The new
+                    // name is what IGDB and SteamGridDB are searched by from
+                    // then on; an empty one restores the scanned title.
+                    Item {
+                        width: parent.width
+                        height: titleText.height
 
                         Text {
                             id: titleText
-                            width: parent.width
+                            width: Math.min(parent.width, implicitWidth)
+                            visible: !detailsRoot.editingTitle
                             text: detailsRoot.gameData ? detailsRoot.gameData.name : ""
                             color: Theme.textPrimary
                             font.pixelSize: 40; font.bold: true
                             elide: Text.ElideRight
+
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: detailsRoot.canRename
+                                cursorShape: Qt.IBeamCursor
+                                onDoubleClicked: detailsRoot.beginRename()
+                            }
                         }
 
-                        // Play or Check on Steam, the heart, and for an owned game
-                        // the two numbers Steam keeps beside its Play button. The
-                        // third focus slot sits on the same line at the far right:
-                        // Uninstall when owned, Add to Wishlist when not.
-                        Item {
-                            width: parent.width
-                            height: actionBar.height
-                            visible: !detailsRoot.uninstallArmed
+                        TextInput {
+                            id: titleEdit
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: detailsRoot.editingTitle
+                            clip: true
+                            color: Theme.textPrimary
+                            selectionColor: Theme.accent
+                            selectedTextColor: Theme.textInverse
+                            font.pixelSize: 40; font.bold: true
+                            selectByMouse: true
+
+                            onAccepted: detailsRoot.commitRename()
+                            onActiveFocusChanged: {
+                                if (!activeFocus && detailsRoot.editingTitle)
+                                    detailsRoot.commitRename()
+                            }
+                            Keys.onEscapePressed: function(event) {
+                                detailsRoot.cancelRename()
+                                event.accepted = true
+                            }
+
+                            // The edit's extent, so it reads as a field rather
+                            // than a heading with a cursor in it.
+                            Rectangle {
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.bottom
+                                anchors.topMargin: 2
+                                height: 2
+                                color: Theme.accent
+                            }
+                        }
+                    }
+
+                    // Play or Check on Steam, the heart, and for an owned game
+                    // the two numbers Steam keeps beside its Play button. The
+                    // third focus slot sits on the same line at the far right:
+                    // Uninstall when owned, Add to Wishlist when not.
+                    Item {
+                        width: parent.width
+                        height: actionBar.height
+                        visible: !detailsRoot.uninstallArmed
+
+                        Row {
+                            id: actionBar
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 14
+
+                            ActionButton {
+                                visible: detailsRoot.isOwned
+                                // PLAY, then LAUNCHING on green until the game is up, then QUIT,
+                                // which turns red on hover with the icon and label flipped to white.
+                                readonly property bool quitHot: detailsRoot.gameRunning && emphasized
+                                iconSource: detailsRoot.gameLaunching ? ""
+                                          : quitHot ? "assets/quit_hover.png"
+                                          : detailsRoot.gameRunning ? "assets/quit.png" : "assets/play.png"
+                                iconSize: 14
+                                label: detailsRoot.gameLaunching ? "LAUNCHING" : detailsRoot.gameRunning ? "QUIT" : "PLAY"
+                                restColor: detailsRoot.gameLaunching ? Theme.positive : Theme.accent
+                                hoverColor: detailsRoot.gameLaunching ? Theme.positive
+                                          : detailsRoot.gameRunning ? Theme.danger : Theme.accent
+                                ringColor: detailsRoot.gameRunning ? Theme.focusRing : Theme.positive
+                                labelColor: detailsRoot.gameLaunching || quitHot ? Theme.textPrimary : Theme.textInverse
+                                focused: detailsRoot.focusedAction === detailsRoot.actionPlay
+                                onTriggered: detailsRoot.playOrQuit()
+                            }
+
+                            ActionButton {
+                                visible: !detailsRoot.isOwned
+                                // Relative so it survives the module's RESOURCE_PREFIX
+                                // rather than hardcoding it.
+                                iconSource: "assets/steam.png"
+                                label: "CHECK ON STEAM"
+                                restColor: Theme.steamBg
+                                hoverColor: Theme.steamBgPressed
+                                ringColor: Theme.steamAccent
+                                focused: detailsRoot.focusedAction === detailsRoot.actionPlay
+                                onTriggered: Qt.openUrlExternally(detailsRoot.steamUrl)
+                            }
+
+                            // Favourite. There is deliberately no dislike counterpart:
+                            // asking someone to rate a game they chose to install is
+                            // the wrong question, and repeated instant-quits already
+                            // tell the recommender the same thing without asking.
+                            // Hearting also clears that behavioural penalty, so this
+                            // is how you overrule the model when it gets one wrong.
+                            ActionButton {
+                                heart: true
+                                label: detailsRoot.isFavorite ? "FAVORITED" : "FAVORITE"
+                                active: detailsRoot.isFavorite
+                                activeColor: Theme.favorite
+                                focused: detailsRoot.focusedAction === detailsRoot.actionFavorite
+                                onTriggered: if (detailsRoot.gameData)
+                                    detailsRoot.api.updatePreference(detailsRoot.gameData.name, 1.0)
+                            }
 
                             Row {
-                                id: actionBar
                                 anchors.verticalCenter: parent.verticalCenter
-                                spacing: 14
+                                visible: detailsRoot.isOwned
+                                leftPadding: 18
+                                spacing: 32
 
-                                ActionButton {
-                                    visible: detailsRoot.isOwned
-                                    // PLAY, then LAUNCHING on green until the game is up, then QUIT,
-                                    // which turns red on hover with the icon and label flipped to white.
-                                    readonly property bool quitHot: detailsRoot.gameRunning && emphasized
-                                    iconSource: detailsRoot.gameLaunching ? ""
-                                              : quitHot ? "assets/quit_hover.png"
-                                              : detailsRoot.gameRunning ? "assets/quit.png" : "assets/play.png"
-                                    iconSize: 14
-                                    label: detailsRoot.gameLaunching ? "LAUNCHING" : detailsRoot.gameRunning ? "QUIT" : "PLAY"
-                                    restColor: detailsRoot.gameLaunching ? Theme.positive : Theme.accent
-                                    hoverColor: detailsRoot.gameLaunching ? Theme.positive
-                                              : detailsRoot.gameRunning ? Theme.danger : Theme.accent
-                                    ringColor: detailsRoot.gameRunning ? Theme.focusRing : Theme.positive
-                                    labelColor: detailsRoot.gameLaunching || quitHot ? Theme.textPrimary : Theme.textInverse
-                                    focused: detailsRoot.focusedAction === detailsRoot.actionPlay
-                                    onTriggered: detailsRoot.playOrQuit()
+                                Column {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 3
+                                    Text {
+                                        text: "LAST PLAYED"
+                                        color: Theme.textMuted
+                                        font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                    }
+                                    Text {
+                                        text: detailsRoot.gameData && detailsRoot.gameData.lastPlayed
+                                              ? detailsRoot.gameData.lastPlayed : "Never"
+                                        color: Theme.textSecondary
+                                        font.pixelSize: 14
+                                    }
                                 }
 
-                                ActionButton {
-                                    visible: !detailsRoot.isOwned
-                                    // Relative so it survives the module's RESOURCE_PREFIX
-                                    // rather than hardcoding it.
-                                    iconSource: "assets/steam.png"
-                                    label: "CHECK ON STEAM"
-                                    restColor: Theme.steamBg
-                                    hoverColor: Theme.steamBgPressed
-                                    ringColor: Theme.steamAccent
-                                    focused: detailsRoot.focusedAction === detailsRoot.actionPlay
-                                    onTriggered: Qt.openUrlExternally(detailsRoot.steamUrl)
-                                }
-
-                                // Favourite. There is deliberately no dislike counterpart:
-                                // asking someone to rate a game they chose to install is
-                                // the wrong question, and repeated instant-quits already
-                                // tell the recommender the same thing without asking.
-                                // Hearting also clears that behavioural penalty, so this
-                                // is how you overrule the model when it gets one wrong.
-                                ActionButton {
-                                    glyph: "♥"
-                                    label: detailsRoot.isFavorite ? "FAVORITED" : "FAVORITE"
-                                    active: detailsRoot.isFavorite
-                                    activeColor: Theme.favorite
-                                    focused: detailsRoot.focusedAction === detailsRoot.actionFavorite
-                                    onTriggered: if (detailsRoot.gameData)
-                                        detailsRoot.api.updatePreference(detailsRoot.gameData.name, 1.0)
-                                }
-
+                                // Time actually played -- the session total with idle
+                                // taken out -- except for a Steam game showing Steam's
+                                // own figure. The caption under YOUR GAME says which.
                                 Row {
                                     anchors.verticalCenter: parent.verticalCenter
-                                    visible: detailsRoot.isOwned
-                                    leftPadding: 18
-                                    spacing: 32
-
+                                    spacing: 10
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: String.fromCharCode(0xE823)   // clock
+                                        font.family: detailsRoot.iconFont
+                                        font.pixelSize: 22
+                                        color: Theme.textMuted
+                                    }
                                     Column {
                                         anchors.verticalCenter: parent.verticalCenter
                                         spacing: 3
                                         Text {
-                                            text: "LAST PLAYED"
+                                            text: "PLAY TIME"
                                             color: Theme.textMuted
                                             font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
                                         }
                                         Text {
-                                            text: detailsRoot.gameData && detailsRoot.gameData.lastPlayed
-                                                  ? detailsRoot.gameData.lastPlayed : "Never"
+                                            text: detailsRoot.gameData && detailsRoot.gameData.playtime
+                                                  ? detailsRoot.gameData.playtime : "0m"
                                             color: Theme.textSecondary
                                             font.pixelSize: 14
                                         }
                                     }
-
-                                    // Time actually played -- the session total with idle
-                                    // taken out -- except for a Steam game showing Steam's
-                                    // own figure. The caption under YOUR GAME says which.
-                                    Row {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        spacing: 10
-                                        Text {
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            text: String.fromCharCode(0xE823)   // clock
-                                            font.family: detailsRoot.iconFont
-                                            font.pixelSize: 22
-                                            color: Theme.textMuted
-                                        }
-                                        Column {
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            spacing: 3
-                                            Text {
-                                                text: "PLAY TIME"
-                                                color: Theme.textMuted
-                                                font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                                            }
-                                            Text {
-                                                text: detailsRoot.gameData && detailsRoot.gameData.playtime
-                                                      ? detailsRoot.gameData.playtime : "0m"
-                                                color: Theme.textSecondary
-                                                font.pixelSize: 14
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Steam games hand off to Steam; a local one arms the confirm.
-                            ActionButton {
-                                id: uninstallButton
-                                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
-                                visible: detailsRoot.isOwned && !detailsRoot.uninstallArmed
-                                // The lid lifts on hover or pad focus. The two PNGs
-                                // carry dangerRest and dangerIcon baked in.
-                                iconSource: emphasized ? "assets/trash_open.png" : "assets/trash.png"
-                                label: "UNINSTALL"
-                                hoverColor: Theme.dangerBg
-                                focused: detailsRoot.focusedAction === detailsRoot.actionUninstall
-                                onTriggered: detailsRoot.requestUninstall()
-                            }
-
-                            // Saving a game is purely a bookmark: it never feeds or
-                            // filters the recommender, so the pick keeps appearing in
-                            // Discover with a cart marker.
-                            ActionButton {
-                                id: wishlistButton
-                                anchors { right: parent.right; verticalCenter: parent.verticalCenter }
-                                visible: !detailsRoot.isOwned
-                                glyph: "\u{1F6D2}"
-                                label: detailsRoot.isWishlisted ? "WISHLISTED" : "ADD TO WISHLIST"
-                                active: detailsRoot.isWishlisted
-                                focused: detailsRoot.focusedAction === detailsRoot.actionUninstall
-                                onTriggered: {
-                                    if (!detailsRoot.gameData) return
-                                    detailsRoot.api.toggleWishlist(detailsRoot.gameData.name)
-                                    detailsRoot.wishlistRevision++
                                 }
                             }
                         }
 
-                        // Confirm step — a local uninstall deletes the game's folder
-                        // off the disk, so it is never one click. Steam games skip this.
-                        Row {
-                            spacing: 14
-                            visible: detailsRoot.uninstallArmed
+                        // Steam games hand off to Steam; a local one arms the confirm.
+                        ActionButton {
+                            id: uninstallButton
+                            anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                            visible: detailsRoot.isOwned && !detailsRoot.uninstallArmed
+                            // The lid lifts on hover or pad focus. The two PNGs
+                            // carry dangerRest and dangerIcon baked in.
+                            iconSource: emphasized ? "assets/trash_open.png" : "assets/trash.png"
+                            label: "UNINSTALL"
+                            hoverColor: Theme.dangerBg
+                            focused: detailsRoot.focusedAction === detailsRoot.actionUninstall
+                            onTriggered: detailsRoot.requestUninstall()
+                        }
 
-                            Text {
-                                anchors.verticalCenter: parent.verticalCenter
-                                text: "Delete this game's files from disk?"
-                                color: Theme.dangerText
-                                font.pixelSize: 16
+                        // Saving a game is purely a bookmark: it never feeds or
+                        // filters the recommender, so the pick keeps appearing in
+                        // Discover with a cart marker.
+                        ActionButton {
+                            id: wishlistButton
+                            anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                            visible: !detailsRoot.isOwned
+                            glyph: "\u{1F6D2}"
+                            label: detailsRoot.isWishlisted ? "WISHLISTED" : "ADD TO WISHLIST"
+                            active: detailsRoot.isWishlisted
+                            focused: detailsRoot.focusedAction === detailsRoot.actionUninstall
+                            onTriggered: {
+                                if (!detailsRoot.gameData) return
+                                detailsRoot.api.toggleWishlist(detailsRoot.gameData.name)
+                                detailsRoot.wishlistRevision++
                             }
+                        }
+                    }
 
-                            ActionButton {
-                                label: "DELETE"
-                                restColor: Theme.dangerRest
-                                hoverColor: Theme.danger
-                                focused: detailsRoot.armedChoice === detailsRoot.armedDelete
-                                onTriggered: detailsRoot.confirmUninstall()
-                            }
+                    // Confirm step — a local uninstall deletes the game's folder
+                    // off the disk, so it is never one click. Steam games skip this.
+                    Row {
+                        spacing: 14
+                        visible: detailsRoot.uninstallArmed
 
-                            ActionButton {
-                                label: "CANCEL"
-                                hoverColor: Theme.bgInert
-                                labelColor: Theme.textBody
-                                focused: detailsRoot.armedChoice === detailsRoot.armedCancel
-                                onTriggered: detailsRoot.cancelUninstall()
-                            }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Delete this game's files from disk?"
+                            color: Theme.dangerText
+                            font.pixelSize: 16
+                        }
+
+                        ActionButton {
+                            label: "DELETE"
+                            restColor: Theme.dangerRest
+                            hoverColor: Theme.danger
+                            focused: detailsRoot.armedChoice === detailsRoot.armedDelete
+                            onTriggered: detailsRoot.confirmUninstall()
+                        }
+
+                        ActionButton {
+                            label: "CANCEL"
+                            hoverColor: Theme.bgInert
+                            labelColor: Theme.textBody
+                            focused: detailsRoot.armedChoice === detailsRoot.armedCancel
+                            onTriggered: detailsRoot.cancelUninstall()
                         }
                     }
                 }
@@ -900,7 +831,7 @@ Popup {
                         spacing: 14
                         visible: detailsRoot.isOwned
 
-                        SectionTitle { text: "YOUR GAME" }
+                        SectionTitle { text: "GAME PATH" }
 
                         // A Steam game showing Steam's own figure arrives with
                         // nothing deducted, so say which kind the band's number
@@ -1309,7 +1240,7 @@ Popup {
 
             anchors { top: parent.top; right: parent.right; margins: 20 }
             width: 44; height: 44; radius: 22
-            color: closeButton.emphasized ? Theme.bgEmphasis : Theme.overlayButton
+            color: closeButton.emphasized ? "#B32A2A2A" : "#80000000"
             border.width: closeButton.emphasized ? 2 : 1
             border.color: closeButton.emphasized ? Theme.focusRing : Theme.borderControl
             scale: closeButton.emphasized ? 1.1 : 1.0
@@ -1317,11 +1248,15 @@ Popup {
             Behavior on color { ColorAnimation { duration: 150 } }
             Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
 
-            Text {
+            // White X, decoded at twice the drawn size.
+            Image {
                 anchors.centerIn: parent
-                text: "✕"
-                color: closeButton.emphasized ? Theme.textPrimary : Theme.textBody
-                font.pixelSize: 20
+                width: 20; height: 20
+                source: "assets/close.png"
+                sourceSize.width: 40
+                sourceSize.height: 40
+                fillMode: Image.PreserveAspectFit
+                smooth: true
             }
             MouseArea {
                 id: closeArea

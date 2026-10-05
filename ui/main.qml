@@ -17,6 +17,11 @@ Window {
     // cleared on every tab switch -- a filter left over from another list
     // would make this one look half empty for no visible reason.
     property string searchText: ""
+    // When the query was last typed or the tab last switched. The cards on
+    // show then, and any made just after, rise and fade in one after
+    // another, as on Browse; a heart rebuilding Favorites or a rescan leaves
+    // it alone, so those cards simply appear.
+    property double popStamp: 0
     readonly property bool searchable:
         root.activeTab === "Library" || root.activeTab === "Favorites"
         || root.activeTab === "Wishlist" || root.activeTab === "Played"
@@ -63,7 +68,25 @@ Window {
     Connections {
         target: root.api
         function onCredentialsChanged() { root.refreshCredentialState() }
+        // A refreshed ranking pops in like a tab switch, but only while it
+        // is on show -- the stamp would otherwise replay whatever tab is up.
+        // Cards rebuilt before this runs replay on the stamp; cards rebuilt
+        // after it see a fresh one.
+        //
+        // The list also re-emits when art or metadata is patched into a
+        // pick in place, which must not replay the tab. A finished ranking
+        // is the one emit that comes straight after loading ends.
+        function onRecommendationLoadingChanged() {
+            if (!root.api.isRecommendationLoading)
+                root.rankingDoneAt = Date.now()
+        }
+        function onRecommendationListChanged() {
+            if (root.activeTab === "Recommendations"
+                && Date.now() - root.rankingDoneAt <= 250)
+                root.popStamp = Date.now()
+        }
     }
+    property double rankingDoneAt: 0
 
     // ─────────────────────────────────────────────────────────────────────────
     // Controller navigation
@@ -270,23 +293,24 @@ Window {
             return
         }
 
-        // Recommendations open the Browse-style page too, by name: both the
-        // library and Discover picks, owned or not. It shows Play or Check on
-        // Steam itself.
-        if (root.activeTab === "Recommendations") {
+        // liveName is the library delegate's resolved title; the Discover
+        // grid has no such property and its names never change under it.
+        const name = (grid.currentItem && grid.currentItem.liveName)
+                   ? grid.currentItem.liveName
+                   : game.name
+
+        // Every tab but Library opens the Browse-style page, by name:
+        // Recommendations, Favorites, Wishlist and Played, owned or not. It
+        // shows Play or Check on Steam itself.
+        if (root.activeTab !== "Library") {
             browseDetails.focusedAction = 0
-            browseDetails.openForGame(game.name, "Recommendations")
+            browseDetails.openForGame(name, root.activeTab)
             return
         }
 
         detailPopup.launchOrigin = root.activeTab
         detailPopup.focusedAction = 0
-        // liveName is the library delegate's resolved title; the Discover
-        // grid has no such property and its names never change under it.
-        detailPopup.selectedGameName =
-            (grid.currentItem && grid.currentItem.liveName)
-                ? grid.currentItem.liveName
-                : game.name
+        detailPopup.selectedGameName = name
         detailPopup.open()
     }
 
@@ -403,6 +427,7 @@ Window {
 
     onActiveFilterChanged: gameGrid.currentIndex = root.padActive ? 0 : -1
     onActiveTabChanged: {
+        root.popStamp = Date.now()
         root.searchText = ""
         // Typing is the only thing to do on an empty Browse tab, so the box
         // takes the keyboard straight away. The pad never reads keys, so this
@@ -429,6 +454,7 @@ Window {
     // The tile overflow menu. One instance for the whole grid -- see TileMenu.qml.
     TileMenu {
         id: tileMenu
+        api: root.api
 
         // Removing rebuilds gameList, and the grid binds to that as a plain JS
         // array -- GridView answers a new array by throwing the scroll position
@@ -441,6 +467,28 @@ Window {
             if (root.api)
                 root.api.removeFromLibrary(name, installDir)
             releaseScrollPin.restart()
+        }
+
+        // Same pin again: a local uninstall drops the row at once, and a Steam
+        // one drops it when Steam finishes.
+        onUninstallRequested: (name) => {
+            gameGrid.restoreY = gameGrid.contentY
+            if (root.api)
+                root.api.uninstallGame(name)
+            releaseScrollPin.restart()
+        }
+
+        // Hearting patches the row in place, but un-hearting on Favorites
+        // takes the card off that grid -- pin for it, and close the menu
+        // rather than leave it hanging off a card that is no longer there.
+        onLikeRequested: (name) => {
+            gameGrid.restoreY = gameGrid.contentY
+            const wasLiked = tileMenu.liked
+            if (root.api)
+                root.api.updatePreference(name, 1.0)
+            releaseScrollPin.restart()
+            if (wasLiked && root.activeTab === "Favorites")
+                tileMenu.close()
         }
     }
 
@@ -457,10 +505,10 @@ Window {
     GameDetails {
         id: detailPopup
 
-        // Every heart and wishlist toggle happens from this page, so this is
-        // the last moment the grids' scroll positions are still intact. Both
-        // are captured because the page does not know which tab it was opened
-        // from, and a grid with nothing pending simply never restores.
+        // A heart toggled on this page rebuilds the grid underneath, so this
+        // is the last moment the grids' scroll positions are still intact.
+        // Both are captured to match browseDetails below; a grid with nothing
+        // pending simply never restores.
         onOpened: {
             gameGrid.restoreY = gameGrid.contentY
             wishlistGrid.restoreY = wishlistGrid.contentY
@@ -475,6 +523,19 @@ Window {
 
     BrowseDetails {
         id: browseDetails
+
+        // Favorites, Wishlist and Played open this page now, and a heart or
+        // wishlist toggle on it rebuilds the grid underneath -- the same pin
+        // detailPopup takes, for the same reason.
+        onOpened: {
+            gameGrid.restoreY = gameGrid.contentY
+            wishlistGrid.restoreY = wishlistGrid.contentY
+        }
+
+        onClosed: {
+            gameGrid.restoreY = -1
+            wishlistGrid.restoreY = -1
+        }
     }
 
     SettingsWindow {
@@ -652,7 +713,16 @@ Window {
                                  ? "Search installed games"
                                  : "Search " + root.activeTab.toLowerCase()
                 text: root.searchText
-                onTextChanged: root.searchText = librarySearch.text
+                onTextChanged: {
+                    // Equal when the change came down the binding (a tab
+                    // switch clearing it, which stamps for itself) rather
+                    // than from the keyboard.
+                    if (librarySearch.text === root.searchText)
+                        return
+                    // Stamped first, so it is set before the grids rebuild.
+                    root.popStamp = Date.now()
+                    root.searchText = librarySearch.text
+                }
             }
 
             Shortcut {
@@ -807,14 +877,26 @@ Window {
                 readonly property bool hovered: settingsArea.containsMouse && root.mouseInControl
 
                 implicitWidth: 35; implicitHeight: 35; radius: 17
-                color: settingsButton.hovered ? Theme.accent : Theme.bgRaised
+                // Not the accent fill on hover: the accent is white, and so is the icon.
+                color: settingsButton.hovered ? Theme.bgEmphasis : Theme.bgRaised
                 border.color: settingsButton.hovered ? Theme.focusRing : Theme.borderControl
 
-                Text {
+                onHoveredChanged: if (hovered && !settingsIcon.running) settingsIcon.restart()
+
+                // 180 frames at 60 fps, 56 px cells on a 15x12 sheet (2x for HiDPI).
+                // One full roll per hover; it finishes even if the pointer leaves.
+                AnimatedSprite {
+                    id: settingsIcon
                     anchors.centerIn: parent
-                    text: "⚙"
-                    font.pixelSize: 17
-                    color: settingsButton.hovered ? Theme.textInverse : Theme.textMuted
+                    width: 28; height: 28
+                    source: "assets/settings_roll.png"
+                    frameWidth: 56; frameHeight: 56
+                    frameCount: 180
+                    frameRate: 60
+                    loops: 1
+                    running: false
+                    interpolate: false
+                    smooth: true
                 }
 
                 MouseArea {
@@ -1094,17 +1176,70 @@ Window {
                         return abbreviated ? abbreviated[1] : first
                     }
 
-                    // Launching something that is no longer on the disk fails
-                    // with nothing to show for it. Played is the only grid that
-                    // holds any -- everywhere else every row is installed.
+                    // Launching something that is not on the disk fails with
+                    // nothing to show for it. Played holds uninstalled games,
+                    // and so does Favorites -- a hearted Discover pick, or a
+                    // played game since removed. Library rows are all installed.
                     readonly property bool launchable:
-                        root.activeTab !== "Played"
+                        (root.activeTab !== "Played" && root.activeTab !== "Favorites")
                         || gameDelegate.modelData.installed === true
 
                     // 415, not the old 400: the caption line is the fourth row
                     // of text the comment on the badges below used to rule out.
                     // cellHeight is 440 and already had the room.
-                    width: 240; height: 415
+                    //
+                    // The extra 16 each way is room for the hover scale. The
+                    // card grows 1.04x about its centre -- ~5px past each side,
+                    // ~7px past the top -- and a delegate exactly the card's
+                    // size put the first column flush with the grid's clipped
+                    // left edge and the first row with its top, so both lost a
+                    // sliver on hover. Centring the card in 256x431 keeps 8px
+                    // clear all round and still fits the 440 cell.
+                    width: 256; height: 431
+
+                    // A fresh search answer or tab: rise and fade in, a beat
+                    // after the card before it, as Browse's results do. Cards
+                    // already up when the stamp lands replay too -- going back
+                    // to Library does not rebuild its grid. Counted from the
+                    // first row in view, so a scrolled grid does not wait out
+                    // the cards above it.
+                    transform: Translate { id: gameEnterShift }
+                    function popIn() {
+                        const firstShown = Math.floor(gameGrid.contentY / gameGrid.cellHeight)
+                                           * gameGrid.columns
+                        gameEnterPause.duration =
+                            Math.max(0, Math.min(gameDelegate.index - firstShown, 12)) * 40
+                        gameEnterAnim.stop()
+                        gameDelegate.opacity = 0
+                        gameEnterShift.y = 18
+                        gameEnterAnim.start()
+                    }
+                    Component.onCompleted: {
+                        if (Date.now() - root.popStamp <= 250)
+                            gameDelegate.popIn()
+                    }
+                    Connections {
+                        target: root
+                        function onPopStampChanged() {
+                            if (root.activeTab === "Library" || root.activeTab === "Favorites"
+                                || root.activeTab === "Played")
+                                gameDelegate.popIn()
+                        }
+                    }
+                    SequentialAnimation {
+                        id: gameEnterAnim
+                        PauseAnimation { id: gameEnterPause }
+                        ParallelAnimation {
+                            NumberAnimation {
+                                target: gameDelegate; property: "opacity"
+                                to: 1.0; duration: 380; easing.type: Easing.OutCubic
+                            }
+                            NumberAnimation {
+                                target: gameEnterShift; property: "y"
+                                to: 0; duration: 380; easing.type: Easing.OutCubic
+                            }
+                        }
+                    }
 
                     // Started by the card's own PLAY button and, for the pad,
                     // by root.controllerPlay() reaching through currentItem --
@@ -1121,7 +1256,9 @@ Window {
                     // root.controllerOptions() reaching through currentItem.
                     function openTileMenu() {
                         tileMenu.openFor(overflowButton, gameDelegate.liveName,
-                                         gameDelegate.modelData.installDir || "")
+                                         gameDelegate.modelData.installDir || "",
+                                         gameDelegate.launchable,
+                                         gameDelegate.sourceLabel === "Local")
                     }
 
                     Column {
@@ -1311,24 +1448,30 @@ Window {
                                     // without it.
                                     visible: gameDelegate.launchable
 
-                                    color: playButton.hovered ? Theme.bgPressed : Theme.accent
+                                    color: playButton.hovered ? Theme.playHover : Theme.accent
                                     Behavior on color { ColorAnimation { duration: 120 } }
 
                                     Row {
                                         anchors.centerIn: parent
                                         spacing: 7
 
-                                        Text {
+                                        // Same asset as the details pages' PLAY.
+                                        // Decoded at twice the drawn size so it
+                                        // stays sharp on a scaled display.
+                                        Image {
                                             anchors.verticalCenter: parent.verticalCenter
-                                            text: "▶"
-                                            color: Theme.textInverse
-                                            font.pixelSize: 10
+                                            source: playButton.hovered ? "assets/play_hover.png" : "assets/play.png"
+                                            sourceSize.width: 20
+                                            sourceSize.height: 20
+                                            width: 10; height: 10
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
                                         }
 
                                         Text {
                                             anchors.verticalCenter: parent.verticalCenter
                                             text: "PLAY"
-                                            color: Theme.textInverse
+                                            color: playButton.hovered ? Theme.textPrimary : Theme.textInverse
                                             font.pixelSize: 11
                                             font.bold: true
                                             font.letterSpacing: 1
@@ -1418,15 +1561,19 @@ Window {
 
                     MouseArea {
                         id: cardArea
-                        anchors.fill: parent; hoverEnabled: true
+                        anchors.fill: parent; anchors.margins: 8; hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
                             // Keep the pad's place in sync when both are in use.
                             if (root.padActive)
                                 gameGrid.currentIndex = gameDelegate.index
-                            detailPopup.launchOrigin =
-                                (root.activeTab === "Favorites" || root.activeTab === "Played")
-                                    ? root.activeTab : "Library"
+                            // Favorites and Played share this grid with the
+                            // library but open the Browse-style page.
+                            if (root.activeTab === "Favorites" || root.activeTab === "Played") {
+                                browseDetails.openForGame(gameDelegate.liveName, root.activeTab)
+                                return
+                            }
+                            detailPopup.launchOrigin = "Library"
                             detailPopup.selectedGameName = gameDelegate.liveName
                             detailPopup.open()
                         }
@@ -1575,6 +1722,7 @@ Window {
                     // ~200x larger than the unplayed library — and games the
                     // user could actually launch right now disappear.
                     Flickable {
+                        id: recommendationFlick
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         clip: true
@@ -1776,8 +1924,59 @@ Window {
                                                     && recommendationDelegate.isFocusedSection
                                                     && root.padInControl)
 
-                                            width: 240
+                                            // 256 for the hover scale's
+                                            // overhang, as in the library grid
+                                            // -- which also keeps the two tabs'
+                                            // columns lined up.
+                                            width: 256
                                             height: 448
+
+                                            // The tab pop-in, as on the library
+                                            // grid. Both sections sit in one
+                                            // Flickable and their grids never
+                                            // scroll, so the beat is counted
+                                            // from where the card is on screen
+                                            // rather than from its index.
+                                            transform: Translate { id: recommendationEnterShift }
+                                            function popIn() {
+                                                const shownY = sectionColumn.y + sectionGrid.y
+                                                               + recommendationDelegate.y
+                                                               - recommendationFlick.contentY
+                                                const slot = Math.floor(shownY / sectionGrid.cellHeight)
+                                                             * sectionGrid.columns
+                                                             + recommendationDelegate.index % sectionGrid.columns
+                                                recommendationEnterPause.duration =
+                                                    Math.max(0, Math.min(slot, 12)) * 40
+                                                recommendationEnterAnim.stop()
+                                                recommendationDelegate.opacity = 0
+                                                recommendationEnterShift.y = 18
+                                                recommendationEnterAnim.start()
+                                            }
+                                            Component.onCompleted: {
+                                                if (Date.now() - root.popStamp <= 250)
+                                                    recommendationDelegate.popIn()
+                                            }
+                                            Connections {
+                                                target: root
+                                                function onPopStampChanged() {
+                                                    if (root.activeTab === "Recommendations")
+                                                        recommendationDelegate.popIn()
+                                                }
+                                            }
+                                            SequentialAnimation {
+                                                id: recommendationEnterAnim
+                                                PauseAnimation { id: recommendationEnterPause }
+                                                ParallelAnimation {
+                                                    NumberAnimation {
+                                                        target: recommendationDelegate; property: "opacity"
+                                                        to: 1.0; duration: 380; easing.type: Easing.OutCubic
+                                                    }
+                                                    NumberAnimation {
+                                                        target: recommendationEnterShift; property: "y"
+                                                        to: 0; duration: 380; easing.type: Easing.OutCubic
+                                                    }
+                                                }
+                                            }
 
                                             // Top-anchored, not centred: the
                                             // reason line is one or two lines
@@ -1970,6 +2169,7 @@ Window {
                                             MouseArea {
                                                 id: recommendationArea
                                                 anchors.fill: parent
+                                                anchors.leftMargin: 8; anchors.rightMargin: 8
                                                 hoverEnabled: true
                                                 cursorShape: Qt.PointingHandCursor
                                                 // Opens the Browse-style page, owned or
@@ -2099,8 +2299,47 @@ Window {
 
                         // Same card as the library grid: 240x360 art in a
                         // 240x415 cell, so switching tabs doesn't resize them.
-                        width: 240
-                        height: 415
+                        // Padded to 256x431 for the hover scale, as there.
+                        width: 256
+                        height: 431
+
+                        // The search and tab pop-in, as on the library grid above.
+                        transform: Translate { id: wishlistEnterShift }
+                        function popIn() {
+                            const firstShown = Math.floor(wishlistGrid.contentY / wishlistGrid.cellHeight)
+                                               * wishlistGrid.columns
+                            wishlistEnterPause.duration =
+                                Math.max(0, Math.min(wishlistDelegate.index - firstShown, 12)) * 40
+                            wishlistEnterAnim.stop()
+                            wishlistDelegate.opacity = 0
+                            wishlistEnterShift.y = 18
+                            wishlistEnterAnim.start()
+                        }
+                        Component.onCompleted: {
+                            if (Date.now() - root.popStamp <= 250)
+                                wishlistDelegate.popIn()
+                        }
+                        Connections {
+                            target: root
+                            function onPopStampChanged() {
+                                if (root.activeTab === "Wishlist")
+                                    wishlistDelegate.popIn()
+                            }
+                        }
+                        SequentialAnimation {
+                            id: wishlistEnterAnim
+                            PauseAnimation { id: wishlistEnterPause }
+                            ParallelAnimation {
+                                NumberAnimation {
+                                    target: wishlistDelegate; property: "opacity"
+                                    to: 1.0; duration: 380; easing.type: Easing.OutCubic
+                                }
+                                NumberAnimation {
+                                    target: wishlistEnterShift; property: "y"
+                                    to: 0; duration: 380; easing.type: Easing.OutCubic
+                                }
+                            }
+                        }
 
                         Column {
                             anchors.centerIn: parent
@@ -2166,14 +2405,13 @@ Window {
                         MouseArea {
                             id: wishlistArea
                             anchors.fill: parent
+                            anchors.margins: 8
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 if (root.padActive)
                                     wishlistGrid.currentIndex = wishlistDelegate.index
-                                detailPopup.launchOrigin = "Wishlist"
-                                detailPopup.selectedGameName = wishlistDelegate.modelData.name
-                                detailPopup.open()
+                                browseDetails.openForGame(wishlistDelegate.modelData.name, "Wishlist")
                             }
                         }
                     }

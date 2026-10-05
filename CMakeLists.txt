@@ -100,7 +100,9 @@ qt_add_qml_module(VortexLauncher
         ui/SearchField.qml
         ui/BrowsePage.qml
         ui/BrowseDetails.qml
+        ui/FrostedHero.qml
         ui/LoadingBar.qml
+        ui/HeartIcon.qml
     RESOURCES
         ui/assets/steam.png
         ui/assets/local.png
@@ -108,11 +110,14 @@ qt_add_qml_module(VortexLauncher
         ui/assets/thumb_down.png
         ui/assets/arrow_left.png
         ui/assets/arrow_right.png
+        ui/assets/close.png
         ui/assets/trash.png
         ui/assets/trash_open.png
         ui/assets/play.png
+        ui/assets/play_hover.png
         ui/assets/quit.png
         ui/assets/quit_hover.png
+        ui/assets/settings_roll.png
 )
 
 # 6. Link everything
@@ -124,7 +129,7 @@ target_link_libraries(VortexLauncher PRIVATE
     Qt6::Quick
     Qt6::QuickControls2
     Qt6::QuickDialogs2
-    # MultiEffect, for the blurred details-page banner in GameDetails.qml.
+    # MultiEffect, for the frosted details-page banner in FrostedHero.qml.
     Qt6::QuickEffects
     # RadialGradient behind each Steam review card in BrowseDetails.qml.
     Qt6::QuickShapes

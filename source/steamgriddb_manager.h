@@ -24,6 +24,18 @@ void ensure_steamgriddb_images(const std::vector<std::string>& game_names,
                                const std::string& images_root,
                                const SgdbProgressFn& on_progress = nullptr);
 
+// Steam's own library_hero.jpg for Steam games whose hero folder is still
+// empty after ensure_steamgriddb_images() -- SteamGridDB has no hero for some
+// games Steam itself does. Needs no API key. Run it after the SteamGridDB pass
+// so a SteamGridDB hero, when there is one, keeps priority. A 404 is stamped
+// in the same state file and not retried for a week. Blocking.
+struct SteamHeroRequest {
+  std::string name;
+  int app_id = 0;
+};
+void ensure_steam_hero_fallback(const std::vector<SteamHeroRequest>& games,
+                                const std::string& images_root);
+
 // Folder name (without the images_root prefix) that holds a game's artwork:
 // "<sanitized game name>_img". Callers that need to find or delete artwork
 // should use this rather than re-deriving the name.

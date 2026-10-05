@@ -58,6 +58,16 @@ long long get_baseline_playtime(const std::string& game_key);
 bool import_steam_baseline(const std::string& game_key, const std::string& game_name,
                            long long steam_seconds);
 
+// Moves a game's playtime from old_key to new_key, in both the stats file and
+// the sessions log, and stamps new_name on the row.
+//
+// For a rename: the new title can resolve to a different IGDB id, which changes
+// the key, and without this the hours stay filed under a key nothing reads any
+// more. A row already under new_key is added to, not replaced. With equal keys
+// only the name is updated. Returns true when anything was written.
+bool rekey_play_stats(const std::string& old_key, const std::string& new_key,
+                      const std::string& new_name);
+
 // True when the user has asked for Steam's own lifetime total to be displayed
 // instead of the one Vortex keeps. Read from settings.json, which the UI owns;
 // the CLI reads the same file through here so the two cannot disagree about

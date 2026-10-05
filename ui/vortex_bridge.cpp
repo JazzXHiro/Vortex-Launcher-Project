@@ -140,6 +140,83 @@ static void writeLocalGameDirectories(const std::vector<fs::path> &dirs,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// name_overrides.txt — titles the user typed over the scanned ones.
+//
+// "INSTALL_DIR|NAME", appended to and last-line-wins like exe_cache.txt, with an
+// empty NAME putting the scanned title back. Keyed by install directory because
+// that is fixed in pass 1, where the name is exactly what is being replaced.
+// A pipe rather than exe_cache's '=' because Windows paths may hold '=' but
+// never '|', so the first pipe always ends the path whatever the title holds.
+// ─────────────────────────────────────────────────────────────────────────────
+static fs::path nameOverridesPath() {
+    return app_data_path("name_overrides.txt");
+}
+
+static QString overrideKey(const fs::path &installDir) {
+    return QString::fromStdString(installDir.string()).toLower();
+}
+
+static QHash<QString, std::string> readNameOverrides() {
+    QHash<QString, std::string> overrides;
+    std::ifstream file(nameOverridesPath());
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        const size_t pipe = line.find('|');
+        if (pipe == std::string::npos || pipe == 0) continue;
+
+        const QString key = overrideKey(fs::path(line.substr(0, pipe)));
+        const std::string name = trimCopy(line.substr(pipe + 1));
+        if (name.empty())
+            overrides.remove(key);
+        else
+            overrides.insert(key, name);
+    }
+    return overrides;
+}
+
+static bool appendNameOverride(const fs::path &installDir, const std::string &name) {
+    const fs::path path = nameOverridesPath();
+    const bool fresh = !fs::exists(path);
+    std::ofstream out(path, std::ios::app);
+    if (!out.is_open()) return false;
+    if (fresh)
+        out << "# Vortex Name Overrides\n# Format: INSTALL_DIR|NAME (empty NAME = scanned name)\n";
+    out << installDir.string() << "|" << name << "\n";
+    return static_cast<bool>(out);
+}
+
+// One game's IGDB lookup, shared by the scan's pass 2 and renameGame().
+//
+// A renamed game is searched by the user's title alone -- not by appid, not by
+// folder -- since putting a better search term in is the point of renaming, and
+// its title is never swapped for IGDB's spelling.
+static void resolveIgdb(BridgeGame &bg) {
+    IgdbGameInfo info;
+    if (!bg.customName.empty())
+        info = igdb_resolve_game(bg.name, false);
+    else if (bg.source == "Steam")
+        info = igdb_resolve_game(bg.name, false, bg.appid);
+    else
+        info = igdb_resolve_game(bg.installDir.filename().string());
+
+    if (info.id <= 0) {
+        // A renamed game that IGDB has no answer for must not keep the id its
+        // old title resolved to -- that is the wrong game's metadata.
+        if (!bg.customName.empty()) bg.igdb_id = 0;
+        return;
+    }
+
+    bg.igdb_id = info.id;
+    // The canonical IGDB title replaces the folder name for local games. Steam
+    // store names are already presentable, so those are left alone rather than
+    // swapping in a subtly different spelling under the user mid-scan.
+    if (bg.customName.empty() && bg.source != "Steam" && !info.name.empty())
+        bg.name = info.name;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 void VortexBridge::setLoading(bool val) {
@@ -1016,6 +1093,12 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     game["coverPath"]  = findImagePath(gameDir, "grid");
     game["heroPath"]   = findImagePath(gameDir, "hero");
     game["logoPath"]   = findImagePath(gameDir, "logo");
+    // No hero anywhere: the cover stands in, which FrostedHero recognises as
+    // portrait and blurs into a tinted backdrop. Without it a game that has a
+    // logo got bare fill behind it, since the centred cover only shows when
+    // there is no logo.
+    if (game["heroPath"].toString().isEmpty())
+        game["heroPath"] = game["coverPath"];
 
     // One read of the stats file, not one per figure -- this runs for every row
     // on every list rebuild, and twice per game during a scan.
@@ -1554,6 +1637,7 @@ void VortexBridge::resolveLiveArtwork(const QString &name, bool urgent) {
         return;
     }
     m_liveArtAsked.insert(key);
+    m_liveArtPending.insert(key);
     if (urgent)
         m_liveArtQueue.prepend(name);
     else
@@ -1595,6 +1679,8 @@ void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art
     QVariantMap row = findGameByName(m_recommendationList, name);
     if (row.isEmpty())
         row = savedRowFor(name);
+    if (row.isEmpty())
+        row = findGameByName(m_browseSnapshots, name);   // a Discover page's game
     const int appId = row.value("steamAppId").toInt();
 
     QList<QPair<QString, QString>> probes;   // art key -> URL
@@ -1654,6 +1740,8 @@ void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art
 // needs the emit.
 void VortexBridge::applyLiveArtwork(const QString &name, const QVariantMap &art,
                                     bool definitive) {
+    m_liveArtPending.remove(liveArtKey(name));
+
     // Only a complete answer is cached; anything less is asked again on the
     // next launch, with the fallback URLs showing meanwhile.
     if (definitive) {
@@ -1711,6 +1799,22 @@ void VortexBridge::applyLiveArtwork(const QString &name, const QVariantMap &art,
         savePlayedLedger();
         emit playedGamesChanged();
     }
+    // Read only when one is wishlisted or hearted, so nothing to emit.
+    apply(m_browseSnapshots);
+
+    // An open Discover page on this game: whatever arrived goes up, and the
+    // wait is over either way, so IGDB's banner may stand in for the rest.
+    if (QString::compare(m_browseDetails.value("name").toString(), name,
+                         Qt::CaseInsensitive) == 0) {
+        const QString hero = art.value("liveHeroUrl").toString();
+        const QString logo = art.value("liveLogoUrl").toString();
+        if (!hero.isEmpty())
+            m_browseDetails["bannerUrl"] = hero;
+        if (!logo.isEmpty())
+            m_browseDetails["logoUrl"] = logo;
+        m_browseDetails["artPending"] = false;
+        emit browseDetailsChanged();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1721,10 +1825,15 @@ QVariantList VortexBridge::favoriteGames() const {
     // sets `status` from get_game_preference().
     QVariantList list;
     QSet<QString> seen;
+    //
+    // Every row says whether it is installed, the way playedGames() does: the
+    // card's PLAY button reads it, and this list mixes library rows with ones
+    // that have nothing on the disk to launch.
     for (const QVariant &entry : m_gameList) {
-        const QVariantMap game = entry.toMap();
+        QVariantMap game = entry.toMap();
         if (game.value("status").toDouble() > 0.0) {
-            list << entry;
+            game["installed"] = true;
+            list << game;
             seen.insert(game.value("name").toString().toLower());
         }
     }
@@ -1779,12 +1888,14 @@ QVariantList VortexBridge::favoriteGames() const {
             // send the next heart click to toggle_game_preference() under a
             // name it has never seen, which writes a second entry instead of
             // clearing the first -- the game would refuse to unlike.
+            // `installed` comes with the played row as playedGames() set it.
             played["name"]   = name;
             played["status"] = 1.0;
             list << played;
             continue;
         }
 
+        snapshot["installed"] = false;
         list << snapshot;
     }
     return list;
@@ -2891,6 +3002,13 @@ void VortexBridge::loadBrowseDetails(qlonglong igdbId) {
         if (!seed.isEmpty())
             break;
     }
+    // The grid row carries genres pre-joined; the page reads them as a list.
+    if (seed.value("genres").typeId() == QMetaType::QString) {
+        QStringList genres;
+        for (const QString &genre : seed.value("genres").toString().split(',', Qt::SkipEmptyParts))
+            genres << genre.trimmed();
+        seed["genres"] = genres;
+    }
     seed["igdbId"] = igdbId;
     m_browseDetails = seed;
     m_browseDetailsLoading = true;
@@ -2996,7 +3114,8 @@ void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
     const std::string gameBody =
         "fields id,name,summary,storyline,first_release_date,"
         "total_rating,total_rating_count,aggregated_rating,aggregated_rating_count,"
-        "rating,rating_count,cover.image_id,screenshots.image_id,artworks.image_id,"
+        "rating,rating_count,cover.image_id,screenshots.image_id,"
+        "artworks.image_id,artworks.width,artworks.height,"
         "genres.name,themes.name,game_modes.name,player_perspectives.name,"
         "platforms.name,involved_companies.company.name,"
         "involved_companies.developer,involved_companies.publisher,"
@@ -3097,12 +3216,19 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
     }
     d["screenshots"] = screenshots;
 
-    // Artworks are key art made for banners; screenshots are the fallback,
-    // and both are landscape, unlike the cover GameDetails has to blur.
+    // IGDB's banner, the last resort after SteamGridDB and Steam's CDN. Its
+    // artworks are community uploads of any shape -- Portal 2's first is its
+    // square icon -- so only a genuinely wide one counts, by FrostedHero's
+    // 1.6 test; screenshots are the fallback.
     QString heroUrl;
-    const QJsonArray artworks = game.value("artworks").toArray();
-    if (!artworks.isEmpty())
-        heroUrl = igdbImageUrl(artworks.at(0).toObject().value("image_id").toString(), "1080p");
+    for (const QJsonValue &entry : game.value("artworks").toArray()) {
+        const QJsonObject artwork = entry.toObject();
+        if (artwork.value("width").toInt() > artwork.value("height").toInt() * 1.6) {
+            heroUrl = igdbImageUrl(artwork.value("image_id").toString(), "1080p");
+            if (!heroUrl.isEmpty())
+                break;
+        }
+    }
     if (heroUrl.isEmpty() && !screenshots.isEmpty())
         heroUrl = screenshots.first().toMap().value("full").toString();
     d["heroUrl"] = heroUrl;
@@ -3130,6 +3256,26 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
     // hearts and the played ledger are keyed on the library's own name.
     const QVariantMap owned = findGameByName(m_gameList, name);
     d["ownedName"] = owned.value("name").toString();
+
+    // The banner and logo ahead of IGDB's: an owned game's own Images/ art,
+    // else the live lookup's -- SteamGridDB, then Steam's CDN for a Steam
+    // game. Until that answers, artPending keeps IGDB's banner off screen so
+    // it is not shown only to be swapped out.
+    const QString key = liveArtKey(name);
+    bool lookUp = false;
+    if (!owned.isEmpty()) {
+        d["bannerUrl"] = owned.value("heroPath").toString();
+        d["logoUrl"]   = owned.value("logoPath").toString();
+    } else {
+        const auto cached = m_liveArtCache.constFind(key);
+        if (cached != m_liveArtCache.constEnd()) {
+            d["bannerUrl"] = cached.value().value("liveHeroUrl").toString();
+            d["logoUrl"]   = cached.value().value("liveLogoUrl").toString();
+        }
+        lookUp = !name.isEmpty() && !liveArtCacheIsFresh(name);
+    }
+    d["artPending"] = lookUp
+        && (m_liveArtPending.contains(key) || !m_liveArtAsked.contains(key));
 
     m_browseDetails = d;
     emit browseDetailsChanged();
@@ -3170,6 +3316,10 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
     }
     if (!replaced)
         m_browseSnapshots << snapshot;
+
+    // After the snapshot is in, so finishLiveArtwork() finds its Steam app id.
+    if (lookUp)
+        resolveLiveArtwork(name, true);
 
     QVariantMap meta;
     meta["igdbId"]     = igdbId;
@@ -3430,7 +3580,11 @@ void VortexBridge::loadGames() {
     // folder added from the settings panel) is queued instead of dropped --
     // otherwise the in-flight scan, which started before the new folder was
     // written, would leave those games missing until the next launch.
-    if (m_isLoading) {
+    //
+    // A rename still resolving holds the scan back the same way: its playtime
+    // rekey has to land before the Steam baseline import below looks for a row
+    // under the new key, or Steam's total is imported a second time.
+    if (m_isLoading || m_renamesInFlight > 0) {
         m_rescanQueued = true;
         return;
     }
@@ -3486,6 +3640,19 @@ void VortexBridge::loadGames() {
         // updateGameRow() writes m_gameList by position, so m_internalGames and
         // m_gameList have to stay index-parallel, and they only do if both are
         // built from the same filtered set.
+        // The user's own titles go on here, in pass 1, so every pass after it
+        // -- the IGDB search, the SteamGridDB search, the artwork folder --
+        // works from the name the user chose.
+        const QHash<QString, std::string> overrides = readNameOverrides();
+        auto applyOverride = [&overrides](BridgeGame &bg) {
+            bg.scannedName = bg.name;
+            const auto it = overrides.constFind(overrideKey(bg.installDir));
+            if (it != overrides.constEnd()) {
+                bg.name       = *it;
+                bg.customName = *it;
+            }
+        };
+
         std::vector<BridgeGame> internalGames;
         for (const SteamGame &g : steamGames) {
             BridgeGame bg;
@@ -3495,6 +3662,7 @@ void VortexBridge::loadGames() {
             bg.igdb_id    = g.igdb_id;
             bg.installDir = g.installDir;
             if (isRemovedIn(removedSnapshot, bg)) continue;
+            applyOverride(bg);
             internalGames.push_back(std::move(bg));
         }
         for (const temp_GameEntry &g : localEntries) {
@@ -3505,6 +3673,7 @@ void VortexBridge::loadGames() {
             bg.installDir = g.installDir;
             bg.gamePath   = g.gamePath;
             if (isRemovedIn(removedSnapshot, bg)) continue;
+            applyOverride(bg);
             internalGames.push_back(std::move(bg));
         }
 
@@ -3539,22 +3708,7 @@ void VortexBridge::loadGames() {
 
         for (int i = 0; i < total; ++i) {
             BridgeGame &bg = internalGames[i];
-
-            IgdbGameInfo info =
-                (bg.source == "Steam")
-                    ? igdb_resolve_game(bg.name, false, bg.appid)
-                    : igdb_resolve_game(bg.installDir.filename().string());
-
-            if (info.id > 0) {
-                bg.igdb_id = info.id;
-                // The canonical IGDB title replaces the folder name for local
-                // games. Steam store names are already presentable, so those
-                // are left alone rather than swapping in a subtly different
-                // spelling under the user mid-scan.
-                if (bg.source != "Steam" && !info.name.empty())
-                    bg.name = info.name;
-            }
-
+            resolveIgdb(bg);
             updateGameRow(i, bg);
             reportScanProgress("Fetching details", i + 1, total);
         }
@@ -3610,6 +3764,16 @@ void VortexBridge::loadGames() {
                 [this](int done, int count, const std::string &) {
                     reportScanProgress("Downloading artwork", done, count);
                 });
+        }
+
+        // SteamGridDB has no hero for some games that Steam itself ships one
+        // for, which left their banner as bare fill behind the logo.
+        {
+            std::vector<SteamHeroRequest> steamHeroes;
+            for (const BridgeGame &bg : internalGames)
+                if (bg.source == "Steam" && bg.appid > 0)
+                    steamHeroes.push_back({ bg.name, bg.appid });
+            ensure_steam_hero_fallback(steamHeroes, imagesRoot.string());
         }
 
         {
@@ -4263,6 +4427,133 @@ QString VortexBridge::setGameExecutable(QString installDir, QString exeUrl) {
         return newPath;
     }
     return QString();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// renameGame — the user's title becomes the game's name from here on.
+//
+// Two halves. Synchronously: record the override, retitle the row in place and
+// carry the heart across, so the page and the grid show the new name at once.
+// Then, off the UI thread: resolve the new title against IGDB and fetch its
+// SteamGridDB art, which is the reason to rename at all -- and once that lands,
+// move the playtime if the new IGDB id changed the key it is filed under.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Moves a heart from one title to another; preferences.json is keyed by name.
+static void moveFavorite(const std::string &from, const std::string &to) {
+    if (from == to || get_game_preference(from) <= 0.0) return;
+    toggle_game_preference(from, 1.0);   // matches the current score: clears it
+    if (get_game_preference(to) <= 0.0)
+        toggle_game_preference(to, 1.0);
+}
+
+bool VortexBridge::renameGame(QString installDir, QString newName) {
+    // The scan holds its own copy of every row and writes them back by
+    // position; a rename under it would be overwritten by the old title.
+    if (m_isLoading || installDir.isEmpty())
+        return false;
+
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(m_internalGames.size()); ++i) {
+        if (QString::compare(QString::fromStdString(m_internalGames[i].installDir.string()),
+                             installDir, Qt::CaseInsensitive) == 0) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0)
+        return false;
+
+    BridgeGame &bg = m_internalGames[index];
+    std::string name = newName.simplified().toStdString();
+    // Empty, or the scanned title typed back in, is a revert.
+    const bool revert = name.empty() || name == bg.scannedName;
+    if (revert)
+        name = bg.scannedName.empty() ? bg.name : bg.scannedName;
+    if (name == bg.name && (revert ? bg.customName.empty() : bg.customName == name))
+        return true;   // nothing to do
+
+    if (!appendNameOverride(bg.installDir, revert ? std::string() : name))
+        return false;
+
+    const std::string oldName = bg.name;
+    const std::string oldKey  = makePtKey(bg);
+    bg.name       = name;
+    bg.customName = revert ? std::string() : name;
+    moveFavorite(oldName, name);
+
+    if (index < m_gameList.size())
+        m_gameList[index] = buildGameMap(bg);
+    scheduleArtNotify();
+    emit favoritesChanged();
+    emit gameRowChanged(installDir);
+    vlog::line("Library", oldName + " renamed to " + name
+                          + (revert ? " (scanned name restored)" : ""));
+
+    ++m_renamesInFlight;
+    const BridgeGame snapshot   = bg;
+    const fs::path   imagesRoot = m_baseDir / "Images";
+    QThread *thread = QThread::create([this, snapshot, imagesRoot, oldKey, installDir]() {
+        BridgeGame resolved = snapshot;
+        resolveIgdb(resolved);
+
+        ensure_steamgriddb_images({ resolved.name }, imagesRoot.string());
+        if (resolved.source == "Steam" && resolved.appid > 0)
+            ensure_steam_hero_fallback({ { resolved.name, resolved.appid } },
+                                       imagesRoot.string());
+
+        QMetaObject::invokeMethod(this, [this, resolved, oldKey, installDir]() {
+            --m_renamesInFlight;
+
+            int at = -1;
+            for (int i = 0; i < static_cast<int>(m_internalGames.size()); ++i) {
+                if (QString::compare(QString::fromStdString(m_internalGames[i].installDir.string()),
+                                     installDir, Qt::CaseInsensitive) == 0) {
+                    at = i;
+                    break;
+                }
+            }
+
+            // A later rename of the same game supersedes this one; its own
+            // completion does the bookkeeping for the title that stuck.
+            if (at >= 0 && m_internalGames[at].customName == resolved.customName) {
+                BridgeGame &live = m_internalGames[at];
+                const std::string shownName = live.name;
+                live.igdb_id = resolved.igdb_id;
+                live.name    = resolved.name;   // a revert can take IGDB's spelling
+                moveFavorite(shownName, live.name);
+
+                const std::string newKey = makePtKey(live);
+                rekey_play_stats(oldKey, newKey, live.name);
+                if (newKey != oldKey) {
+                    // The hours moved to the new key; a ledger row left on the
+                    // old one would show up as a second, uninstalled game.
+                    const QString stale = QString::fromStdString(oldKey);
+                    for (int i = m_playedLedger.size() - 1; i >= 0; --i) {
+                        if (m_playedLedger[i].toMap().value("key").toString() == stale)
+                            m_playedLedger.removeAt(i);
+                    }
+                    savePlayedLedger();
+                }
+
+                if (at < m_gameList.size())
+                    m_gameList[at] = buildGameMap(live);
+                syncPlayedLedger();
+                scheduleArtNotify();
+                emit favoritesChanged();
+                emit gameRowChanged(installDir);
+                loadRecommendations();
+            }
+
+            if (m_renamesInFlight == 0 && m_rescanQueued) {
+                m_rescanQueued = false;
+                loadGames();
+            }
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

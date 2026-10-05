@@ -293,6 +293,61 @@ bool import_steam_baseline(const std::string& game_key, const std::string& game_
     return false;
 }
 
+bool rekey_play_stats(const std::string& old_key, const std::string& new_key,
+                      const std::string& new_name) {
+    if (old_key.empty() || new_key.empty()) return false;
+
+    auto stats = load_stats();
+    auto it = stats.find(old_key);
+    if (it == stats.end()) return false;
+
+    if (old_key == new_key) {
+        if (new_name.empty() || it->second.name == new_name) return false;
+        it->second.name = new_name;
+        save_stats(stats);
+        return true;
+    }
+
+    // Added rather than overwritten: a row already under the new key is play
+    // that happened too, and dropping either side would lose hours.
+    const StatEntry moved = it->second;
+    stats.erase(it);
+    StatEntry &dest = stats[new_key];
+    dest.time     += moved.time;
+    dest.idle     += moved.idle;
+    dest.baseline += moved.baseline;
+    dest.name      = new_name.empty() ? moved.name : new_name;
+    save_stats(stats);
+
+    // The sessions log is keyed the same way, and getLastPlayedDate() and
+    // sync_local_data.py both read it by key -- leaving it behind would show
+    // the hours with "Never" beside them. Through a temporary, so a failed
+    // write cannot truncate the only history there is.
+    const fs::path sessions_path = get_sessions_file_path();
+    std::ifstream in(sessions_path);
+    if (!in.is_open()) return true;
+
+    const fs::path temp_path = sessions_path.string() + ".tmp";
+    {
+        std::ofstream out(temp_path, std::ios::trunc);
+        if (!out.is_open()) return true;
+
+        const std::string prefix = old_key + " |";
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.compare(0, prefix.size(), prefix) == 0)
+                line = new_key + line.substr(old_key.size());
+            out << line << "\n";
+        }
+    }
+    in.close();
+
+    std::error_code ec;
+    fs::rename(temp_path, sessions_path, ec);
+    if (ec) fs::remove(temp_path, ec);
+    return true;
+}
+
 // Scans settings.json for one boolean. A full JSON parser would be the third in
 // this codebase and the UI already owns writing the file; all that is needed
 // here is agreement with it on a single key.

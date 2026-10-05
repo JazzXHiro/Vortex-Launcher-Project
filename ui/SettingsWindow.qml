@@ -163,6 +163,7 @@ Popup {
                                 id: sectionArea
                                 anchors.fill: parent
                                 hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
                                 onClicked: {
                                     // A row armed on the Directories page must not
                                     // still be armed when the user returns to it.
@@ -194,6 +195,7 @@ Popup {
                     id: closeArea
                     anchors.fill: parent
                     hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
                     onClicked: settingsRoot.close()
                 }
             }
@@ -312,6 +314,7 @@ Popup {
                                                 id: confirmArea
                                                 anchors.fill: parent
                                                 hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
                                                 onClicked: {
                                                     settingsRoot.armedIndex = -1;
                                                     settingsRoot.statusMessage = "Removing folder and cleaning up artwork…";
@@ -334,6 +337,7 @@ Popup {
                                                 id: cancelArea
                                                 anchors.fill: parent
                                                 hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
                                                 onClicked: settingsRoot.armedIndex = -1
                                             }
                                         }
@@ -358,6 +362,7 @@ Popup {
                                             id: removeArea
                                             anchors.fill: parent
                                             hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
                                             onClicked: settingsRoot.armedIndex = dirRow.index
                                         }
                                     }
@@ -385,6 +390,7 @@ Popup {
                                     id: addDirArea
                                     anchors.fill: parent
                                     hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
                                     onClicked: settingsRoot.requestAddDirectory()
                                 }
                             }
@@ -509,6 +515,7 @@ Popup {
                                             id: restoreArea
                                             anchors.fill: parent
                                             hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
                                             onClicked: {
                                                 if (!settingsRoot.api) return;
                                                 // Restoring rescans the disk, so
@@ -573,6 +580,8 @@ Popup {
                             // change on a whim.
                             ComboBox {
                                 id: moodPicker
+
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
 
                                 Layout.fillWidth: true
                                 Layout.maximumWidth: 260
@@ -644,6 +653,8 @@ Popup {
 
                                 delegate: ItemDelegate {
                                     id: moodItem
+
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
                                     required property int index
                                     required property var modelData
 
@@ -739,6 +750,8 @@ Popup {
                                 Switch {
                                     id: curatedSwitch
 
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+
                                     Layout.alignment: Qt.AlignTop
                                     padding: 0
                                     implicitWidth: 52
@@ -828,6 +841,8 @@ Popup {
                                 Switch {
                                     id: ignorePlayedSwitch
 
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+
                                     Layout.alignment: Qt.AlignTop
                                     padding: 0
                                     implicitWidth: 52
@@ -907,6 +922,8 @@ Popup {
 
                                 Switch {
                                     id: ignoreLikedSwitch
+
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
 
                                     Layout.alignment: Qt.AlignTop
                                     padding: 0
@@ -1001,6 +1018,8 @@ Popup {
 
                                 Switch {
                                     id: steamPlaytimeSwitch
+
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
 
                                     Layout.alignment: Qt.AlignTop
                                     padding: 0

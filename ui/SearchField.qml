@@ -49,6 +49,29 @@ Rectangle {
         onClicked: input.forceActiveFocus()
     }
 
+    // TextInput keeps the keyboard until something else asks for it, and the
+    // launcher's MouseAreas never do, so a click elsewhere left the caret
+    // here. This sits above the whole window and only watches: a press
+    // outside the pill lets go of the keyboard, and the click still lands on
+    // whatever was under it.
+    Item {
+        parent: field.Window.contentItem
+        anchors.fill: parent
+        z: 1000000
+        enabled: input.activeFocus
+
+        PointHandler {
+            acceptedButtons: Qt.AllButtons
+            onActiveChanged: {
+                if (!active)
+                    return
+                const p = field.mapFromItem(null, point.scenePressPosition)
+                if (!field.contains(p))
+                    input.focus = false
+            }
+        }
+    }
+
     Text {
         id: icon
         anchors { left: parent.left; leftMargin: 14; verticalCenter: parent.verticalCenter }

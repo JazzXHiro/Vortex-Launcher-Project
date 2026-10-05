@@ -2,6 +2,7 @@
 #include "json_text.h"
 #include "game_manager.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <ctime>
@@ -17,7 +18,11 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winhttp.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 #endif
 
 using std::string;
@@ -143,6 +148,146 @@ static bool download_file(const string &url, const fs::path &dest_path) {
 #endif
 }
 
+// SteamGridDB serves some logos at absurd sizes -- Apex Legends' is 12480x7857,
+// which decodes to ~390 MB. Qt refuses anything over 256 MB, so the details
+// page got an Image.Error and an empty space where the logo should be. The
+// widest the logo is ever drawn is 40% of a full-screen banner, so anything
+// past this edge is pure waste.
+static constexpr unsigned kLogoMaxEdge = 1600;
+
+// Scales the image at path down in place so neither side exceeds max_edge,
+// keeping its container format. Only the header is read when the image is
+// already small enough, so this is cheap to run over the cache every scan.
+// Returns true when the file was rewritten.
+static bool shrink_image_file(const fs::path &path, unsigned max_edge,
+                              unsigned *old_w, unsigned *old_h,
+                              unsigned *new_w, unsigned *new_h) {
+#ifdef _WIN32
+  using Microsoft::WRL::ComPtr;
+
+  // The scan runs on a worker thread nobody has initialised COM on. If the
+  // caller already did, as a single-threaded apartment, WIC works there too;
+  // only balance the call that actually succeeded.
+  const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  struct CoGuard {
+    bool active;
+    ~CoGuard() {
+      if (active)
+        CoUninitialize();
+    }
+  } co_guard{SUCCEEDED(co)};
+
+  const fs::path tmp_path = path.string() + ".tmp";
+  bool wrote = false;
+  {
+    ComPtr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))))
+      return false;
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(factory->CreateDecoderFromFilename(
+            path.wstring().c_str(), nullptr, GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand, &decoder)))
+      return false;
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    UINT w = 0, h = 0;
+    if (FAILED(decoder->GetFrame(0, &frame)) || FAILED(frame->GetSize(&w, &h)) ||
+        w == 0 || h == 0)
+      return false;
+    if (w <= max_edge && h <= max_edge)
+      return false;
+
+    const double scale = static_cast<double>(max_edge) / (w > h ? w : h);
+    const UINT sw = (std::max)(1u, static_cast<UINT>(w * scale + 0.5));
+    const UINT sh = (std::max)(1u, static_cast<UINT>(h * scale + 0.5));
+
+    // A logo is usually a palette PNG; convert to plain BGRA (or BGR for a
+    // JPEG, which has no alpha) before scaling so transparency survives and
+    // the scaler gets a format it can interpolate.
+    GUID container = {};
+    if (FAILED(decoder->GetContainerFormat(&container)))
+      return false;
+    const bool is_jpeg = container == GUID_ContainerFormatJpeg;
+    WICPixelFormatGUID pixel_format =
+        is_jpeg ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA;
+
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(frame.Get(), pixel_format,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom)))
+      return false;
+
+    // Fant is WIC's area-averaging mode, the right one for a large reduction.
+    ComPtr<IWICBitmapScaler> scaler;
+    if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+        FAILED(scaler->Initialize(converter.Get(), sw, sh,
+                                  WICBitmapInterpolationModeFant)))
+      return false;
+
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> out_frame;
+    if (FAILED(factory->CreateStream(&stream)) ||
+        FAILED(stream->InitializeFromFilename(tmp_path.wstring().c_str(),
+                                              GENERIC_WRITE)) ||
+        FAILED(factory->CreateEncoder(
+            is_jpeg ? GUID_ContainerFormatJpeg : GUID_ContainerFormatPng,
+            nullptr, &encoder)) ||
+        FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->CreateNewFrame(&out_frame, nullptr)) ||
+        FAILED(out_frame->Initialize(nullptr)) ||
+        FAILED(out_frame->SetSize(sw, sh)) ||
+        FAILED(out_frame->SetPixelFormat(&pixel_format)) ||
+        FAILED(out_frame->WriteSource(scaler.Get(), nullptr)) ||
+        FAILED(out_frame->Commit()) || FAILED(encoder->Commit()))
+      wrote = false;
+    else
+      wrote = true;
+
+    if (old_w) *old_w = w;
+    if (old_h) *old_h = h;
+    if (new_w) *new_w = sw;
+    if (new_h) *new_h = sh;
+  } // every WIC object released here, so neither file is still held open
+
+  std::error_code ec;
+  if (!wrote) {
+    fs::remove(tmp_path, ec);
+    return false;
+  }
+  fs::rename(tmp_path, path, ec);
+  if (ec) {
+    fs::remove(tmp_path, ec);
+    return false;
+  }
+  return true;
+#else
+  (void)path; (void)max_edge;
+  (void)old_w; (void)old_h; (void)new_w; (void)new_h;
+  return false;
+#endif
+}
+
+// Brings an oversized logo in logo_dir down to kLogoMaxEdge, whether it was
+// just downloaded or has been sitting in the cache since before this existed.
+static void shrink_cached_logo(const fs::path &logo_dir, const string &name) {
+  for (const char *ext : {".png", ".jpg", ".jpeg"}) {
+    const fs::path file = logo_dir / (string("logo") + ext);
+    std::error_code ec;
+    if (!fs::exists(file, ec))
+      continue;
+    unsigned ow = 0, oh = 0, nw = 0, nh = 0;
+    if (shrink_image_file(file, kLogoMaxEdge, &ow, &oh, &nw, &nh))
+      vlog::item("SteamGridDB", name, vlog::Status::Ok,
+                 "shrank logo " + std::to_string(ow) + "x" + std::to_string(oh) +
+                     " -> " + std::to_string(nw) + "x" + std::to_string(nh));
+    return;
+  }
+}
+
 static string extract_json_value(const string &json, const string &key,
                                  bool is_number = false) {
   string search_key = "\"" + key + "\":";
@@ -251,6 +396,7 @@ struct SgdbState {
   std::time_t grid = 0;   // last query that yielded no usable grid
   std::time_t logo = 0;
   std::time_t hero = 0;
+  std::time_t steam_hero = 0; // last time Steam's CDN had no library_hero.jpg
 };
 
 // A stamp in the future (the clock moved backwards between runs) counts as
@@ -286,6 +432,8 @@ static SgdbState load_sgdb_state(const fs::path &game_img_dir) {
       state.logo = value;
     else if (key == "hero")
       state.hero = value;
+    else if (key == "steam_hero")
+      state.steam_hero = value;
   }
   return state;
 }
@@ -303,7 +451,8 @@ static void save_sgdb_state(const fs::path &game_img_dir,
   out << "search=" << static_cast<long long>(state.search) << "\n"
       << "grid=" << static_cast<long long>(state.grid) << "\n"
       << "logo=" << static_cast<long long>(state.logo) << "\n"
-      << "hero=" << static_cast<long long>(state.hero) << "\n";
+      << "hero=" << static_cast<long long>(state.hero) << "\n"
+      << "steam_hero=" << static_cast<long long>(state.steam_hero) << "\n";
 }
 
 // ---------- credential probe --------------------------------------------
@@ -407,6 +556,10 @@ void ensure_steamgriddb_images(const std::vector<std::string> &game_names,
     bool need_logo = is_dir_empty(logo_dir) && !attempt_is_fresh(state.logo, now);
     bool need_hero = is_dir_empty(hero_dir) && !attempt_is_fresh(state.hero, now);
 
+    // A logo cached before oversized ones were shrunk on download.
+    if (!need_logo)
+      shrink_cached_logo(logo_dir, name);
+
     if (!need_grid && !need_logo && !need_hero) {
       ++n_cached;
       vlog::item("SteamGridDB", name, vlog::Status::Cached, "artwork already present");
@@ -507,6 +660,7 @@ void ensure_steamgriddb_images(const std::vector<std::string> &game_names,
           if (download_file(logo_url, file_path)) {
             downloaded.push_back("logo");
             got_logo = true;
+            shrink_cached_logo(logo_dir, name);
           }
         }
         state.logo = got_logo ? 0 : now;
@@ -571,6 +725,64 @@ void ensure_steamgriddb_images(const std::vector<std::string> &game_names,
   const double elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   vlog::phase_done("Artwork (SteamGridDB)", elapsed, n_ok, n_cached, n_skipped, n_failed);
+}
+
+void ensure_steam_hero_fallback(const std::vector<SteamHeroRequest> &games,
+                                const std::string &images_root) {
+  const fs::path images_root_path(images_root);
+  const std::time_t now = std::time(nullptr);
+
+  for (const SteamHeroRequest &game : games) {
+    if (game.app_id <= 0 || game.name.empty())
+      continue;
+
+    const fs::path game_img_dir =
+        images_root_path / steamgriddb_image_folder_name(game.name);
+    const fs::path hero_dir = game_img_dir / "hero";
+    if (!is_dir_empty(hero_dir))
+      continue; // SteamGridDB's hero, or an earlier Steam one, is already here
+
+    SgdbState state = load_sgdb_state(game_img_dir);
+    if (attempt_is_fresh(state.steam_hero, now))
+      continue; // Steam had none recently either
+
+    // Same CDN path steamArtUrl() in the bridge uses for unowned picks. No key,
+    // no search: the appid is the whole address.
+    const string path =
+        "/steam/apps/" + std::to_string(game.app_id) + "/library_hero.jpg";
+    string data;
+    try {
+      data = https_get(L"cdn.cloudflare.steamstatic.com", widen_ascii(path), L"");
+    } catch (const std::exception &e) {
+      // Only a 404 is Steam saying the game has no hero. Anything else is an
+      // outage and must not write the game off for a week.
+      if (http_status_from_error(e.what()) == 404) {
+        state.steam_hero = now;
+        save_sgdb_state(game_img_dir, state);
+        vlog::item("Steam", game.name, vlog::Status::Skipped, "no library hero on Steam");
+      } else {
+        vlog::item("Steam", game.name, vlog::Status::Fail,
+                   std::string("hero download failed: ") + e.what());
+      }
+      continue;
+    }
+    if (data.empty())
+      continue;
+
+    std::error_code ec;
+    fs::create_directories(hero_dir, ec);
+    std::ofstream out(hero_dir / "hero.jpg", std::ios::binary);
+    if (!out)
+      continue;
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    out.close();
+
+    if (state.steam_hero != 0) {
+      state.steam_hero = 0;
+      save_sgdb_state(game_img_dir, state);
+    }
+    vlog::item("Steam", game.name, vlog::Status::Ok, "downloaded hero from Steam");
+  }
 }
 
 SgdbArtUrls steamgriddb_art_urls(const std::string &name) {

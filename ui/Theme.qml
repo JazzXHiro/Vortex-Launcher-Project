@@ -107,6 +107,7 @@ QtObject {
     readonly property color positiveBg:      "#1e4d2f"  // switch track at on
     readonly property color positiveDim:     "#1d4a2b"  // wishlisted button fill
     readonly property color positiveText:    "#7fe0a0"  // the INSTALLED badge label
+    readonly property color playHover:       "#4ade80"  // the library card's PLAY, hovered
 
     readonly property color danger:          "#e74c3c"  // destructive, hovered
     readonly property color dangerRest:      "#c0392b"  // destructive at rest

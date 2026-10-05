@@ -23,6 +23,8 @@ struct BridgeGame {
     long long   igdb_id  = 0;
     fs::path    installDir;
     fs::path    gamePath;    // local exe path only (empty for Steam games)
+    std::string scannedName; // the name pass 1 found, before any rename
+    std::string customName;  // the user's own title, "" when not renamed
 };
 
 class VortexBridge : public QObject {
@@ -261,6 +263,12 @@ public:
     // so the choice survives rescans. Returns the new path, "" if refused.
     Q_INVOKABLE QString setGameExecutable(QString installDir, QString exeUrl);
 
+    // Gives an owned game the user's own title, recorded in name_overrides.txt
+    // so it survives rescans, and makes it the name IGDB and SteamGridDB are
+    // searched by from then on. An empty name puts the scanned one back.
+    // Refused (false) while a scan is running.
+    Q_INVOKABLE bool   renameGame(QString installDir, QString newName);
+
     // Puts one back. Needs a full rescan: the game is gone from
     // m_internalGames, and only the scan can rebuild it from the disk.
     Q_INVOKABLE void   restoreToLibrary(QString name);
@@ -385,6 +393,10 @@ signals:
     void credentialsValidated(QVariantMap result);
     void scanProgressChanged();
     void artRevisionChanged();
+    // One owned row was rewritten in place (a rename, and again once its new
+    // art and metadata land). The grid follows through artRevision; this is
+    // for a details page, which holds a copy of the row.
+    void gameRowChanged(QString installDir);
     void catalogRefreshingChanged();
     void catalogProgressChanged();
     // ok=false carries the script's stderr in `details`; the wizard shows it
@@ -411,6 +423,9 @@ private:
     std::vector<BridgeGame> m_internalGames;
     bool                    m_isLoading   = false;
     bool                    m_rescanQueued = false;  // scan requested while one was running
+    // Renames whose IGDB / artwork pass is still running. A scan waits for
+    // them, or its Steam baseline import could race the playtime rekey.
+    int                     m_renamesInFlight = 0;
     bool                    m_isRecommendationLoading = false;
     bool                    m_catalogRefreshing = false;
     // When maybeAutoFetchCatalog() last started a fetch. Invalid until the
@@ -574,6 +589,10 @@ private:
     QSet<QString>           m_liveArtAsked;
     QStringList             m_liveArtQueue;
     int                     m_liveArtRunning = 0;
+    // Queued or in flight right now -- unlike m_liveArtAsked, which also holds
+    // lookups that ended without a definitive answer. A Discover page holds
+    // IGDB's banner back only while its game is in here.
+    QSet<QString>           m_liveArtPending;
 
     // The metadata counterpart of applyLiveArtwork(): writes one resolved IGDB
     // id's fields into every list holding that name, and emits for each.

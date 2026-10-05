@@ -1,7 +1,6 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Effects
 import QtQuick.Shapes
 import Vortex
 
@@ -29,6 +28,25 @@ Popup {
                                    ? browseRoot.api.browseReviews : ({})
     readonly property bool loading: !!browseRoot.api && browseRoot.api.browseDetailsLoading
     readonly property bool owned: !!browseRoot.details.ownedName
+
+    // The body's sections fade and drift up into place once IGDB answers,
+    // one after another, rather than all popping in at once. 0 while loading,
+    // run up to 1 when the answer lands; revealAt() staggers it per section.
+    property real reveal: 1.0
+    onLoadingChanged: {
+        revealAnim.stop()
+        if (browseRoot.loading) browseRoot.reveal = 0.0
+        else revealAnim.start()
+    }
+    NumberAnimation {
+        id: revealAnim
+        target: browseRoot; property: "reveal"
+        from: 0.0; to: 1.0; duration: 750
+    }
+    function revealAt(index) {
+        const t = Math.max(0, Math.min(1, (browseRoot.reveal - index * 0.12) / 0.55))
+        return 1 - Math.pow(1 - t, 3)
+    }
 
     // ── Recommendation mode ─────────────────────────────────────────────────
     property bool fromRecommendation: false
@@ -130,6 +148,12 @@ Popup {
     readonly property string focusedKey:
         browseRoot.focusedAction >= 0 && browseRoot.focusedAction < browseRoot.actions.length
             ? browseRoot.actions[browseRoot.focusedAction] : ""
+
+    // Windows' own icon font, for the clock beside an owned pick's playtime.
+    // Win11 ships Segoe Fluent Icons, Win10 only MDL2; the codepoints are shared.
+    readonly property string iconFont:
+        Qt.fontFamilies().indexOf("Segoe Fluent Icons") >= 0
+            ? "Segoe Fluent Icons" : "Segoe MDL2 Assets"
 
     // Index into details.screenshots of the one shown full size, or -1.
     property int lightboxIndex: -1
@@ -334,9 +358,7 @@ Popup {
     property bool titleDocked: false
 
     function updateTitleDock() {
-        const info = browseRoot.fromRecommendation ? recInfo : browseInfo
-        const title = info.titleItem
-        const bottom = title.mapToItem(page, 0, title.height).y
+        const bottom = titleText.mapToItem(page, 0, titleText.height).y
         browseRoot.titleDocked = bottom - body.contentY < stickyHeader.height
     }
 
@@ -404,6 +426,8 @@ Popup {
         id: action
         property string label
         property string glyph
+        // Draws HeartIcon in the glyph's place.
+        property bool heart: false
         property bool active: false
         property bool available: true
         property bool focused: false
@@ -461,6 +485,12 @@ Popup {
                 color: action.glyphColor
                 font.pixelSize: 18
             }
+            HeartIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: action.heart
+                color: action.glyphColor
+                size: 18
+            }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: action.label
@@ -475,198 +505,6 @@ Popup {
             hoverEnabled: true
             cursorShape: action.available ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: if (action.available) action.triggered()
-        }
-    }
-
-    // The title, facts line, genres and action row. Browse sets it beside the
-    // cover inside its banner; a recommendation sets it under the hero, where
-    // GameDetails keeps its buttons. One definition so the two cannot drift.
-    component BannerInfo: Column {
-        // Read by updateTitleDock() to tell when the title has scrolled away.
-        readonly property Item titleItem: titleText
-        spacing: 14
-
-        Row {
-            spacing: 10
-            visible: browseRoot.isOwned
-            Rectangle {
-                width: libraryChip.implicitWidth + 18; height: 24; radius: 12
-                color: Theme.overlayPositive
-                Text {
-                    id: libraryChip
-                    anchors.centerIn: parent
-                    text: "IN LIBRARY"
-                    color: Theme.textPrimary
-                    font.pixelSize: 11; font.bold: true; font.letterSpacing: 1
-                }
-            }
-        }
-
-        Text {
-            id: titleText
-            width: parent.width
-            // The card's spelling for a recommendation, so
-            // the page is titled as the card that opened it.
-            text: browseRoot.fromRecommendation
-                  ? browseRoot.gameName : (browseRoot.details.name || "")
-            color: Theme.textPrimary
-            font.pixelSize: 40; font.bold: true
-            wrapMode: Text.WordWrap
-            maximumLineCount: 2
-            elide: Text.ElideRight
-        }
-
-        Text {
-            width: parent.width
-            text: [browseRoot.details.year,
-                   browseRoot.details.developers,
-                   browseRoot.details.publishers !== browseRoot.details.developers
-                       ? browseRoot.details.publishers : ""]
-                      .filter(function (part) { return !!part }).join("  ·  ")
-            color: Theme.textSecondary
-            font.pixelSize: 16
-            elide: Text.ElideRight
-        }
-
-        Flow {
-            width: parent.width
-            spacing: 8
-            Repeater {
-                model: browseRoot.details.genres || []
-                delegate: Chip {
-                    required property string modelData
-                    label: modelData
-                }
-            }
-        }
-
-        // The three ways to keep a game, led by Play or
-        // Check on Steam for a recommendation. A Flow, so
-        // the four-wide recommendation row wraps on a
-        // narrow window instead of running off the page.
-        Flow {
-            width: parent.width
-            spacing: 14
-            topPadding: 6
-            visible: !browseRoot.uninstallArmed
-
-            ActionButton {
-                visible: browseRoot.actions.indexOf("play") >= 0
-                // PLAY, then LAUNCHING on green until the game is up, then QUIT,
-                // which turns red on hover with the icon and label flipped to white.
-                readonly property bool quitHot: browseRoot.gameRunning && emphasized
-                iconSource: browseRoot.gameLaunching ? ""
-                          : quitHot ? "assets/quit_hover.png"
-                          : browseRoot.gameRunning ? "assets/quit.png" : "assets/play.png"
-                iconSize: 14
-                label: browseRoot.gameLaunching ? "LAUNCHING" : browseRoot.gameRunning ? "QUIT" : "PLAY"
-                restColor: browseRoot.gameLaunching ? Theme.positive : Theme.accent
-                hoverColor: browseRoot.gameLaunching ? Theme.positive
-                          : browseRoot.gameRunning ? Theme.danger : Theme.accent
-                ringColor: browseRoot.gameRunning ? Theme.focusRing : Theme.positive
-                labelColor: browseRoot.gameLaunching || quitHot ? Theme.textPrimary : Theme.textInverse
-                focused: browseRoot.focusedKey === "play"
-                onTriggered: browseRoot.play()
-            }
-
-            ActionButton {
-                visible: browseRoot.actions.indexOf("steam") >= 0
-                // Relative so it survives the module's
-                // RESOURCE_PREFIX, as GameDetails does.
-                iconSource: "assets/steam.png"
-                label: "CHECK ON STEAM"
-                restColor: Theme.steamBg
-                hoverColor: Theme.steamBgPressed
-                ringColor: Theme.steamAccent
-                focused: browseRoot.focusedKey === "steam"
-                onTriggered: browseRoot.openSteam()
-            }
-
-            ActionButton {
-                readonly property bool tracked: browseRoot.playedState === "tracked"
-                readonly property bool manual: browseRoot.playedState === "manual"
-                glyph: (tracked || manual) ? "✓" : "+"
-                label: tracked ? "PLAYED"
-                     : manual ? (emphasized ? "REMOVE FROM PLAYED" : "PLAYED")
-                     : "ADD TO PLAYED"
-                active: tracked || manual
-                // Recorded playtime is history; only a mark
-                // made by hand can be taken back.
-                available: !tracked && browseRoot.actionName !== ""
-                focused: browseRoot.focusedKey === "played"
-                onTriggered: browseRoot.togglePlayed()
-
-                ToolTip.visible: tracked && hovered
-                ToolTip.delay: 400
-                ToolTip.text: "Vortex has recorded playtime for this game"
-            }
-
-            ActionButton {
-                glyph: "♥"
-                label: browseRoot.isFavorite ? "FAVORITED" : "FAVORITE"
-                active: browseRoot.isFavorite
-                activeColor: Theme.favorite
-                available: browseRoot.actionName !== ""
-                focused: browseRoot.focusedKey === "favorite"
-                onTriggered: browseRoot.toggleFavorite()
-            }
-
-            ActionButton {
-                visible: browseRoot.actions.indexOf("wishlist") >= 0
-                glyph: "\u{1F6D2}"
-                label: browseRoot.isOwned ? "OWNED"
-                     : browseRoot.isWishlisted ? "WISHLISTED" : "ADD TO WISHLIST"
-                active: browseRoot.isWishlisted
-                // A game you own is not one you want to buy.
-                available: !browseRoot.isOwned && browseRoot.actionName !== ""
-                focused: browseRoot.focusedKey === "wishlist"
-                onTriggered: browseRoot.toggleWishlist()
-            }
-
-            // Owned recommendations only. Steam games hand
-            // off to Steam; a local one arms the confirm.
-            ActionButton {
-                visible: browseRoot.actions.indexOf("uninstall") >= 0
-                // The lid lifts on hover or pad focus. The two PNGs
-                // carry dangerRest and dangerIcon baked in.
-                iconSource: emphasized ? "assets/trash_open.png" : "assets/trash.png"
-                label: "UNINSTALL"
-                hoverColor: Theme.dangerBg
-                focused: browseRoot.focusedKey === "uninstall"
-                onTriggered: browseRoot.requestUninstall()
-            }
-        }
-
-        // Confirm step -- a local uninstall deletes the
-        // game's folder off the disk, so it is never one
-        // click. Steam games skip this entirely.
-        Row {
-            spacing: 14
-            topPadding: 6
-            visible: browseRoot.uninstallArmed
-
-            Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Delete this game's files from disk?"
-                color: Theme.dangerText
-                font.pixelSize: 16
-            }
-
-            ActionButton {
-                label: "DELETE"
-                restColor: Theme.dangerRest
-                hoverColor: Theme.danger
-                focused: browseRoot.armedChoice === browseRoot.armedDelete
-                onTriggered: browseRoot.confirmUninstall()
-            }
-
-            ActionButton {
-                label: "CANCEL"
-                hoverColor: Theme.bgInert
-                labelColor: Theme.textBody
-                focused: browseRoot.armedChoice === browseRoot.armedCancel
-                onTriggered: browseRoot.cancelUninstall()
-            }
         }
     }
 
@@ -691,173 +529,233 @@ Popup {
                 // Details landing while scrolled can move the title.
                 onHeightChanged: browseRoot.updateTitleDock()
 
-                // ── Banner (Browse) ─────────────────────────────────────────
-                Item {
-                    id: banner
-                    width: parent.width
-                    height: 420
-                    clip: true
-                    visible: !browseRoot.fromRecommendation
-
-                    readonly property string heroSource:
-                        browseRoot.details.heroUrl || browseRoot.details.coverUrl || ""
-
-                    Image {
-                        id: heroImage
-                        anchors.fill: parent
-                        visible: false
-                        asynchronous: true
-                        fillMode: Image.PreserveAspectCrop
-                        source: banner.heroSource
-                    }
-
-                    // Real key art stays sharp; a cover standing in is only
-                    // there for colour, so it is blurred like GameDetails does.
-                    MultiEffect {
-                        anchors.fill: parent
-                        source: heroImage
-                        blurEnabled: !browseRoot.details.heroUrl
-                        blur: 1.0
-                        blurMax: 48
-                        opacity: browseRoot.details.heroUrl ? 0.45 : 0.55
-                    }
-
-                    Rectangle {
-                        anchors.fill: parent
-                        gradient: Gradient {
-                            GradientStop { position: 0.35; color: "transparent" }
-                            GradientStop { position: 1.0; color: Theme.bgPanel }
-                        }
-                    }
-
-                    Row {
-                        anchors { left: parent.left; right: parent.right; bottom: parent.bottom
-                                  leftMargin: 40; rightMargin: 40; bottomMargin: 28 }
-                        spacing: 32
-
-                        Rectangle {
-                            width: 210; height: 280; radius: 12
-                            color: Theme.bgRaised
-                            border.color: Theme.borderControl; border.width: 2
-                            clip: true
-
-                            Image {
-                                id: coverImage
-                                anchors.fill: parent
-                                anchors.margins: 2
-                                asynchronous: true
-                                fillMode: Image.PreserveAspectCrop
-                                source: browseRoot.details.coverUrl || ""
-                            }
-                            Text {
-                                anchors.centerIn: parent
-                                visible: coverImage.status !== Image.Ready
-                                text: coverImage.status === Image.Loading ? "" : "NO ART"
-                                color: Theme.textGhost; font.bold: true
-                            }
-                        }
-
-                        BannerInfo {
-                            id: browseInfo
-                            anchors.bottom: parent.bottom
-                            width: parent.width - 242
-                        }
-                    }
-                }
-
-                // ── Banner (Recommendation) ─────────────────────────────────
-                // GameDetails' hero banner, so a pick looks the way its library
-                // page does: art across the top half, the logo centred on it.
+                // ── Hero ────────────────────────────────────────────────────
+                // The Library page's Steam-style header (FrostedHero.qml), for
+                // a Browse result and a recommendation alike; what is declared
+                // inside goes into its frosted band.
                 //
-                // Whether heroPath is genuinely wide art is decided from the
-                // loaded image, not from where it came from: Steam's
-                // library_hero is a banner, but IGDB's t_720p and the cover the
-                // bridge aliases in when neither exists are portrait, and
-                // cropping a portrait into this shape is an ugly upscale. So the
-                // shape of what loaded picks the treatment, as in GameDetails.
-                Rectangle {
-                    id: recBanner
+                // A recommendation reads its own row's art first, as
+                // GameDetails does. A Browse result takes the bridge's
+                // bannerUrl and logoUrl -- SteamGridDB, else Steam's CDN for a
+                // Steam game -- and IGDB's own banner only once that lookup
+                // has finished without one; the cover holds the page meanwhile.
+                FrostedHero {
+                    id: heroBanner
+                    readonly property var row: browseRoot.fromRecommendation ? browseRoot.gameRow : null
+
                     width: parent.width
-                    height: Math.round(body.height * 0.5)
-                    visible: browseRoot.fromRecommendation
-                    color: Theme.bgRaised
-                    radius: 20
-                    layer.enabled: true
-                    clip: true
+                    height: Math.max(460, Math.round(body.height * 0.6))
+                    heroSource: (heroBanner.row && heroBanner.row.heroPath)
+                                || browseRoot.details.bannerUrl
+                                || (browseRoot.details.artPending ? "" : browseRoot.details.heroUrl)
+                                || browseRoot.details.coverUrl || ""
+                    logoSource: (heroBanner.row && heroBanner.row.logoPath)
+                                || browseRoot.details.logoUrl || ""
+                    coverSource: (heroBanner.row && heroBanner.row.coverPath)
+                                 || browseRoot.details.coverUrl || ""
 
-                    // The row's own art, as GameDetails reads it. IGDB's only
-                    // stands in when the row has none at all.
-                    readonly property var row: browseRoot.gameRow
-                    readonly property string heroSource:
-                        (recBanner.row && recBanner.row.heroPath) || browseRoot.details.heroUrl || ""
-                    readonly property string logoSource:
-                        (recBanner.row && recBanner.row.logoPath) || ""
-                    readonly property string coverSource:
-                        (recBanner.row && recBanner.row.coverPath) || browseRoot.details.coverUrl || ""
-
-                    // 16:10 is the loosest thing anyone ships as a banner and
-                    // the tightest portrait cover is 3:4, so 1.6 separates the
-                    // two. False until the image reports a size, so the banner
-                    // starts blurred -- un-blurring late is invisible.
-                    readonly property bool heroIsWide:
-                        recHeroBackdrop.status === Image.Ready
-                        && recHeroBackdrop.implicitWidth > recHeroBackdrop.implicitHeight * 1.6
-
-                    // Drawn through the MultiEffect below, never directly.
-                    Image {
-                        id: recHeroBackdrop
-                        anchors.fill: parent
-                        visible: false
-                        asynchronous: true
-                        fillMode: Image.PreserveAspectCrop
-                        source: recBanner.heroSource
+                    Text {
+                        id: titleText
+                        width: parent.width
+                        // The card's spelling for a recommendation, so the page
+                        // is titled as the card that opened it.
+                        text: browseRoot.fromRecommendation
+                              ? browseRoot.gameName : (browseRoot.details.name || "")
+                        color: Theme.textPrimary
+                        font.pixelSize: 40; font.bold: true
+                        elide: Text.ElideRight
                     }
 
-                    // Wide art stays sharp; portrait art is blurred and only
-                    // there for colour.
-                    MultiEffect {
-                        anchors.fill: parent
-                        source: recHeroBackdrop
-                        blurEnabled: !recBanner.heroIsWide
-                        blur: 1.0
-                        blurMax: 48
-                        opacity: recBanner.heroIsWide ? 0.4 : 0.55
-                        Behavior on opacity { NumberAnimation { duration: 200 } }
+                    // The ways to keep a game, led by Play or Check on Steam for a
+                    // recommendation, and for an owned one the two numbers Steam
+                    // keeps beside its Play button. The last stop on the pad's run
+                    // sits on the same line at the far right: Uninstall for an
+                    // owned recommendation, Wishlist otherwise.
+                    Item {
+                        width: parent.width
+                        height: actionBar.height
+                        visible: !browseRoot.uninstallArmed
+
+                        Row {
+                            id: actionBar
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 14
+
+                            ActionButton {
+                                visible: browseRoot.actions.indexOf("play") >= 0
+                                // PLAY, then LAUNCHING on green until the game is up, then QUIT,
+                                // which turns red on hover with the icon and label flipped to white.
+                                readonly property bool quitHot: browseRoot.gameRunning && emphasized
+                                iconSource: browseRoot.gameLaunching ? ""
+                                          : quitHot ? "assets/quit_hover.png"
+                                          : browseRoot.gameRunning ? "assets/quit.png" : "assets/play.png"
+                                iconSize: 14
+                                label: browseRoot.gameLaunching ? "LAUNCHING" : browseRoot.gameRunning ? "QUIT" : "PLAY"
+                                restColor: browseRoot.gameLaunching ? Theme.positive : Theme.accent
+                                hoverColor: browseRoot.gameLaunching ? Theme.positive
+                                          : browseRoot.gameRunning ? Theme.danger : Theme.accent
+                                ringColor: browseRoot.gameRunning ? Theme.focusRing : Theme.positive
+                                labelColor: browseRoot.gameLaunching || quitHot ? Theme.textPrimary : Theme.textInverse
+                                focused: browseRoot.focusedKey === "play"
+                                onTriggered: browseRoot.play()
+                            }
+
+                            ActionButton {
+                                visible: browseRoot.actions.indexOf("steam") >= 0
+                                // Relative so it survives the module's
+                                // RESOURCE_PREFIX, as GameDetails does.
+                                iconSource: "assets/steam.png"
+                                label: "CHECK ON STEAM"
+                                restColor: Theme.steamBg
+                                hoverColor: Theme.steamBgPressed
+                                ringColor: Theme.steamAccent
+                                focused: browseRoot.focusedKey === "steam"
+                                onTriggered: browseRoot.openSteam()
+                            }
+
+                            ActionButton {
+                                readonly property bool tracked: browseRoot.playedState === "tracked"
+                                readonly property bool manual: browseRoot.playedState === "manual"
+                                glyph: (tracked || manual) ? "✓" : "+"
+                                label: tracked ? "PLAYED"
+                                     : manual ? (emphasized ? "REMOVE FROM PLAYED" : "PLAYED")
+                                     : "ADD TO PLAYED"
+                                active: tracked || manual
+                                // Recorded playtime is history; only a mark
+                                // made by hand can be taken back.
+                                available: !tracked && browseRoot.actionName !== ""
+                                focused: browseRoot.focusedKey === "played"
+                                onTriggered: browseRoot.togglePlayed()
+
+                                ToolTip.visible: tracked && hovered
+                                ToolTip.delay: 400
+                                ToolTip.text: "Vortex has recorded playtime for this game"
+                            }
+
+                            ActionButton {
+                                heart: true
+                                label: browseRoot.isFavorite ? "FAVORITED" : "FAVORITE"
+                                active: browseRoot.isFavorite
+                                activeColor: Theme.favorite
+                                available: browseRoot.actionName !== ""
+                                focused: browseRoot.focusedKey === "favorite"
+                                onTriggered: browseRoot.toggleFavorite()
+                            }
+
+                            // An owned recommendation's last played and playtime,
+                            // read off its library row.
+                            Row {
+                                id: playStats
+                                readonly property var row: browseRoot.gameRow
+
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: browseRoot.fromRecommendation && browseRoot.isOwned && !!playStats.row
+                                leftPadding: 18
+                                spacing: 32
+
+                                Column {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 3
+                                    Text {
+                                        text: "LAST PLAYED"
+                                        color: Theme.textMuted
+                                        font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                    }
+                                    Text {
+                                        text: playStats.row && playStats.row.lastPlayed ? playStats.row.lastPlayed : "Never"
+                                        color: Theme.textSecondary
+                                        font.pixelSize: 14
+                                    }
+                                }
+
+                                // Time actually played -- the session total with idle
+                                // taken out -- except for a Steam game showing Steam's
+                                // own figure. The caption under YOUR GAME says which.
+                                Row {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 10
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: String.fromCharCode(0xE823)   // clock
+                                        font.family: browseRoot.iconFont
+                                        font.pixelSize: 22
+                                        color: Theme.textMuted
+                                    }
+                                    Column {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: 3
+                                        Text {
+                                            text: "PLAY TIME"
+                                            color: Theme.textMuted
+                                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                        }
+                                        Text {
+                                            text: playStats.row && playStats.row.playtime ? playStats.row.playtime : "0m"
+                                            color: Theme.textSecondary
+                                            font.pixelSize: 14
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        ActionButton {
+                            anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                            visible: browseRoot.actions.indexOf("wishlist") >= 0
+                            glyph: "\u{1F6D2}"
+                            label: browseRoot.isOwned ? "OWNED"
+                                 : browseRoot.isWishlisted ? "WISHLISTED" : "ADD TO WISHLIST"
+                            active: browseRoot.isWishlisted
+                            // A game you own is not one you want to buy.
+                            available: !browseRoot.isOwned && browseRoot.actionName !== ""
+                            focused: browseRoot.focusedKey === "wishlist"
+                            onTriggered: browseRoot.toggleWishlist()
+                        }
+
+                        // Owned recommendations only. Steam games hand off to
+                        // Steam; a local one arms the confirm.
+                        ActionButton {
+                            anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+                            visible: browseRoot.actions.indexOf("uninstall") >= 0
+                            // The lid lifts on hover or pad focus. The two PNGs
+                            // carry dangerRest and dangerIcon baked in.
+                            iconSource: emphasized ? "assets/trash_open.png" : "assets/trash.png"
+                            label: "UNINSTALL"
+                            hoverColor: Theme.dangerBg
+                            focused: browseRoot.focusedKey === "uninstall"
+                            onTriggered: browseRoot.requestUninstall()
+                        }
                     }
 
-                    // Centre art, in order of preference: the logo when there
-                    // is one, else the sharp portrait over its own blur, else
-                    // nothing -- real wide art reads perfectly well on its own.
-                    Image {
-                        anchors.centerIn: parent
-                        width: parent.width * 0.4; height: parent.height * 0.4
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                        visible: recBanner.logoSource !== ""
-                        source: recBanner.logoSource
-                    }
+                    // Confirm step -- a local uninstall deletes the game's folder
+                    // off the disk, so it is never one click. Steam games skip this.
+                    Row {
+                        spacing: 14
+                        visible: browseRoot.uninstallArmed
 
-                    Image {
-                        anchors.centerIn: parent
-                        height: parent.height * 0.8
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                        visible: recBanner.logoSource === "" && !recBanner.heroIsWide
-                        // heroSource first: when it is portrait it is IGDB's
-                        // 540x720, which downscales into this slot where the
-                        // 264x352 cover would have to be stretched up.
-                        source: !visible ? ""
-                              : (recBanner.heroSource !== "" ? recBanner.heroSource
-                                                             : recBanner.coverSource)
-                    }
-                }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Delete this game's files from disk?"
+                            color: Theme.dangerText
+                            font.pixelSize: 16
+                        }
 
-                BannerInfo {
-                    id: recInfo
-                    visible: browseRoot.fromRecommendation
-                    x: 40
-                    width: parent.width - 80
-                    topPadding: 24
+                        ActionButton {
+                            label: "DELETE"
+                            restColor: Theme.dangerRest
+                            hoverColor: Theme.danger
+                            focused: browseRoot.armedChoice === browseRoot.armedDelete
+                            onTriggered: browseRoot.confirmUninstall()
+                        }
+
+                        ActionButton {
+                            label: "CANCEL"
+                            hoverColor: Theme.bgInert
+                            labelColor: Theme.textBody
+                            focused: browseRoot.armedChoice === browseRoot.armedCancel
+                            onTriggered: browseRoot.cancelUninstall()
+                        }
+                    }
                 }
 
                 // ── Body ────────────────────────────────────────────────────
@@ -869,13 +767,6 @@ Popup {
                     bottomPadding: 50
                     spacing: 40
 
-                    Text {
-                        visible: browseRoot.loading
-                        text: "LOADING…"
-                        color: Theme.textGhost
-                        font.pixelSize: 14; font.bold: true; font.letterSpacing: 2
-                    }
-
                     // Not for a recommendation: its own row is still on the
                     // page, so IGDB failing loses detail rather than the game.
                     Text {
@@ -884,10 +775,41 @@ Popup {
                         text: browseRoot.details.error || ""
                         color: Theme.dangerText
                         font.pixelSize: 15
+                        opacity: browseRoot.revealAt(0)
                     }
 
-                    // Your game -- an owned recommendation's playtime and where
-                    // it lives, as GameDetails showed them. The path is a plain
+                    // Moved out of the header, which now carries only the title
+                    // and the actions, as on the Library page.
+                    Flow {
+                        width: parent.width
+                        spacing: 8
+                        visible: browseRoot.isOwned || genreRepeater.count > 0
+
+                        Rectangle {
+                            visible: browseRoot.isOwned
+                            width: libraryChip.implicitWidth + 22; height: 26; radius: 13
+                            color: Theme.overlayPositive
+                            Text {
+                                id: libraryChip
+                                anchors.centerIn: parent
+                                text: "IN LIBRARY"
+                                color: Theme.textPrimary
+                                font.pixelSize: 11; font.bold: true; font.letterSpacing: 1
+                            }
+                        }
+
+                        Repeater {
+                            id: genreRepeater
+                            model: browseRoot.details.genres || []
+                            delegate: Chip {
+                                required property string modelData
+                                label: modelData
+                            }
+                        }
+                    }
+
+                    // Your game -- where an owned recommendation lives, and how
+                    // the header's playtime was counted. The path is a plain
                     // readout: folder actions belong to the Library tab.
                     Column {
                         id: yourGame
@@ -899,44 +821,20 @@ Popup {
                         spacing: 14
                         visible: browseRoot.fromRecommendation && browseRoot.isOwned && !!yourGame.row
 
-                        SectionTitle { text: "YOUR GAME" }
+                        SectionTitle { text: "GAME PATH" }
 
-                        Row {
-                            spacing: 60
-
-                            // The headline is time actually played -- the session
-                            // total with idle taken out -- except for a Steam game
-                            // showing Steam's own figure, which arrives with nothing
-                            // deducted. The caption says which of the two it is.
-                            Column {
-                                spacing: 5
-                                Text { text: "Playtime"; color: Theme.textMuted; font.pixelSize: 14 }
-                                Text {
-                                    text: yourGame.row && yourGame.row.playtime ? yourGame.row.playtime : "0m"
-                                    color: Theme.textPrimary
-                                    font.pixelSize: 32; font.bold: true
-                                }
-                                Text {
-                                    visible: !!yourGame.row && yourGame.row.idleSeconds > 0
-                                    text: !yourGame.row ? ""
-                                          : yourGame.row.idleDeducted
-                                            ? yourGame.row.idleTime + " idle, taken out of "
-                                              + yourGame.row.totalPlaytime + " total"
-                                            : yourGame.row.idleTime + " idle observed by Vortex"
-                                    color: Theme.textMuted
-                                    font.pixelSize: 14
-                                }
-                            }
-
-                            Column {
-                                spacing: 5
-                                Text { text: "Last played"; color: Theme.textMuted; font.pixelSize: 14 }
-                                Text {
-                                    text: yourGame.row && yourGame.row.lastPlayed ? yourGame.row.lastPlayed : "Never"
-                                    color: Theme.textSecondary
-                                    font.pixelSize: 20
-                                }
-                            }
+                        // A Steam game showing Steam's own figure arrives with
+                        // nothing deducted, so say which kind the header's
+                        // number is rather than leave the reader to guess.
+                        Text {
+                            visible: !!yourGame.row && yourGame.row.idleSeconds > 0
+                            text: !yourGame.row ? ""
+                                  : yourGame.row.idleDeducted
+                                    ? yourGame.row.idleTime + " idle, taken out of "
+                                      + yourGame.row.totalPlaytime + " total"
+                                    : yourGame.row.idleTime + " idle observed by Vortex"
+                            color: Theme.textMuted
+                            font.pixelSize: 14
                         }
 
                         Rectangle {
@@ -955,11 +853,22 @@ Popup {
                         }
                     }
 
+                    // Below the chips rather than above them, so they hold
+                    // still when it goes and the sections take its place.
+                    Text {
+                        visible: browseRoot.loading
+                        text: "LOADING…"
+                        color: Theme.textGhost
+                        font.pixelSize: 14; font.bold: true; font.letterSpacing: 2
+                    }
+
                     // About
                     Column {
                         width: parent.width
                         spacing: 14
                         visible: !browseRoot.loading && (!!browseRoot.details.summary || !!browseRoot.details.storyline)
+                        opacity: browseRoot.revealAt(0)
+                        transform: Translate { y: 16 * (1 - browseRoot.revealAt(0)) }
 
                         SectionTitle { text: "ABOUT" }
 
@@ -1006,6 +915,8 @@ Popup {
                         width: parent.width
                         spacing: 14
                         visible: !browseRoot.loading && factsFlow.facts.length > 0
+                        opacity: browseRoot.revealAt(1)
+                        transform: Translate { y: 16 * (1 - browseRoot.revealAt(1)) }
 
                         SectionTitle { text: "DETAILS" }
 
@@ -1085,6 +996,8 @@ Popup {
                         width: parent.width
                         spacing: 14
                         visible: !browseRoot.loading && browseRoot.screenshots.length > 0
+                        opacity: browseRoot.revealAt(2)
+                        transform: Translate { y: 16 * (1 - browseRoot.revealAt(2)) }
 
                         SectionTitle { text: "SCREENSHOTS" }
 
@@ -1132,6 +1045,8 @@ Popup {
                                         asynchronous: true
                                         fillMode: Image.PreserveAspectCrop
                                         source: shot.modelData.thumb
+                                        opacity: status === Image.Ready ? 1.0 : 0.0
+                                        Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
                                     }
                                     MouseArea {
                                         id: shotArea
@@ -1153,6 +1068,8 @@ Popup {
                         // IGDB failed: the bridge fetches them off the row's app.
                         visible: !browseRoot.loading
                                  && (!browseRoot.details.error || browseRoot.fromRecommendation)
+                        opacity: browseRoot.revealAt(3)
+                        transform: Translate { y: 16 * (1 - browseRoot.revealAt(3)) }
 
                         SectionTitle { text: "REVIEWS" }
 
@@ -1199,6 +1116,12 @@ Popup {
                                 radius: 12
                                 color: Theme.bgSurface
                                 border.color: Theme.borderQuiet
+
+                                // Steam's reviews land after IGDB's answer, so
+                                // each card eases in on its own as it arrives.
+                                NumberAnimation on opacity {
+                                    from: 0.0; to: 1.0; duration: 400; easing.type: Easing.OutCubic
+                                }
 
                                 // Backlight from the bottom-right corner: green for a
                                 // recommendation, red for a pan. Inset by the border so
@@ -1355,17 +1278,21 @@ Popup {
 
             anchors { top: parent.top; right: parent.right; margins: 20 }
             width: 44; height: 44; radius: 22
-            color: closeButton.emphasized ? Theme.bgEmphasis : Theme.overlayButton
+            color: closeButton.emphasized ? "#B32A2A2A" : "#80000000"
             border.width: closeButton.emphasized ? 2 : 1
             border.color: closeButton.emphasized ? Theme.focusRing : Theme.borderControl
             scale: closeButton.emphasized ? 1.1 : 1.0
             Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
 
-            Text {
+            // White X, decoded at twice the drawn size.
+            Image {
                 anchors.centerIn: parent
-                text: "✕"
-                color: closeButton.emphasized ? Theme.textPrimary : Theme.textBody
-                font.pixelSize: 20
+                width: 20; height: 20
+                source: "assets/close.png"
+                sourceSize.width: 40
+                sourceSize.height: 40
+                fillMode: Image.PreserveAspectFit
+                smooth: true
             }
             MouseArea {
                 id: closeArea
@@ -1398,6 +1325,8 @@ Popup {
                 fillMode: Image.PreserveAspectFit
                 source: lightbox.visible && browseRoot.screenshots[browseRoot.lightboxIndex]
                         ? browseRoot.screenshots[browseRoot.lightboxIndex].full : ""
+                opacity: status === Image.Ready ? 1.0 : 0.0
+                Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
             }
 
             Text {
