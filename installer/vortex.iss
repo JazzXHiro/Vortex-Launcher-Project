@@ -129,6 +129,7 @@ begin
   DeleteFile(AppDir + '\manual_played.txt');
   DeleteFile(AppDir + '\removed_games.json');
   DeleteFile(AppDir + '\live_artwork.json');
+  DeleteFile(AppDir + '\name_overrides.txt');
   DeleteFile(AppDir + '\installed_games.txt');
   DeleteFile(AppDir + '\local_game_dirs.txt');
   DeleteFile(AppDir + '\igdb_cache.txt');

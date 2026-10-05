@@ -136,6 +136,7 @@ Images/
 /manual_played.txt
 /removed_games.json
 /live_artwork.json
+/name_overrides.txt
 
 # =========================
 # User-specific CMake configuration

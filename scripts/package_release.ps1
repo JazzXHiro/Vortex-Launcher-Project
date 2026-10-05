@@ -146,6 +146,8 @@ $PersonalFiles = @(
     # library, and the artwork URLs looked up for them -- all specific to the
     # developer's library, like the ledger above.
     'manual_played.txt', 'removed_games.json', 'live_artwork.json',
+    # Titles the user typed over the scanned ones, keyed by install path.
+    'name_overrides.txt',
     'playtime_sessions.log', 'playtime_stats.txt',
     'preferences.json', 'settings.json',
     'igdb_cache.txt', 'exe_cache.txt', 'game_metadata.txt',
