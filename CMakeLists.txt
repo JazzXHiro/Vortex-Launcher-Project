@@ -103,6 +103,7 @@ qt_add_qml_module(VortexLauncher
         ui/FrostedHero.qml
         ui/LoadingBar.qml
         ui/HeartIcon.qml
+        ui/CoverGlow.qml
     RESOURCES
         ui/assets/steam.png
         ui/assets/local.png

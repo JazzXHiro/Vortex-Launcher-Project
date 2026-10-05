@@ -455,6 +455,10 @@ Window {
     TileMenu {
         id: tileMenu
         api: root.api
+        // The page itself, not the window: the window's content item also
+        // holds the popup overlay, and a backdrop captured from that would
+        // blur the menu back into itself.
+        backdropItem: pageContent
 
         // Removing rebuilds gameList, and the grid binds to that as a plain JS
         // array -- GridView answers a new array by throwing the scroll position
@@ -496,6 +500,25 @@ Window {
     // when countChanged fires, so it cannot be dropped on the line after the
     // call; leaving it set for good would snap a later filter or tab change
     // back to a position that no longer means anything.
+    // Laid over the page while the tile menu is open, which is not modal so
+    // the wheel still reaches the page. Eats the press that closes the menu
+    // so it never lands on the card underneath, and blocks hover so no other
+    // card lights up behind it. The wheel goes on through to scroll the page,
+    // and fades the menu out first: the card it is fastened to is about to
+    // move.
+    MouseArea {
+        id: tileMenuCatcher
+        anchors.fill: parent
+        z: 1000
+        visible: tileMenu.visible
+        hoverEnabled: true
+        onPressed: tileMenu.close()
+        onWheel: (wheel) => {
+            tileMenu.dismissForScroll()
+            wheel.accepted = false
+        }
+    }
+
     Timer {
         id: releaseScrollPin
         interval: 400
@@ -583,7 +606,61 @@ Window {
     // ─────────────────────────────────────────────────────────────────────────
     // Main content: filter bar + game grid
     // ─────────────────────────────────────────────────────────────────────────
+    // Where the cards' hover glows are drawn (see CoverGlow.qml). Behind the
+    // content and outside every grid, so a glow is never cut off by a grid's
+    // clip and sits under the neighbouring cards rather than over them.
+    Item {
+        id: glowStage
+        anchors.fill: parent
+    }
+
+    // The scrolling view on the page showing, and whether it has left the top.
+    // Browse's grid is typed Item over there; it is a GridView or the
+    // horizontal rail, and the rail never leaves the top.
+    readonly property Item scrollingView:
+        root.activeTab === "Recommendations" ? recommendationFlick
+        : root.activeTab === "Wishlist" ? wishlistGrid
+        : root.activeTab === "Browse" ? browsePage.grid
+        : gameGrid
+    readonly property bool contentScrolled:
+        root.scrollingView !== null && !root.scrollingView.atYBeginning
+
+    // ── Header backdrop ─────────────────────────────────────────────────────
+    //
+    // Window-coloured cover over everything above the scrolling view, between
+    // the glows and the content. Clear at the top of the page, so the top
+    // row's glow rises softly behind the tabs. Once scrolled, the lit card can
+    // be half under the view's top edge with its whole glow spilling up into
+    // the header -- too strong there -- so the header goes opaque.
+    Rectangle {
+        anchors { left: parent.left; right: parent.right; top: parent.top }
+        // Mapped rather than added up from the layout, since the view sits
+        // under a different stack of headers on each page. Re-read when the
+        // window resizes and when scrolling starts, which is all that moves
+        // it -- and is after the layout has settled.
+        height: {
+            root.width; root.height; root.contentScrolled   // dependencies
+            return root.scrollingView ? root.scrollingView.mapToItem(null, 0, 0).y : 0
+        }
+        color: Theme.bgWindow
+        visible: opacity > 0
+        opacity: root.contentScrolled ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 200 } }
+
+        // A short fade past the view's top edge rather than a hard line: the
+        // glow in the gutters beside a clipped card tails off into it.
+        Rectangle {
+            anchors { left: parent.left; right: parent.right; top: parent.bottom }
+            height: 24
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: Theme.bgWindow }
+                GradientStop { position: 1.0; color: "transparent" }
+            }
+        }
+    }
+
     ColumnLayout {
+        id: pageContent
         anchors.fill: parent
         anchors.margins: 40
         spacing: 30
@@ -592,7 +669,9 @@ Window {
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: 35
-            color: Theme.bgWindow
+            // Clear, so a top-row card's glow shows through behind the tabs
+            // instead of stopping at a hard line along the bar.
+            color: "transparent"
             z: 10
 
             RowLayout {
@@ -1261,6 +1340,15 @@ Window {
                                          gameDelegate.sourceLabel === "Local")
                     }
 
+                    // Drawn on root's glowStage, behind the page: see
+                    // CoverGlow.qml.
+                    CoverGlow {
+                        target: capsuleContainer
+                        stage: glowStage
+                        source: gameCover
+                        lit: gameDelegate.highlighted
+                    }
+
                     Column {
                         anchors.centerIn: parent
                         spacing: 12
@@ -1597,8 +1685,10 @@ Window {
                         id: overflowButton
                         readonly property bool hovered:
                             overflowArea.containsMouse && root.mouseInControl
-                        // Stays up while its own menu is open, or it would
-                        // vanish the moment the pointer left the card for it.
+                        // While its own menu is open the menu's first cell
+                        // stands in for this button, so it steps aside rather
+                        // than being caught in the menu's frosted backdrop as a
+                        // smeared grey disc.
                         readonly property bool menuOpen:
                             tileMenu.visible
                             && tileMenu.gameName === gameDelegate.liveName
@@ -1606,8 +1696,8 @@ Window {
                         anchors {
                             top: parent.top
                             right: parent.right
-                            topMargin: 4
-                            rightMargin: 5
+                            topMargin: 8
+                            rightMargin: 9
                         }
                         width: 32; height: 32; radius: 16
                         z: 2                     // above the lifted column
@@ -1619,7 +1709,7 @@ Window {
                         border.color: overflowButton.hovered ? Theme.focusRing : Theme.borderStrong
 
                         visible: opacity > 0
-                        opacity: (gameDelegate.highlighted || overflowButton.menuOpen)
+                        opacity: (gameDelegate.highlighted && !overflowButton.menuOpen)
                                  ? 0.6 : 0.0
                         Behavior on opacity { NumberAnimation { duration: 150 } }
                         Behavior on color { ColorAnimation { duration: 120 } }
@@ -1984,6 +2074,13 @@ Window {
                                             // centring pushed the art of the
                                             // two-line cards up out of line
                                             // with its neighbours.
+                                            CoverGlow {
+                                                target: recommendationCard
+                                                stage: glowStage
+                                                source: recommendationCover
+                                                lit: recommendationDelegate.highlighted
+                                            }
+
                                             Column {
                                                 anchors.top: parent.top
                                                 anchors.horizontalCenter: parent.horizontalCenter
@@ -2341,11 +2438,19 @@ Window {
                             }
                         }
 
+                        CoverGlow {
+                            target: wishlistCard
+                            stage: glowStage
+                            source: wishlistCover
+                            lit: wishlistDelegate.highlighted
+                        }
+
                         Column {
                             anchors.centerIn: parent
                             spacing: 12
 
                             Rectangle {
+                                id: wishlistCard
                                 width: 240
                                 height: 360
                                 radius: 12
@@ -2426,6 +2531,7 @@ Window {
                 igdbConfigured: root.igdbConfigured
                 padActive: root.padActive
                 padInControl: root.padInControl
+                glowStage: glowStage
                 onOpenRequested: (item) => browseDetails.openFor(item)
                 onSettingsRequested: settingsWindow.open()
             }

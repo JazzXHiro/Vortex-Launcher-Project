@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
 import Vortex
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -30,6 +31,15 @@ Popup {
 
     // Read for the heart's state only; every action goes out as a signal.
     property var api: null
+
+    // What the frosted backdrop is captured from. It must not contain this
+    // popup: in a plain Window the overlay popups render into is a child of
+    // the window's content item, so capturing that feeds the menu's own tint
+    // back into its blur and it darkens with every redraw.
+    property Item backdropItem: null
+    // Where backdropItem sits in this popup's parent, read once per opening;
+    // the capture rectangle is in backdropItem's coordinates.
+    property point backdropOrigin: Qt.point(0, 0)
 
     // The game this menu was opened for. installDir is carried alongside the
     // name because it is the identity that survives a scan renaming a local
@@ -62,6 +72,8 @@ Popup {
     // -1 means "mouse only", so nothing is outlined until the pad opens this.
     // Same rule as GameDetails.focusedAction.
     property int focusedItem: -1
+    // The row under the mouse, or -1; the pad's counterpart is focusedItem.
+    property int hoveredItem: -1
 
     // Within the confirm step. Starts on CANCEL so a stray pad press removes
     // nothing, mirroring the uninstall confirm on the details page.
@@ -92,10 +104,19 @@ Popup {
     property real anchorW: 0
     property real anchorH: 0
 
-    // The ring of panel around the button, and so the width of the pill.
-    readonly property real rim: 6
+    // The panel around the button, kept to a hairline so the column stays
+    // slim and its cells short -- just enough for the panel's edge to clear
+    // the button's own outline. Every cell is this same square.
+    readonly property real rim: 1
     readonly property real pillWidth: menuRoot.anchorW + 2 * menuRoot.rim
     readonly property real headerHeight: menuRoot.anchorH + 2 * menuRoot.rim
+
+    // A rounded bar rather than a capsule: the cells are square-ish blocks
+    // stacked under each other, and a capsule's half-circle ends would cut
+    // into the first and last of them.
+    readonly property real shellRadius: menuRoot.confirming !== "" ? 16 : 12
+    // A lit cell lets a little of the cover art through, like the panel does.
+    readonly property real fillAlpha: 0.7
 
     // Set when opened: true when there was no room below, in which case the
     // button becomes the BOTTOM cell and the list stretches upwards out of it.
@@ -130,6 +151,10 @@ Popup {
         menuRoot.anchorY = at.y
         menuRoot.anchorW = anchorItem.width
         menuRoot.anchorH = anchorItem.height
+        if (menuRoot.backdropItem) {
+            const origin = menuRoot.backdropItem.mapToItem(frame, 0, 0)
+            menuRoot.backdropOrigin = Qt.point(origin.x, origin.y)
+        }
 
         // Decided once per opening: flipping while the confirm step resizes
         // the panel would tear it off the button.
@@ -233,6 +258,9 @@ Popup {
         // Starts on CANCEL for the pad, unarmed for the mouse -- the same
         // -1 convention the rest of the selection uses.
         menuRoot.armedChoice = menuRoot.focusedItem >= 0 ? menuRoot.armedCancel : -1
+        // The rows are torn down for the confirm, and a row destroyed under
+        // the cursor never reports the mouse leaving it.
+        menuRoot.hoveredItem = -1
         menuRoot.confirming = kind
     }
 
@@ -257,10 +285,13 @@ Popup {
     Behavior on width  { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
     Behavior on height { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
 
-    // Modal so a click outside is CONSUMED as well as closing this: without it
-    // the same press lands on the card underneath and opens the details page.
-    // dim stays off -- this is a small menu, not a page.
-    modal: true
+    // Not modal: a modal popup swallows the mouse wheel everywhere, so the page
+    // could not be scrolled while this was open. A press outside still has to
+    // be CONSUMED as well as closing this, though -- otherwise the same press
+    // lands on the card underneath and opens the details page -- so the
+    // window lays a catcher over the page while this is visible (see
+    // tileMenuCatcher in main.qml) that eats presses and lets the wheel by.
+    modal: false
     dim: false
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
@@ -275,18 +306,40 @@ Popup {
             easing.type: Easing.OutCubic
         }
     }
+    // Rolled back up into the button -- unless the page is scrolling out from
+    // under it, when the card is already moving away and a roll towards where
+    // the button was would chase nothing; then the whole panel just fades.
     exit: Transition {
         NumberAnimation {
             property: "reveal"
-            from: 1; to: 0
-            duration: 170
+            from: 1; to: menuRoot.fadingOut ? 1 : 0
+            duration: menuRoot.fadingOut ? 0 : 170
             easing.type: Easing.InCubic
+        }
+        NumberAnimation {
+            property: "opacity"
+            from: 1; to: menuRoot.fadingOut ? 0 : 1
+            duration: menuRoot.fadingOut ? 80 : 0
+            easing.type: Easing.OutQuad
         }
     }
 
+    property bool fadingOut: false
+
+    // The page under the menu is scrolling: get out of the way at once.
+    function dismissForScroll() {
+        if (!menuRoot.visible || menuRoot.fadingOut)
+            return
+        menuRoot.fadingOut = true
+        menuRoot.close()
+    }
+
     onClosed: {
+        menuRoot.fadingOut = false
+        menuRoot.opacity = 1
         menuRoot.confirming = ""
         menuRoot.focusedItem = -1
+        menuRoot.hoveredItem = -1
         menuRoot.armedChoice = -1
     }
 
@@ -312,19 +365,114 @@ Popup {
             // half-transparent button underneath it.
             opacity: Math.min(1, menuRoot.reveal * 5)
 
-            Rectangle {
+            // ── Frosted backdrop ─────────────────────────────────────────────
+            // Whatever is behind the panel, blurred, so the art seeping through
+            // it reads as glass rather than competing with the icons. Captured
+            // from backdropItem, which the caller points at the page beneath --
+            // never at anything holding the overlay this popup renders in (see
+            // backdropItem).
+            //
+            // A blur's edge pixels sample past the area they blur, so the
+            // capture reaches a blur radius further out on every side and the
+            // result is cut back to the panel's rounded shape afterwards;
+            // otherwise the rim of the glass would fade to black.
+            Item {
+                id: backdrop
+                readonly property real pad: backdropBlur.blurMax
                 anchors.fill: parent
-                // See-through so the cover art shows behind it, like the ⋮ button
-                // it grows out of; the icons on top stay solid.
-                color: Qt.alpha(Theme.bgSurface, 0.7)
-                radius: menuRoot.confirming !== "" ? 16 : menuRoot.pillWidth / 2
-                border.color: Theme.borderControl
-                border.width: 1
+                visible: menuRoot.visible && menuRoot.backdropItem !== null
+
+                layer.enabled: true
+                layer.effect: MultiEffect {
+                    maskEnabled: true
+                    maskSource: backdropMask
+                }
+
+                ShaderEffectSource {
+                    id: backdropSource
+                    x: -backdrop.pad; y: -backdrop.pad
+                    width: backdrop.width + 2 * backdrop.pad
+                    height: backdrop.height + 2 * backdrop.pad
+                    visible: false
+                    sourceItem: menuRoot.backdropItem
+                    // The popup's x/y are in the parent's coordinates, and it
+                    // has no margins to push it off them; shifted from there
+                    // into backdropItem's own.
+                    sourceRect: Qt.rect(menuRoot.x + unroll.x - backdrop.pad - menuRoot.backdropOrigin.x,
+                                        menuRoot.y + unroll.y - backdrop.pad - menuRoot.backdropOrigin.y,
+                                        backdropSource.width, backdropSource.height)
+                    live: menuRoot.visible
+                }
+
+                MultiEffect {
+                    id: backdropBlur
+                    anchors.fill: backdropSource
+                    source: backdropSource
+                    autoPaddingEnabled: false
+                    blurEnabled: true
+                    blur: 0.8
+                    // Kept tight: the panel is barely wider than the button,
+                    // and a wide blur drags in colour from well past the card.
+                    blurMax: 16
+                }
+
+                // A light tint over the glass so the icons have something to
+                // sit on; inside the masked layer, so it is cut to the same
+                // shape -- hole and all -- as the blur.
+                Rectangle {
+                    anchors.fill: parent
+                    color: Qt.alpha(Theme.bgSurface, 0.45)
+                }
+            }
+
+            // ── The glass's shape ────────────────────────────────────────────
+            // The panel's outline, minus the lit cell: that one's colour sits
+            // straight over the art instead of over frosted glass, so it reads
+            // clean rather than smeared. Built as the strips above and below
+            // the lit cell, since a mask can only add coverage, not punch it.
+            readonly property int litItem:
+                menuRoot.padInControl ? menuRoot.focusedItem
+                : menuRoot.mouseInControl ? menuRoot.hoveredItem : -1
+            readonly property real holeY:
+                menuRoot.confirming !== "" ? -1
+                : headerFill.lit ? header.y
+                : unroll.litItem >= 0
+                  ? menuBody.y + menuBody.topPadding + unroll.litItem * menuRoot.headerHeight
+                : -1
+            readonly property bool hasHole: unroll.holeY >= 0
+
+            Item {
+                id: backdropMask
+                anchors.fill: parent
+                visible: false
+                layer.enabled: true
+
+                Rectangle {
+                    width: parent.width
+                    height: unroll.hasHole ? unroll.holeY : parent.height
+                    topLeftRadius: menuRoot.shellRadius
+                    topRightRadius: menuRoot.shellRadius
+                    bottomLeftRadius: unroll.hasHole ? 0 : menuRoot.shellRadius
+                    bottomRightRadius: unroll.hasHole ? 0 : menuRoot.shellRadius
+                }
+                // Collapsed to nothing rather than hidden when there is no
+                // hole: a child of a hidden layered item that turns visible
+                // later is never drawn into the layer, which left everything
+                // below the lit cell bare.
+                Rectangle {
+                    y: unroll.hasHole ? unroll.holeY + menuRoot.headerHeight : parent.height
+                    width: parent.width
+                    height: Math.max(0, parent.height - y)
+                    bottomLeftRadius: menuRoot.shellRadius
+                    bottomRightRadius: menuRoot.shellRadius
+                }
             }
 
             // ── The button's own cell ────────────────────────────────────────
-            // The ⋮ redrawn where the real one sits, lit as "open". Clicking it
-            // closes the menu, which is what clicking the real one would do.
+            // The ⋮ redrawn where the real one sits, lit as "open" -- the
+            // panel's first cell, like the action cells below it, rather than a
+            // circle of its own. Clicking it closes the menu, which is what
+            // clicking the real one would do.
             Item {
                 id: header
                 width: menuRoot.pillWidth
@@ -333,21 +481,35 @@ Popup {
                 y: menuRoot.openUpward ? unroll.height - header.height : 0
 
                 Rectangle {
-                    anchors.centerIn: parent
-                    width: menuRoot.anchorW; height: menuRoot.anchorH
-                    radius: width / 2
-                    color: headerArea.containsMouse ? Qt.alpha(Theme.bgEmphasis, 0.8) : Qt.alpha(Theme.bgActive, 0.55)
-                    border.width: 1
-                    border.color: Theme.focusRing
+                    id: headerFill
+                    readonly property bool lit: headerArea.containsMouse && menuRoot.mouseInControl
+                    // Rounded only on the panel's outer corners, so the fill
+                    // is the cell itself lighting up. In the confirm step the
+                    // cell sits in the panel's right-hand corner, so its left
+                    // side is interior.
+                    readonly property real outer: menuRoot.shellRadius
+                    readonly property real leftOuter: menuRoot.confirming !== "" ? 0 : headerFill.outer
+
+                    anchors.fill: parent
+                    topLeftRadius:     menuRoot.openUpward ? 0 : headerFill.leftOuter
+                    topRightRadius:    menuRoot.openUpward ? 0 : headerFill.outer
+                    bottomLeftRadius:  menuRoot.openUpward ? headerFill.leftOuter : 0
+                    bottomRightRadius: menuRoot.openUpward ? headerFill.outer : 0
+                    color: headerFill.lit ? Qt.alpha(Theme.bgPressed, menuRoot.fillAlpha) : "transparent"
+                    Behavior on color { ColorAnimation { duration: 120 } }
 
                     Column {
                         anchors.centerIn: parent
                         spacing: 3
+                        // Turns from ⋮ to ⋯ as the menu unrolls, and back as it
+                        // rolls up -- riding reveal so it moves in step with
+                        // the panel rather than on a clock of its own.
+                        rotation: 90 * menuRoot.reveal
                         Repeater {
                             model: 3
                             Rectangle {
                                 width: 4; height: 4; radius: 2
-                                color: Theme.accent
+                                color: headerFill.lit ? Theme.textInverse : Theme.accent
                             }
                         }
                     }
@@ -385,30 +547,40 @@ Popup {
                    ? unroll.height - menuRoot.headerHeight - menuBody.height
                    : menuRoot.headerHeight
                 width: unroll.width
-                leftPadding: menuRoot.confirming !== "" ? 10 : menuRoot.rim
+                // The icon cells run edge to edge and butt against each
+                // other; only the confirm step's text needs breathing room.
+                leftPadding: menuRoot.confirming !== "" ? 10 : 0
                 rightPadding: menuBody.leftPadding
-                topPadding: menuRoot.openUpward ? menuRoot.rim : 0
-                bottomPadding: menuRoot.openUpward ? 0 : 10
-                spacing: 6
+                topPadding: menuRoot.confirming !== "" && menuRoot.openUpward ? 6 : 0
+                bottomPadding: menuRoot.confirming !== "" && !menuRoot.openUpward ? 10 : 0
+                spacing: 0
                 opacity: Math.max(0, (menuRoot.reveal - 0.3) / 0.7)
 
                 // ── Step 1: the actions, as icons ────────────────────────────
                 Repeater {
                     model: menuRoot.confirming === "" ? menuRoot.items : []
 
-                    delegate: Column {
+                    // Each action is a cell of the panel itself, the same size
+                    // as the button's own, split from its neighbours by a
+                    // full-width rule -- no button-in-a-button.
+                    delegate: Item {
                         id: itemSlot
                         required property string modelData
                         required property int index
-                        spacing: 6
+                        width: menuRoot.pillWidth
+                        height: menuRoot.headerHeight
 
-                        // A hairline between rows -- and between the button's
-                        // cell and the first one -- so the pill reads as a list.
+                        // The rule on the side facing the button's cell, so
+                        // there is one between that cell and the first row and
+                        // one between every pair of rows after it.
+                        // Above the fill, so a lit cell keeps its edge.
                         Rectangle {
-                            visible: !menuRoot.openUpward || itemSlot.index > 0
-                            width: menuRoot.anchorW; height: 1
-                            color: Theme.borderControl
-                            opacity: 0.6
+                            z: 1
+                            y: menuRoot.openUpward ? itemSlot.height - 1 : 0
+                            width: itemSlot.width; height: 1
+                            // A faint light line rather than a dark one, so it
+                            // reads as a seam in the glass, not a black rule.
+                            color: Qt.alpha(Theme.textPrimary, 0.18)
                         }
 
                         Rectangle {
@@ -418,23 +590,31 @@ Popup {
                                 || (itemArea.containsMouse && menuRoot.mouseInControl)
                             readonly property bool isLike: itemSlot.modelData === "like"
                             // Remove and Uninstall both take something away, so
-                            // both warm to red; Like warms to the heart's pink.
+                            // both light red; Like lights the same whitish grey
+                            // as the ⋮ cell, which the pink heart reads against.
                             readonly property color hotColor:
-                                itemButton.isLike ? Theme.favorite : Theme.dangerRest
+                                Qt.alpha(itemButton.isLike ? Theme.bgPressed : Theme.dangerRest, menuRoot.fillAlpha)
                             readonly property color glyphColor:
                                 (itemButton.isLike && menuRoot.liked) ? Theme.favorite
+                                : (itemButton.emphasized && itemButton.isLike) ? Theme.textInverse
                                 : itemButton.emphasized ? Theme.textPrimary
                                 : Theme.textSecondary
 
-                            width: 32; height: 32
-                            radius: 16
-                            color: itemButton.emphasized
-                                   && !(itemButton.isLike && menuRoot.liked)
-                                   ? itemButton.hotColor : Qt.alpha(Theme.bgActive, 0.55)
-                            border.width: itemButton.emphasized ? 2 : 1
-                            border.color: itemButton.emphasized ? Theme.focusRing
-                                        : (itemButton.isLike && menuRoot.liked) ? Theme.favorite
-                                        : Theme.borderControl
+                            // The end cell's fill takes the panel's rounded
+                            // corners on its outer side; every other edge is
+                            // square against a neighbour.
+                            readonly property bool atTop:
+                                menuRoot.openUpward && itemSlot.index === 0
+                            readonly property bool atBottom:
+                                !menuRoot.openUpward && itemSlot.index === menuRoot.items.length - 1
+
+                            // The whole cell lights, not a box inside it.
+                            anchors.fill: parent
+                            topLeftRadius:     itemButton.atTop ? menuRoot.shellRadius : 0
+                            topRightRadius:    itemButton.atTop ? menuRoot.shellRadius : 0
+                            bottomLeftRadius:  itemButton.atBottom ? menuRoot.shellRadius : 0
+                            bottomRightRadius: itemButton.atBottom ? menuRoot.shellRadius : 0
+                            color: itemButton.emphasized ? itemButton.hotColor : "transparent"
 
                             Behavior on color { ColorAnimation { duration: 120 } }
 
@@ -489,6 +669,12 @@ Popup {
                                 hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: menuRoot.trigger(itemSlot.modelData)
+                                onContainsMouseChanged: {
+                                    if (itemArea.containsMouse)
+                                        menuRoot.hoveredItem = itemSlot.index
+                                    else if (menuRoot.hoveredItem === itemSlot.index)
+                                        menuRoot.hoveredItem = -1
+                                }
                             }
 
                             ToolTip.visible: itemArea.containsMouse && menuRoot.mouseInControl
@@ -496,16 +682,6 @@ Popup {
                             ToolTip.text: itemSlot.modelData === "remove" ? "Remove from launcher"
                                         : itemSlot.modelData === "uninstall" ? "Uninstall"
                                         : menuRoot.liked ? "Unfavorite" : "Favorite"
-                        }
-
-                        // Upwards, the button's cell is under the last row, so
-                        // that one carries the hairline beneath it instead.
-                        Rectangle {
-                            visible: menuRoot.openUpward
-                                     && itemSlot.index === menuRoot.items.length - 1
-                            width: menuRoot.anchorW; height: 1
-                            color: Theme.borderControl
-                            opacity: 0.6
                         }
                     }
                 }

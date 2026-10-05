@@ -15,6 +15,8 @@ Item {
     property bool igdbConfigured: false
     property bool padActive: false
     property bool padInControl: false
+    // main.qml's glowStage, which the cards' hover glows are drawn on.
+    property Item glowStage: null
     readonly property bool mouseInControl: !page.padInControl
 
     // main.qml steers whichever view is showing with the pad like any other
@@ -404,11 +406,19 @@ Item {
                 }
             }
 
+            CoverGlow {
+                target: resultCard
+                stage: page.glowStage
+                source: resultCover
+                lit: resultDelegate.highlighted
+            }
+
             Column {
                 anchors.centerIn: parent
                 spacing: resultDelegate.compact ? 10 : 12
 
                 Rectangle {
+                    id: resultCard
                     width: resultDelegate.width
                     height: resultDelegate.compact ? newRail.coverHeight : 360
                     radius: resultDelegate.compact ? 10 : 12
