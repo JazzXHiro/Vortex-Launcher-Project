@@ -53,4 +53,8 @@ void phase_done(const std::string &name, double seconds, int ok, int cached,
 // file could not be opened -- console output still works in that case.
 std::string file_path();
 
+// Human-readable length: "1h 23m", "4m 10s", "12s". The log is read by someone
+// asking "did that count", and 4980 does not answer that as directly as 1h 23m.
+std::string duration(long long seconds);
+
 }  // namespace vlog

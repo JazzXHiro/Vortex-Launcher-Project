@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QHash>
 #include <QSet>
+#include <QSize>
 #include <QStringList>
 #include <QVariantList>
 #include <QVariantMap>
@@ -25,6 +26,7 @@ struct BridgeGame {
     fs::path    gamePath;    // local exe path only (empty for Steam games)
     std::string scannedName; // the name pass 1 found, before any rename
     std::string customName;  // the user's own title, "" when not renamed
+    bool        isEa     = false; // a Local game the EA app launches (read_ea_install)
 };
 
 class VortexBridge : public QObject {
@@ -194,6 +196,21 @@ public:
     // game whose folder disagrees with its IGDB title showed NO ART forever.
     // installDir is fixed at scan time and survives the rename.
     Q_INVOKABLE QVariantMap gameDetailsForInstallDir(QString installDir) const;
+
+    // The Image.sourceSize that decodes `source` no larger than a width x height
+    // box (logical pixels, at dpr) needs: covering the box when `crop`, fitting
+    // inside it otherwise. SteamGridDB art under Images/ runs to 3840x1240
+    // heroes and 8000-pixel logos, tens of MB each once decoded, drawn a few
+    // hundred pixels across.
+    //
+    // Never upscales. Qt scales to sourceSize in both directions under the
+    // PreserveAspect fill modes, so a fixed box would blow a 540x720 portrait
+    // up past the banner's width; reading the file's real size first is what
+    // keeps a small image at its own size. Only local files are measured, from
+    // the header alone -- a remote URL, or a file that cannot be read, answers
+    // (-1, -1), which Image takes as its natural size.
+    Q_INVOKABLE QSize decodeSize(QString source, qreal width, qreal height,
+                                 bool crop, qreal dpr) const;
 
     // Configured local game folders, as plain path strings for the settings panel.
     QVariantList localDirectories() const;
@@ -410,6 +427,17 @@ signals:
 
 private:
     QVariantList            m_gameList;
+    // Row positions in m_gameList by installDir and by exact name, for
+    // gameDetailsFor*(). Every card in the library grid asks on creation, and
+    // a linear scan copying each row's map made that O(library) per card --
+    // twice over for a Played row with no install directory. Rebuilt lazily
+    // on the next lookup after invalidateGameIndex(), which every write to
+    // m_gameList calls.
+    mutable QHash<QString, int> m_rowByInstallDir;
+    mutable QHash<QString, int> m_rowByName;
+    mutable bool                m_gameIndexValid = false;
+    void invalidateGameIndex() { m_gameIndexValid = false; }
+    void ensureGameIndex() const;
     QVariantList            m_recommendationList;
     QVariantList            m_wishlist;
     QVariantList            m_favoriteSnapshots;

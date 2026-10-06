@@ -19,6 +19,7 @@ option(VORTEX_DEPLOY_QT "Run windeployqt after building VortexLauncher" ON)
 
 set(VORTEX_ENGINE_SOURCES
     source/app_paths.cpp
+    source/ea_manager.cpp
     source/game_manager.cpp
     source/idle_tracker.cpp
     source/igdb_manager.cpp
@@ -102,11 +103,14 @@ qt_add_qml_module(VortexLauncher
         ui/BrowseDetails.qml
         ui/FrostedHero.qml
         ui/LoadingBar.qml
+        ui/LoadingGamepad.qml
         ui/HeartIcon.qml
         ui/CoverGlow.qml
+        ui/WheelScroller.qml
     RESOURCES
         ui/assets/steam.png
         ui/assets/local.png
+        ui/assets/ea.png
         ui/assets/thumb_up.png
         ui/assets/thumb_down.png
         ui/assets/arrow_left.png

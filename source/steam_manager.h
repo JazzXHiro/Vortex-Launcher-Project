@@ -26,6 +26,10 @@ bool launch_steam_game_by_appid(int appid);
 bool uninstall_steam_game_by_appid(int appid);
 int get_steam_appid_for_install_dir(const fs::path& installDir);
 
+// Every Steam library root (the folders holding steamapps\), from
+// libraryfolders.vdf. Empty when Steam is not installed.
+std::vector<fs::path> steam_library_folders();
+
 // True while any Steam library still holds appmanifest_<appid>.acf -- the same
 // file read_installed_steam_games() discovers games by, so the two agree on
 // what "installed" means. steam://uninstall only opens Steam's own confirm

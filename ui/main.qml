@@ -627,31 +627,30 @@ Window {
 
     // ── Header backdrop ─────────────────────────────────────────────────────
     //
-    // Window-coloured cover over everything above the scrolling view, between
+    // Window-coloured cover over the tab bar and everything above it, between
     // the glows and the content. Clear at the top of the page, so the top
     // row's glow rises softly behind the tabs. Once scrolled, the lit card can
     // be half under the view's top edge with its whole glow spilling up into
-    // the header -- too strong there -- so the header goes opaque.
+    // the header -- too strong there -- so the bar goes opaque.
+    //
+    // Down to the bar's bottom, not the scrolling view's top: covering the gap
+    // between them as well cut the glow off well short of the tabs.
     Rectangle {
         anchors { left: parent.left; right: parent.right; top: parent.top }
-        // Mapped rather than added up from the layout, since the view sits
-        // under a different stack of headers on each page. Re-read when the
-        // window resizes and when scrolling starts, which is all that moves
-        // it -- and is after the layout has settled.
         height: {
-            root.width; root.height; root.contentScrolled   // dependencies
-            return root.scrollingView ? root.scrollingView.mapToItem(null, 0, 0).y : 0
+            root.width; root.height; navBar.y; navBar.height   // dependencies
+            return navBar.mapToItem(null, 0, navBar.height).y
         }
         color: Theme.bgWindow
         visible: opacity > 0
         opacity: root.contentScrolled ? 1.0 : 0.0
         Behavior on opacity { NumberAnimation { duration: 200 } }
 
-        // A short fade past the view's top edge rather than a hard line: the
-        // glow in the gutters beside a clipped card tails off into it.
+        // A few pixels of fade below the bar, so the glow stops in a soft
+        // edge rather than a ruled line.
         Rectangle {
             anchors { left: parent.left; right: parent.right; top: parent.bottom }
-            height: 24
+            height: 8
             gradient: Gradient {
                 GradientStop { position: 0.0; color: Theme.bgWindow }
                 GradientStop { position: 1.0; color: "transparent" }
@@ -667,6 +666,7 @@ Window {
 
         // Top navigation + library filters
         Rectangle {
+            id: navBar
             Layout.fillWidth: true
             Layout.preferredHeight: 35
             // Clear, so a top-row card's glow shows through behind the tabs
@@ -1047,7 +1047,18 @@ Window {
                            : gameGrid.minCellWidth
                 cellHeight: 440
 
+                // Two rows built ahead of the viewport each way, and cards that
+                // leave it are pooled and handed the next row instead of being
+                // destroyed. Without either, a fast fling built every card --
+                // forty-odd objects and a library lookup each -- in the frame
+                // its row came into view, which is the stutter. The buffer is
+                // incubated across frames; see the delegate's onPooled /
+                // onReused for what a recycled card has to reset.
+                cacheBuffer: gameGrid.cellHeight * 2
+                reuseItems: true
+
                 ScrollBar.vertical: VortexScrollBar { }
+                WheelScroller { view: gameGrid }
 
                 // No current item until the pad asks for one. A model reload
                 // (first scan, filter change) puts it back to -1 for the mouse,
@@ -1235,6 +1246,13 @@ Window {
                     readonly property bool fromSteam:
                         gameDelegate.sourceLabel === "Steam"
 
+                    // A Local row the EA app launches. Live row first, as
+                    // sourceLabel reads it.
+                    readonly property bool fromEa:
+                        (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
+                            ? gameDelegate.liveDetails.isEa === true
+                            : gameDelegate.modelData.isEa === true
+
                     // applyGameMetadata() hands over the whole comma-separated
                     // list ("Role-playing (RPG), Simulator, Strategy"); only the
                     // first one fits under a 240px card.
@@ -1297,8 +1315,30 @@ Window {
                         if (Date.now() - root.popStamp <= 250)
                             gameDelegate.popIn()
                     }
+
+                    // reuseItems: a card scrolled out is parked here and later
+                    // handed another row rather than rebuilt, so neither
+                    // Component.onCompleted nor a fresh set of property defaults
+                    // happens again. Park it at rest -- no half-played pop-in,
+                    // no glow armed for the old cover -- and on reuse do what
+                    // onCompleted would have.
+                    property bool pooled: false
+                    GridView.onPooled: {
+                        gameDelegate.pooled = true
+                        gameEnterAnim.stop()
+                        gameDelegate.opacity = 1.0
+                        gameEnterShift.y = 0
+                        gameGlow.armed = false
+                    }
+                    GridView.onReused: {
+                        gameDelegate.pooled = false
+                        if (Date.now() - root.popStamp <= 250)
+                            gameDelegate.popIn()
+                    }
+
                     Connections {
                         target: root
+                        enabled: !gameDelegate.pooled
                         function onPopStampChanged() {
                             if (root.activeTab === "Library" || root.activeTab === "Favorites"
                                 || root.activeTab === "Played")
@@ -1343,6 +1383,7 @@ Window {
                     // Drawn on root's glowStage, behind the page: see
                     // CoverGlow.qml.
                     CoverGlow {
+                        id: gameGlow
                         target: capsuleContainer
                         stage: glowStage
                         source: gameCover
@@ -1378,75 +1419,32 @@ Window {
                                         ? gameDelegate.liveDetails.coverPath
                                         : (gameDelegate.modelData.coverPath || "")
                                 fillMode: Image.PreserveAspectCrop
+
+                                // Decoded off the UI thread, and at the card's
+                                // size. The covers are 600x900 (SteamGridDB's
+                                // grid size, larger for some local art), and a
+                                // full synchronous decode per card stalled the
+                                // frame each new row scrolled in on. With both
+                                // dimensions set, PreserveAspectCrop scales to
+                                // cover and crops, same as it draws; Qt applies
+                                // the device pixel ratio itself.
+                                asynchronous: true
+                                sourceSize.width: capsuleContainer.width
+                                sourceSize.height: capsuleContainer.height
+
                                 opacity: status === Image.Ready ? 1.0 : 0.0
                                 Behavior on opacity { NumberAnimation { duration: 250 } }
                             }
 
+                            // Only for a card with no art at all. Not merely
+                            // "not Ready": an asynchronous cover is Loading for a
+                            // few frames, and NO ART flashed on every card that
+                            // scrolled in.
                             Column {
                                 anchors.centerIn: parent; spacing: 10
-                                visible: gameCover.status !== Image.Ready
+                                visible: gameCover.status === Image.Null
+                                         || gameCover.status === Image.Error
                                 Text { text: "NO ART"; color: Theme.textGhost; font.bold: true }
-                            }
-
-                            // ── Source mark ─────────────────────────────────
-                            //
-                            // On the artwork rather than in the caption, which
-                            // leaves the caption for the two facts that have to
-                            // be read rather than recognised. White for both, so
-                            // Steam and local read as one set of marks and not
-                            // as two logos competing with the cover behind them.
-                            Item {
-                                anchors { left: parent.left; top: parent.top; margins: 5 }
-                                width: 30; height: 30
-                                opacity: 0.6
-
-                                // Library only, though this delegate also
-                                // serves Favorites and Played. Those two are
-                                // already narrowed to games you know, and
-                                // Played carries the marker that earns its
-                                // place there -- the green installed dot in
-                                // the caption, for the rows whose files are
-                                // gone. Library is the one grid you scan whole.
-                                visible: root.activeTab === "Library"
-
-                                // Steam's own colours, unfiltered. The mark is
-                                // a filled disc whose meaning is the contrast
-                                // between the pipe glyph and the circle behind
-                                // it, so anything that flattens it -- whitening
-                                // it especially -- costs the glyph the ground it
-                                // reads against. It is the one spot of colour on
-                                // an otherwise monochrome card, which is the
-                                // trade for it being recognisable at 30px.
-                                Image {
-                                    anchors.fill: parent
-                                    source: "assets/steam.png"
-                                    // Decoded at the size it is drawn, the way
-                                    // the Check on Steam button does it. The
-                                    // asset is 600x600: handed over whole, the
-                                    // GPU bilinear-samples a 20x reduction every
-                                    // frame and the glyph crawls with aliasing.
-                                    sourceSize.width: 30
-                                    sourceSize.height: 30
-                                    fillMode: Image.PreserveAspectFit
-                                    smooth: true
-                                    visible: gameDelegate.fromSteam
-                                }
-
-                                // The save mark off the design canvas, flattened
-                                // to white on transparent at build time rather
-                                // than by an effect at run time: it is a solid
-                                // silhouette, so the whitening the Steam disc
-                                // could not survive costs this one nothing, and
-                                // baking it keeps a framebuffer off every card.
-                                Image {
-                                    anchors.fill: parent
-                                    source: "assets/local.png"
-                                    sourceSize.width: 30
-                                    sourceSize.height: 30
-                                    fillMode: Image.PreserveAspectFit
-                                    smooth: true
-                                    visible: !gameDelegate.fromSteam
-                                }
                             }
 
                             // ── Focus treatment ───────────────────────
@@ -1584,13 +1582,76 @@ Window {
                             anchors.horizontalCenter: parent.horizontalCenter
                             spacing: 4
 
-                            Text {
+                            // ── Title ───────────────────────────────────────
+                            //
+                            // Source mark, then the name. The mark is Library
+                            // only, though this delegate also serves Favorites
+                            // and Played: those two are already narrowed to
+                            // games you know, and Library is the one grid you
+                            // scan whole.
+                            Row {
+                                id: titleRow
                                 anchors.horizontalCenter: parent.horizontalCenter
-                                text: gameDelegate.liveName
-                                color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
-                                font.pixelSize: 15; font.weight: Font.DemiBold
-                                horizontalAlignment: Text.AlignHCenter
-                                elide: Text.ElideRight; width: 220
+                                spacing: 6
+
+                                readonly property bool showMark: root.activeTab === "Library"
+
+                                Item {
+                                    visible: titleRow.showMark
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: 16; height: 16
+
+                                    // Steam's own colours, unfiltered: the mark
+                                    // is the contrast between the pipe glyph and
+                                    // the disc behind it, and whitening it costs
+                                    // the glyph its ground. Decoded at the drawn
+                                    // size -- the asset is 600x600, and handed
+                                    // over whole it aliases badly at 16px.
+                                    Image {
+                                        anchors.fill: parent
+                                        source: "assets/steam.png"
+                                        sourceSize.width: 16
+                                        sourceSize.height: 16
+                                        fillMode: Image.PreserveAspectFit
+                                        smooth: true
+                                        visible: gameDelegate.fromSteam
+                                    }
+
+                                    // EA's own disc, unfiltered for the same
+                                    // reason as Steam's. The asset is 1000x1000.
+                                    Image {
+                                        anchors.fill: parent
+                                        source: "assets/ea.png"
+                                        sourceSize.width: 16
+                                        sourceSize.height: 16
+                                        fillMode: Image.PreserveAspectFit
+                                        smooth: true
+                                        visible: gameDelegate.fromEa
+                                    }
+
+                                    // White on transparent, baked at build time.
+                                    Image {
+                                        anchors.fill: parent
+                                        source: "assets/local.png"
+                                        sourceSize.width: 16
+                                        sourceSize.height: 16
+                                        fillMode: Image.PreserveAspectFit
+                                        smooth: true
+                                        opacity: 0.7
+                                        visible: !gameDelegate.fromSteam && !gameDelegate.fromEa
+                                    }
+                                }
+
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: gameDelegate.liveName
+                                    color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
+                                    font.pixelSize: 15; font.weight: Font.DemiBold
+                                    elide: Text.ElideRight
+                                    // 220 across the whole row, as before.
+                                    width: Math.min(implicitWidth,
+                                                    titleRow.showMark ? 220 - 16 - titleRow.spacing : 220)
+                                }
                             }
 
                             // ── Caption ─────────────────────────────────────
@@ -1600,7 +1661,11 @@ Window {
                             // covers are the point of the grid, and enough of
                             // them are missing in a real library that the
                             // caption often has to carry the card on its own.
+                            //
+                            // Library cards are title-only; Played and
+                            // Favorites keep the caption.
                             Row {
+                                visible: root.activeTab !== "Library"
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 spacing: 7
 
@@ -1696,8 +1761,8 @@ Window {
                         anchors {
                             top: parent.top
                             right: parent.right
-                            topMargin: 8
-                            rightMargin: 9
+                            topMargin: 12
+                            rightMargin: 11
                         }
                         width: 32; height: 32; radius: 16
                         z: 2                     // above the lifted column
@@ -1818,6 +1883,7 @@ Window {
                         clip: true
                         contentHeight: recommendationSections.height
                         ScrollBar.vertical: VortexScrollBar { }
+                        WheelScroller { view: recommendationFlick }
 
                         Column {
                             id: recommendationSections
@@ -2101,6 +2167,16 @@ Window {
                                                         anchors.fill: parent
                                                         source: recommendationDelegate.modelData.coverPath || ""
                                                         fillMode: Image.PreserveAspectCrop
+                                                        // At the card's size, as the library
+                                                        // grid does -- but through the bridge,
+                                                        // which leaves IGDB's 264x374 remote
+                                                        // covers alone rather than upscaling
+                                                        // them, and shrinks local 600x900 art.
+                                                        sourceSize: root.api
+                                                            ? root.api.decodeSize(recommendationCover.source.toString(),
+                                                                                  recommendationCard.width, recommendationCard.height,
+                                                                                  true, Screen.devicePixelRatio)
+                                                            : Qt.size(-1, -1)
                                                         opacity: status === Image.Ready ? 1.0 : 0.0
                                                         Behavior on opacity { NumberAnimation { duration: 250 } }
                                                     }
@@ -2335,6 +2411,7 @@ Window {
                     }
 
                     ScrollBar.vertical: VortexScrollBar { }
+                    WheelScroller { view: wishlistGrid }
 
                     currentIndex: -1
 
@@ -2464,6 +2541,12 @@ Window {
                                     anchors.fill: parent
                                     source: wishlistDelegate.modelData.coverPath || ""
                                     fillMode: Image.PreserveAspectCrop
+                                    // Same as the recommendation cards.
+                                    sourceSize: root.api
+                                        ? root.api.decodeSize(wishlistCover.source.toString(),
+                                                              wishlistCard.width, wishlistCard.height,
+                                                              true, Screen.devicePixelRatio)
+                                        : Qt.size(-1, -1)
                                     opacity: status === Image.Ready ? 1.0 : 0.0
                                     Behavior on opacity { NumberAnimation { duration: 250 } }
                                 }

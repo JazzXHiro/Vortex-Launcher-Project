@@ -11,6 +11,7 @@
 #include <vector>
 #include <filesystem>
 #include <ctime>
+#include <cstdio>
 
 namespace fs = std::filesystem;
 
@@ -168,9 +169,12 @@ void record_play_session(const std::string& game_key, const std::string& game_na
     
     long long duration_seconds = static_cast<long long>(end_time - start_time);
 
-    // Idle is measured off a tick counter, which does not advance while the
-    // machine is asleep, whereas the wall clock the duration comes from does.
-    // Clamping keeps the two from ever disagreeing about which is larger.
+    // Idle and the duration come off different clocks -- the tick counter and
+    // the wall clock -- and nothing ties them together: the wall clock can be
+    // stepped mid-session by a time sync or by hand, and the tracker takes its
+    // last reading a moment after the end time was stamped. (Sleep is not a
+    // source of drift; both clocks keep counting through it.) Clamping keeps
+    // idle from ever claiming more than the session it belongs to.
     idle_seconds = std::max(0LL, std::min(idle_seconds, duration_seconds));
 
     auto stats = load_stats();
@@ -291,6 +295,94 @@ bool import_steam_baseline(const std::string& game_key, const std::string& game_
     }
 
     return false;
+}
+
+static fs::path get_launcher_imports_path() {
+    return g_base_dir.empty() ? fs::path("launcher_imports.txt")
+                              : (g_base_dir / "launcher_imports.txt");
+}
+
+bool launcher_history_imported(const std::string& game_key) {
+    std::ifstream file(get_launcher_imports_path());
+    const std::string prefix = game_key + "|";
+    std::string line;
+    while (std::getline(file, line))
+        if (line.compare(0, prefix.size(), prefix) == 0)
+            return true;
+    return false;
+}
+
+void mark_launcher_history_imported(const std::string& game_key,
+                                    const std::string& source) {
+    const fs::path path = get_launcher_imports_path();
+    const bool fresh = !fs::exists(path);
+    std::ofstream out(path, std::ios::app);
+    if (!out.is_open()) return;
+    if (fresh)
+        out << "# Vortex Launcher Imports\n"
+               "# Format: GAME_KEY|SOURCE|IMPORTED_AT -- history before this "
+               "was taken from the launcher, once\n";
+    out << game_key << "|" << source << "|" << format_time(std::time(nullptr))
+        << "\n";
+}
+
+// "2026-04-28 Tue 19:40:00", as format_time() writes it, back to local time.
+// Read by position rather than through %a, which locales spell differently.
+static std::time_t parse_log_time(const std::string& s) {
+    if (s.size() < 19) return 0;
+    std::tm tm_info{};
+    if (std::sscanf(s.c_str(), "%d-%d-%d", &tm_info.tm_year, &tm_info.tm_mon,
+                    &tm_info.tm_mday) != 3)
+        return 0;
+    if (std::sscanf(s.c_str() + s.size() - 8, "%d:%d:%d", &tm_info.tm_hour,
+                    &tm_info.tm_min, &tm_info.tm_sec) != 3)
+        return 0;
+    tm_info.tm_year -= 1900;
+    tm_info.tm_mon  -= 1;
+    tm_info.tm_isdst = -1;
+    return std::mktime(&tm_info);
+}
+
+std::vector<std::pair<std::time_t, std::time_t>>
+recorded_sessions(const std::string& game_key) {
+    std::vector<std::pair<std::time_t, std::time_t>> sessions;
+    std::ifstream file(get_sessions_file_path());
+    const std::string prefix = game_key + " |";
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        if (line.compare(0, prefix.size(), prefix) != 0) continue;
+
+        std::vector<std::string> fields;
+        for (size_t start = 0; start <= line.size();) {
+            const size_t pipe = line.find('|', start);
+            const size_t end  = pipe == std::string::npos ? line.size() : pipe;
+            std::string field = line.substr(start, end - start);
+            const size_t a = field.find_first_not_of(' ');
+            const size_t b = field.find_last_not_of(' ');
+            fields.push_back(a == std::string::npos ? std::string()
+                                                    : field.substr(a, b - a + 1));
+            if (pipe == std::string::npos) break;
+            start = pipe + 1;
+        }
+        if (fields.size() < 5) continue;
+
+        // Counted from the end, as the UI's last-played reader does: a game
+        // name holding a pipe shifts everything after it, and idle (a plain
+        // integer) trails the dates on every line written since it existed.
+        const std::string& last = fields.back();
+        const bool trailingIdle =
+            !last.empty() && last.find_first_not_of("0123456789") == std::string::npos;
+        const size_t endAt = fields.size() - (trailingIdle ? 2 : 1);
+        if (endAt < 4) continue;
+
+        const std::time_t start = parse_log_time(fields[endAt - 1]);
+        const std::time_t end   = parse_log_time(fields[endAt]);
+        if (start > 0 && end >= start)
+            sessions.emplace_back(start, end);
+    }
+    return sessions;
 }
 
 bool rekey_play_stats(const std::string& old_key, const std::string& new_key,

@@ -202,6 +202,7 @@ Item {
         delegate: resultCard
 
         ScrollBar.vertical: VortexScrollBar { }
+        WheelScroller { view: browseGrid }
 
         // A new answer is a new array; start from the top of it.
         onModelChanged: {

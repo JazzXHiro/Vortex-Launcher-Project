@@ -34,6 +34,8 @@ Item {
 
     // Not decoded until the card is first lit, so a grid full of cards costs
     // nothing until one is hovered. Kept afterwards: hovering back is free.
+    // A grid that recycles its cards clears it when one is pooled, so the
+    // glow is not armed for a cover the card no longer shows.
     property bool armed: false
     onLitChanged: if (glow.lit) glow.armed = true
 
@@ -41,7 +43,7 @@ Item {
     // The target's visible is its effective visibility: a lit card on a page
     // the StackLayout just switched away from must not leave its light behind.
     opacity: (glow.lit && glow.target && glow.target.visible
-              && swatch.status === Image.Ready) ? 0.8 : 0.0
+              && body.item && body.item.ready) ? 0.8 : 0.0
     Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
 
     // Over the target's centre, which its hover scale leaves where it is, and
@@ -59,64 +61,83 @@ Item {
         glow.scale = glow.target.scale
     }
     onVisibleChanged: if (glow.visible) glow.place()
-    FrameAnimation {
-        running: glow.visible
-        onTriggered: glow.place()
-    }
 
-    // Only decodes here; it is drawn through the layer below.
-    Image {
-        id: swatch
-        visible: false
-        asynchronous: true
-        source: (glow.armed && glow.source) ? glow.source.source : ""
-        sourceSize.width: 6
-        sourceSize.height: 9
-    }
-
-    // Behind a Loader, so only the lit card (and the one fading out behind
-    // it) pays for the framebuffers. The focus strip on the library card
-    // turns down a MultiEffect for exactly that cost on every card.
+    // Everything else waits for armed, so an unlit card carries this Item and
+    // an empty Loader and nothing more. Every card in a grid has a glow, and a
+    // decoder, a frame clock and a second Loader each were paid on every card
+    // built while scrolling, for the one under the mouse.
     Loader {
+        id: body
         anchors.fill: parent
-        anchors.margins: -glow.spread
-        // Dropped a little: the light pools under the card more than above it.
-        anchors.topMargin: -glow.spread + 10
-        anchors.bottomMargin: -glow.spread - 10
-        active: glow.visible
+        active: glow.armed
 
         sourceComponent: Item {
-            // The swatch stretched to full size in a layer of its own. Handed
-            // the 6x9 texture directly, MultiEffect blurs at that size and
-            // scales the result up, which came out as a hard-edged block with
-            // streaks; blurring a full-size texture is what spreads it.
-            Item {
-                id: wash
-                anchors.fill: parent
-                visible: false
-                layer.enabled: true
+            readonly property bool ready: swatch.status === Image.Ready
 
-                Image {
-                    anchors.fill: parent
-                    source: swatch.source
-                    sourceSize: swatch.sourceSize
-                    fillMode: Image.Stretch
-                    smooth: true
-                }
+            FrameAnimation {
+                running: glow.visible
+                onTriggered: glow.place()
             }
 
-            MultiEffect {
+            // Only decodes here; it is drawn through the layer below.
+            Image {
+                id: swatch
+                visible: false
+                asynchronous: true
+                source: glow.source ? glow.source.source : ""
+                sourceSize.width: 6
+                sourceSize.height: 9
+            }
+
+            // Behind a Loader, so only the lit card (and the one fading out
+            // behind it) pays for the framebuffers. The focus strip on the
+            // library card turns down a MultiEffect for exactly that cost on
+            // every card.
+            Loader {
                 anchors.fill: parent
-                source: wash
-                blurEnabled: true
-                blur: 1.0
-                blurMax: 64
-                // Past blurMax for a wider, softer reach. The coarse samples
-                // this costs are invisible on a wash with no detail in it.
-                blurMultiplier: 1.6
-                // A touch richer than the art, so a muted cover still throws
-                // a colour rather than grey.
-                saturation: 0.5
+                anchors.margins: -glow.spread
+                // Dropped a little: the light pools under the card more than
+                // above it.
+                anchors.topMargin: -glow.spread + 10
+                anchors.bottomMargin: -glow.spread - 10
+                active: glow.visible
+
+                sourceComponent: Item {
+                    // The swatch stretched to full size in a layer of its own.
+                    // Handed the 6x9 texture directly, MultiEffect blurs at that
+                    // size and scales the result up, which came out as a
+                    // hard-edged block with streaks; blurring a full-size
+                    // texture is what spreads it.
+                    Item {
+                        id: wash
+                        anchors.fill: parent
+                        visible: false
+                        layer.enabled: true
+
+                        Image {
+                            anchors.fill: parent
+                            source: swatch.source
+                            sourceSize: swatch.sourceSize
+                            fillMode: Image.Stretch
+                            smooth: true
+                        }
+                    }
+
+                    MultiEffect {
+                        anchors.fill: parent
+                        source: wash
+                        blurEnabled: true
+                        blur: 1.0
+                        blurMax: 64
+                        // Past blurMax for a wider, softer reach. The coarse
+                        // samples this costs are invisible on a wash with no
+                        // detail in it.
+                        blurMultiplier: 1.6
+                        // A touch richer than the art, so a muted cover still
+                        // throws a colour rather than grey.
+                        saturation: 0.5
+                    }
+                }
             }
         }
     }

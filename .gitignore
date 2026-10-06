@@ -137,6 +137,8 @@ Images/
 /removed_games.json
 /live_artwork.json
 /name_overrides.txt
+/launcher_exes.txt
+/launcher_imports.txt
 
 # =========================
 # User-specific CMake configuration

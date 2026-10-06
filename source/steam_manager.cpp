@@ -121,6 +121,13 @@ static vector<fs::path> parse_libraryfolders_vdf(const fs::path &steamPath) {
   return libs;
 }
 
+vector<fs::path> steam_library_folders() {
+  fs::path steamPath;
+  if (!get_steam_path_from_registry(steamPath))
+    return {};
+  return parse_libraryfolders_vdf(steamPath);
+}
+
 // ── Minimal VDF reader ───────────────────────────────────────────────────────
 // localconfig.vdf cannot be scraped with a regex the way libraryfolders.vdf is:
 // the same app id appears in several unrelated sections, so "Playtime" has to be

@@ -355,6 +355,7 @@ Popup {
         && detailsRoot.api.isWishlisted(detailsRoot.gameData.name)
 
     function scrollBy(delta) {
+        bodyWheel.stop()
         const limit = Math.max(0, body.contentHeight - body.height)
         body.contentY = Math.max(0, Math.min(limit, body.contentY + delta))
     }
@@ -532,6 +533,7 @@ Popup {
             contentHeight: page.height
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: VortexScrollBar { }
+            WheelScroller { id: bodyWheel; view: body }
 
             onContentYChanged: detailsRoot.updateTitleDock()
 
@@ -1217,7 +1219,7 @@ Popup {
             // so the wheel is passed on by hand.
             MouseArea {
                 anchors.fill: parent
-                onWheel: (wheel) => detailsRoot.scrollBy(-wheel.angleDelta.y)
+                onWheel: (wheel) => bodyWheel.take(wheel)
             }
 
             Text {

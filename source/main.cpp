@@ -8,6 +8,7 @@
 #include <string>
 
 #include "app_paths.h"
+#include "ea_manager.h"
 #include "game_manager.h"
 #include "idle_tracker.h"
 #include "igdb_manager.h"
@@ -613,7 +614,6 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
           continue;
       } else if (action == 1) {
         cout << "\nLaunching: " << selected.name << "...\n";
-        auto start_time = std::time(nullptr);
         
         if (selected.source == GameSource::Steam) {
             if (!launch_steam_game_by_appid(selected.appid)) {
@@ -635,23 +635,27 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
               cout << "[INFO] The game did not start within 2 minutes. No playtime recorded.\n";
             }
         } else {
-            // launchGame() blocks until the process exits, so the tracker
-            // running its own thread is what makes sampling possible here.
-            IdleTracker idle;
-            idle.start();
-            int code = launchGame(selected.gamePath);
-            auto end_time = std::time(nullptr);
-            const long long idle_seconds = idle.stop();
-            
-            if (code != 0) {
-              cout << "[INFO] Process exited with code: " << code << "\n";
+            // Blocks until the game and any launcher it came from have closed.
+            // Only the runs of the game itself come back, idle included. An EA
+            // app install is launched through the EA app instead.
+            EaGame ea;
+            const LocalSession session =
+                read_ea_install(selected.installDir, ea)
+                    ? run_ea_session(ea.contentId, selected.installDir)
+                    : run_local_session(selected.gamePath, selected.installDir);
+
+            if (!session.started) {
+              cout << "[WARN] Could not start the game.\n";
+            } else if (session.segments.empty() && session.viaLauncher) {
+              cout << "[INFO] The launcher closed without starting the game. "
+                      "No playtime recorded.\n";
             }
-            
-            if (end_time > start_time) {
-              long long duration = end_time - start_time;
-              record_play_session(key, selected.name, start_time, end_time,
-                                  idle_seconds);
-              report_session(key, duration, idle_seconds);
+
+            for (const PlaySegment &seg : session.segments) {
+              record_play_session(key, selected.name, seg.start, seg.end,
+                                  seg.idleSeconds);
+              report_session(key, static_cast<long long>(seg.end - seg.start),
+                             seg.idleSeconds);
             }
         }
         break; // Return to the main game list after game closes

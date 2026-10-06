@@ -2,9 +2,11 @@
 
 #include "idle_tracker.h"
 
+#include <algorithm>
 #include <chrono>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <windows.h>
 #include <xinput.h>
 #endif
@@ -142,8 +144,25 @@ void IdleTracker::run() {
     // or the first sample reports input that never happened.
     pads.sawInput();
 
-    const auto take = [&pads]() -> unsigned long {
-        return pads.sawInput() ? 0UL : system_idle_ms();
+    // When a pad last reported input -- or, until one does, when sampling
+    // began, since no-input time from before the game came up is not this
+    // session's to charge.
+    auto lastPadInput = std::chrono::steady_clock::now();
+
+    // A pad sample can only say "input since the last sample", so it becomes
+    // an idle figure of its own and the smaller of that and the system's wins.
+    // Zeroing just the one sample is not enough: the next quiet interval would
+    // hand back GetLastInputInfo's figure, which counts from the last keyboard
+    // or mouse touch -- for a controller player, possibly the whole session --
+    // and the following pad press would then charge all of it as idle.
+    const auto take = [&pads, &lastPadInput]() -> unsigned long {
+        const auto now = std::chrono::steady_clock::now();
+        if (pads.sawInput()) lastPadInput = now;
+        const auto sincePadMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - lastPadInput).count();
+        return std::min(system_idle_ms(),
+                        static_cast<unsigned long>(sincePadMs));
     };
 
     for (;;) {

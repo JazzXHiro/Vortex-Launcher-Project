@@ -148,6 +148,10 @@ $PersonalFiles = @(
     'manual_played.txt', 'removed_games.json', 'live_artwork.json',
     # Titles the user typed over the scanned ones, keyed by install path.
     'name_overrides.txt',
+    # Exes Vortex watched start a game, and the games whose PrismLauncher
+    # history has been imported -- the latter would stop the recipient's own
+    # Minecraft history from ever being imported.
+    'launcher_exes.txt', 'launcher_imports.txt',
     'playtime_sessions.log', 'playtime_stats.txt',
     'preferences.json', 'settings.json',
     'igdb_cache.txt', 'exe_cache.txt', 'game_metadata.txt',

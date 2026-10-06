@@ -260,6 +260,7 @@ Popup {
     }
 
     function scrollBy(delta) {
+        bodyWheel.stop()
         const limit = Math.max(0, body.contentHeight - body.height)
         body.contentY = Math.max(0, Math.min(limit, body.contentY + delta))
     }
@@ -518,6 +519,7 @@ Popup {
             contentHeight: page.height
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: VortexScrollBar { }
+            WheelScroller { id: bodyWheel; view: body }
 
             onContentYChanged: browseRoot.updateTitleDock()
 
@@ -855,11 +857,32 @@ Popup {
 
                     // Below the chips rather than above them, so they hold
                     // still when it goes and the sections take its place.
-                    Text {
+                    //
+                    // One of LoadingGamepad's five colourways, picked afresh each
+                    // time a load starts and never the same one twice running.
+                    Item {
+                        id: loadingIcon
+                        readonly property int variantCount: 5
+                        property int variant: 1
+
+                        function pickVariant() {
+                            const next = 1 + Math.floor(Math.random() * (variantCount - 1))
+                            variant = next >= variant ? next + 1 : next
+                        }
+
                         visible: browseRoot.loading
-                        text: "LOADING…"
-                        color: Theme.textGhost
-                        font.pixelSize: 14; font.bold: true; font.letterSpacing: 2
+                        onVisibleChanged: if (visible) pickVariant()
+                        Component.onCompleted: pickVariant()
+                        width: parent.width
+                        height: 340
+
+                        LoadingGamepad {
+                            anchors.centerIn: parent
+                            anchors.verticalCenterOffset: -35
+                            width: 224; height: 196
+                            variant: loadingIcon.variant
+                            running: parent.visible
+                        }
                     }
 
                     // About
@@ -1044,6 +1067,13 @@ Popup {
                                         anchors.margins: 2
                                         asynchronous: true
                                         fillMode: Image.PreserveAspectCrop
+                                        // IGDB's screenshot_med is a fixed 569x320,
+                                        // so the cap is known without reading it:
+                                        // the card's size, never past the original,
+                                        // since Qt would otherwise upscale it on a
+                                        // 2x screen.
+                                        sourceSize.width: Math.min(width, 569 / Screen.devicePixelRatio)
+                                        sourceSize.height: Math.min(height, 320 / Screen.devicePixelRatio)
                                         source: shot.modelData.thumb
                                         opacity: status === Image.Ready ? 1.0 : 0.0
                                         Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
@@ -1257,7 +1287,7 @@ Popup {
             // so the wheel is passed on by hand.
             MouseArea {
                 anchors.fill: parent
-                onWheel: (wheel) => browseRoot.scrollBy(-wheel.angleDelta.y)
+                onWheel: (wheel) => bodyWheel.take(wheel)
             }
 
             Text {

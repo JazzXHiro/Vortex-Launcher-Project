@@ -187,4 +187,17 @@ std::string file_path() {
     return g_path;
 }
 
+std::string duration(long long seconds) {
+    if (seconds < 0) seconds = 0;
+    const long long hours = seconds / 3600;
+    const long long minutes = (seconds % 3600) / 60;
+    const long long secs = seconds % 60;
+
+    if (hours > 0)
+        return std::to_string(hours) + "h " + std::to_string(minutes) + "m";
+    if (minutes > 0)
+        return std::to_string(minutes) + "m " + std::to_string(secs) + "s";
+    return std::to_string(secs) + "s";
+}
+
 }  // namespace vlog

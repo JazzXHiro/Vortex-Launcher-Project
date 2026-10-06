@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 #include <ctime>
 
@@ -57,6 +58,22 @@ long long get_baseline_playtime(const std::string& game_key);
 // "igdb_<id>", and seeding the wrong key would strand the import.
 bool import_steam_baseline(const std::string& game_key, const std::string& game_name,
                            long long steam_seconds);
+
+// launcher_imports.txt -- games whose history from before Vortex was taken from
+// a launcher's own records (PrismLauncher's Minecraft logs and totals).
+//
+// An explicit once-only marker, unlike the Steam import's non-zero baseline:
+// when a launcher's logs account for every hour, the baseline is legitimately
+// 0, and nothing else would stop the next scan importing the same sessions
+// again. Once marked, a game is tracked by Vortex alone.
+bool launcher_history_imported(const std::string& game_key);
+void mark_launcher_history_imported(const std::string& game_key,
+                                    const std::string& source);
+
+// The start and end of every session recorded for game_key in
+// playtime_sessions.log, so an import can leave out any it already has.
+std::vector<std::pair<std::time_t, std::time_t>>
+recorded_sessions(const std::string& game_key);
 
 // Moves a game's playtime from old_key to new_key, in both the stats file and
 // the sessions log, and stamps new_name on the row.

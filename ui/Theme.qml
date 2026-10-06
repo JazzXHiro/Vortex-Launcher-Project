@@ -133,12 +133,11 @@ QtObject {
     // The wash across the bottom of a card's artwork
     //
     // A focused card fades from its cover into this, which is what the play
-    // button sits on. Deep enough to carry white at full contrast, and its own
-    // blue rather than steamBg's -- that navy means "this came from Steam"
-    // everywhere else in the app and should not start meaning "hovered".
+    // button sits on. Deep enough to carry white at full contrast, and neutral
+    // so it darkens the cover without tinting it.
     // ─────────────────────────────────────────────────────────────────────────
 
-    readonly property color artScrim:        "#16324e"
+    readonly property color artScrim:        "#000000"
 
     // ─────────────────────────────────────────────────────────────────────────
     // Moods

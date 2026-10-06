@@ -1,5 +1,6 @@
 #include "vortex_bridge.h"
 #include "app_paths.h"
+#include "ea_manager.h"
 #include "game_manager.h"
 #include "idle_tracker.h"
 #include "igdb_manager.h"
@@ -20,6 +21,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -33,6 +35,7 @@
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QThread>
+#include <QtMath>
 #include <QTimer>
 #include <QUrl>
 #include <QUuid>
@@ -199,7 +202,7 @@ static void resolveIgdb(BridgeGame &bg) {
     else if (bg.source == "Steam")
         info = igdb_resolve_game(bg.name, false, bg.appid);
     else
-        info = igdb_resolve_game(bg.installDir.filename().string());
+        info = igdb_resolve_game(local_game_title(bg.installDir));
 
     if (info.id <= 0) {
         // A renamed game that IGDB has no answer for must not keep the id its
@@ -1086,6 +1089,7 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     QVariantMap game;
     game["name"]       = QString::fromStdString(bg.name);
     game["source"]     = QString::fromStdString(bg.source);
+    game["isEa"]       = bg.isEa;
     game["appid"]      = bg.appid;
     game["installDir"] = QString::fromStdString(bg.installDir.string());
     game["gamePath"]   = QString::fromStdString(bg.gamePath.string());   // empty for Steam
@@ -1166,6 +1170,7 @@ void VortexBridge::refreshGameList() {
     for (const BridgeGame &bg : m_internalGames)
         list << buildGameMap(bg);
     m_gameList = list;
+    invalidateGameIndex();
     syncPlayedLedger();
     emit gameListChanged();
     emit favoritesChanged();
@@ -3673,6 +3678,10 @@ void VortexBridge::loadGames() {
             bg.installDir = g.installDir;
             bg.gamePath   = g.gamePath;
             if (isRemovedIn(removedSnapshot, bg)) continue;
+            // The same test Play uses, so the card's EA mark means it will
+            // launch through the EA app and not just that EA made it.
+            EaGame ea;
+            bg.isEa       = read_ea_install(bg.installDir, ea);
             applyOverride(bg);
             internalGames.push_back(std::move(bg));
         }
@@ -3693,6 +3702,7 @@ void VortexBridge::loadGames() {
             QMetaObject::invokeMethod(this, [this, list, internalGames]() mutable {
                 m_internalGames = internalGames;
                 m_gameList      = list;
+                invalidateGameIndex();
                 // Steam totals are already on these rows, so a game played
                 // outside Vortex enters the ledger here -- before the details
                 // pass has had a chance to rename anything.
@@ -3736,6 +3746,87 @@ void VortexBridge::loadGames() {
             if (import_steam_baseline(makePtKey(bg), bg.name,
                                       get_steam_playtime_seconds(bg.appid)))
                 vlog::line("Scan", "imported Steam playtime for " + bg.name);
+        }
+
+        // --- PrismLauncher history import ---------------------------------
+        // Vortex follows Minecraft only from the first time it launches Prism;
+        // everything before that is in Prism's own records. Taken once, the
+        // first time the install is seen, and never again: from then on the
+        // launcher tracking is the record, and re-reading Prism would count
+        // every Vortex session a second time.
+        //
+        // Real sessions come first -- Minecraft keeps one log per launch, and
+        // their spans reproduce Prism's totals to the second -- so the
+        // recommender gets dates to weight, not one lump. Whatever Prism
+        // counts beyond the surviving logs becomes the baseline, the same as
+        // a Steam import.
+        //
+        // After pass 2 for the same reason as the Steam import: the key must
+        // be the IGDB one record_play_session() writes under.
+        for (const BridgeGame &bg : internalGames) {
+            if (bg.source != "Local" || bg.installDir.empty()) continue;
+            std::error_code ec;
+            if (!fs::exists(bg.installDir / "prismlauncher.exe", ec)) continue;
+
+            const std::string key = makePtKey(bg);
+            if (key.empty() || launcher_history_imported(key)) continue;
+
+            QString details, output;
+            const fs::path script = analyticsDir(m_baseDir) / "prism_history.py";
+            if (!runPythonScript(script, &details, &output,
+                                 QStringList{ QString::fromStdString(bg.installDir.string()) },
+                                 60000)) {
+                // Not marked, so the next scan tries again -- a missing
+                // interpreter or an absent data folder is not "nothing to import".
+                vlog::item("Scan", bg.name + " (PrismLauncher history)",
+                           vlog::Status::Fail,
+                           details.isEmpty() ? "no output" : details.trimmed().toStdString());
+                continue;
+            }
+
+            long long prismTotal = 0;
+            std::vector<std::pair<std::time_t, std::time_t>> found;
+            for (const QString &line : output.split('\n', Qt::SkipEmptyParts)) {
+                const QStringList parts = line.trimmed().split(' ', Qt::SkipEmptyParts);
+                if (parts.size() >= 2 && parts[0] == "TOTAL")
+                    prismTotal = parts[1].toLongLong();
+                else if (parts.size() >= 3 && parts[0] == "SESSION")
+                    found.emplace_back(static_cast<std::time_t>(parts[1].toLongLong()),
+                                       static_cast<std::time_t>(parts[2].toLongLong()));
+            }
+
+            // A session Vortex already recorded is its own; the log's copy of
+            // it would only count it twice.
+            const auto existing = recorded_sessions(key);
+            int imported = 0;
+            long long loggedSeconds = 0;
+            for (const auto &[start, end] : found) {
+                const bool overlaps = std::any_of(
+                    existing.begin(), existing.end(), [&](const auto &s) {
+                        return start < s.second && s.first < end;
+                    });
+                if (overlaps || end <= start) continue;
+                record_play_session(key, bg.name, start, end, 0);
+                loggedSeconds += static_cast<long long>(end - start);
+                ++imported;
+            }
+
+            // The "row exists, baseline 0" branch: Prism's total beyond what
+            // is now recorded is play no surviving log accounts for. Launcher-
+            // neutral despite the name -- it only compares two totals.
+            const long long before = get_play_stat(key).seconds;
+            import_steam_baseline(key, bg.name, prismTotal);
+            const long long unlogged = get_play_stat(key).seconds - before;
+
+            mark_launcher_history_imported(key, "prism");
+            vlog::line("Scan", "imported " + bg.name + " history from PrismLauncher: " +
+                               std::to_string(imported) + " sessions (" +
+                               vlog::duration(loggedSeconds) + ") from game logs" +
+                               (unlogged > 0 ? " + " + vlog::duration(unlogged) +
+                                               " with no log"
+                                             : std::string()) +
+                               " -- total " + vlog::duration(get_play_stat(key).seconds) +
+                               "; Vortex tracks it from here");
         }
 
         // Real outcomes, not a separate poll: whether the keys WORK is a
@@ -3815,7 +3906,7 @@ void VortexBridge::loadGames() {
                 const bool syncOk = runPythonScript(*syncScript, &syncDetails, &syncOut);
                 if (syncOk) {
                     vlog::item("Sync", "sync_local_data.py", vlog::Status::Ok,
-                               syncOut.trimmed().replace('\n', " | ").toStdString());
+                               syncOut.trimmed().remove('\r').replace('\n', " | ").toStdString());
                 } else {
                     // A failed sync means the recommender is about to run
                     // against stale or absent data, so the reason has to be in
@@ -3871,6 +3962,7 @@ void VortexBridge::updateGameRow(int index, const BridgeGame &game) {
     QMetaObject::invokeMethod(this, [this, index, map]() {
         if (index < 0 || index >= m_gameList.size()) return;
         m_gameList[index] = map;
+        invalidateGameIndex();
         scheduleArtNotify();
     }, Qt::QueuedConnection);
 }
@@ -3909,13 +4001,56 @@ void VortexBridge::reportScanProgress(const QString &phase, int done, int total)
     }, Qt::QueuedConnection);
 }
 
-QVariantMap VortexBridge::gameDetailsFor(QString name) const {
-    for (const QVariant &entry : m_gameList) {
-        const QVariantMap map = entry.toMap();
-        if (map.value("name").toString() == name)
-            return map;
+// First occurrence wins for both keys, as the linear scans these replace did.
+void VortexBridge::ensureGameIndex() const {
+    if (m_gameIndexValid)
+        return;
+    m_rowByInstallDir.clear();
+    m_rowByName.clear();
+    m_rowByInstallDir.reserve(m_gameList.size());
+    m_rowByName.reserve(m_gameList.size());
+    for (int i = 0; i < m_gameList.size(); ++i) {
+        const QVariantMap map = m_gameList[i].toMap();
+        const QString dir = map.value("installDir").toString();
+        if (!dir.isEmpty() && !m_rowByInstallDir.contains(dir))
+            m_rowByInstallDir.insert(dir, i);
+        const QString name = map.value("name").toString();
+        if (!m_rowByName.contains(name))
+            m_rowByName.insert(name, i);
     }
-    return {};
+    m_gameIndexValid = true;
+}
+
+QSize VortexBridge::decodeSize(QString source, qreal width, qreal height,
+                               bool crop, qreal dpr) const {
+    const QSize natural(-1, -1);
+    const QUrl url(source);
+    if (!url.isLocalFile() || width <= 0 || height <= 0 || dpr <= 0)
+        return natural;
+
+    const QSize original = QImageReader(url.toLocalFile()).size();
+    if (original.isEmpty())
+        return natural;
+
+    const qreal rw = width * dpr / original.width();
+    const qreal rh = height * dpr / original.height();
+    const qreal ratio = crop ? qMax(rw, rh) : qMin(rw, rh);
+    if (ratio >= 1.0)
+        return natural;
+
+    // Both sides at the one ratio, so Qt's own fit/crop arithmetic lands on
+    // exactly this size. Logical, since Qt multiplies sourceSize by the dpr;
+    // rounded up so the decode never comes out a pixel short of the box.
+    return QSize(qCeil(original.width() * ratio / dpr),
+                 qCeil(original.height() * ratio / dpr));
+}
+
+QVariantMap VortexBridge::gameDetailsFor(QString name) const {
+    ensureGameIndex();
+    const auto found = m_rowByName.constFind(name);
+    if (found == m_rowByName.constEnd() || *found >= m_gameList.size())
+        return {};
+    return m_gameList[*found].toMap();
 }
 
 // Keyed on install directory, which -- unlike the title -- is decided in pass 1
@@ -3927,12 +4062,11 @@ QVariantMap VortexBridge::gameDetailsForInstallDir(QString installDir) const {
     if (installDir.isEmpty())
         return {};
 
-    for (const QVariant &entry : m_gameList) {
-        const QVariantMap map = entry.toMap();
-        if (map.value("installDir").toString() == installDir)
-            return map;
-    }
-    return {};
+    ensureGameIndex();
+    const auto found = m_rowByInstallDir.constFind(installDir);
+    if (found == m_rowByInstallDir.constEnd() || *found >= m_gameList.size())
+        return {};
+    return m_gameList[*found].toMap();
 }
 
 // Append one feedback event as NDJSON.
@@ -3954,21 +4088,6 @@ void VortexBridge::appendFeedbackEvent(const QVariantMap &fields) {
         return;
     file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
     file.write("\n");
-}
-
-// Human-readable session length. The log is read by someone asking "did that
-// count", and 4980 does not answer that as directly as 1h 23m.
-static std::string formatDuration(long long seconds) {
-    if (seconds < 0) seconds = 0;
-    const long long hours = seconds / 3600;
-    const long long minutes = (seconds % 3600) / 60;
-    const long long secs = seconds % 60;
-
-    if (hours > 0)
-        return std::to_string(hours) + "h " + std::to_string(minutes) + "m";
-    if (minutes > 0)
-        return std::to_string(minutes) + "m " + std::to_string(secs) + "s";
-    return std::to_string(secs) + "s";
 }
 
 // Comma-joined labels, or "Unknown" for an empty set -- matching what
@@ -4159,13 +4278,15 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
     };
 
     QThread *thread = QThread::create([this, found, ptKey, name, markRunning]() {
-        std::time_t sessionStart = 0;
-        std::time_t sessionEnd   = 0;
         bool        played       = false;
         bool        syncOk       = true;
         bool        material     = false;
 
-        long long idleSeconds = 0;
+        // Each stretch the game itself ran. Steam yields at most one; a local
+        // game started through its launcher can yield several, and the time
+        // only the launcher was open is in none of them.
+        std::vector<PlaySegment> segments;
+        LocalSession local;
 
         if (found.source == "Steam") {
             launch_steam_game_by_appid(found.appid);
@@ -4174,21 +4295,26 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
             // session is observed: wait for the game to appear, then to go away.
             // Idle sampling belongs inside that call -- it must not start until
             // the game is actually up, or the wait for it counts as idle.
-            played = monitor_steam_session(found.appid, found.installDir,
-                                           &sessionStart, &sessionEnd,
-                                           &idleSeconds, markRunning);
+            PlaySegment seg;
+            if (monitor_steam_session(found.appid, found.installDir,
+                                      &seg.start, &seg.end,
+                                      &seg.idleSeconds, markRunning))
+                segments.push_back(seg);
         } else {
-            sessionStart = std::time(nullptr);
-            // launchGame() in game_manager blocks until the process exits, so
-            // the tracker running its own thread is what lets the local path
-            // measure idle the same way the Steam one does.
-            IdleTracker idle;
-            idle.start();
-            ::launchGame(found.gamePath, markRunning);
-            idleSeconds = idle.stop();
-            sessionEnd  = std::time(nullptr);
-            played      = sessionEnd > sessionStart;
+            // Blocks until the game and any launcher it came from have closed,
+            // sampling idle per run itself. A game the EA app installed bounces
+            // through the EA app when started directly, so it is launched there
+            // and waited for instead; every other local game is untouched.
+            EaGame ea;
+            if (read_ea_install(found.installDir, ea))
+                local = run_ea_session(ea.contentId, found.installDir,
+                                       markRunning);
+            else
+                local = run_local_session(found.gamePath, found.installDir,
+                                          markRunning);
+            segments = local.segments;
         }
+        played = !segments.empty();
 
         // The button goes back to PLAY now, not after the sync below, which
         // can take a few seconds and has nothing to do with the game.
@@ -4197,28 +4323,46 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
         }, Qt::QueuedConnection);
 
         if (!played) {
-            // A Steam launch that never started, or a process that exited
-            // immediately. Nothing downstream can change, and silence here is
-            // what makes "I played it and nothing happened" unanswerable.
-            vlog::item("Play", found.name, vlog::Status::Skipped,
-                       "no session detected -- the game never ran, or exited "
-                       "immediately");
+            // Nothing downstream can change, and silence here is what makes
+            // "I played it and nothing happened" unanswerable.
+            std::string why;
+            if (found.source != "Steam" && !local.started)
+                why = "could not start " + found.gamePath.filename().string();
+            else if (local.viaLauncher)
+                why = "launcher was open " + vlog::duration(local.launcherSeconds) +
+                      " but the game never started; nothing recorded";
+            else
+                why = "no session detected -- the game never ran, or exited "
+                      "immediately";
+            vlog::item("Play", found.name, vlog::Status::Skipped, why);
         }
 
         if (played) {
-            const long long durationSeconds =
-                static_cast<long long>(sessionEnd - sessionStart);
+            long long durationSeconds = 0;
+            long long idleSeconds     = 0;
+            for (const PlaySegment &seg : segments) {
+                durationSeconds += static_cast<long long>(seg.end - seg.start);
+                idleSeconds     += seg.idleSeconds;
+            }
 
             // The duration is reported unaltered, with idle beside it rather
             // than taken out of it -- that is what goes in the log, and a
             // figure quietly missing its idle would not match what is on disk.
-            std::string played_for = "played for " + formatDuration(durationSeconds);
+            std::string played_for = "played for " + vlog::duration(durationSeconds);
             if (idleSeconds > 0)
-                played_for += " (" + formatDuration(idleSeconds) + " idle)";
+                played_for += " (" + vlog::duration(idleSeconds) + " idle)";
+            if (segments.size() > 1)
+                played_for += " across " + std::to_string(segments.size()) + " runs";
+            if (local.viaLauncher)
+                played_for += " | launcher open " +
+                              vlog::duration(local.launcherSeconds) + ", not counted";
             vlog::item("Play", found.name, vlog::Status::Ok, played_for);
 
-            record_play_session(ptKey, found.name, sessionStart, sessionEnd,
-                                idleSeconds);
+            // One session per run, so the history shows when the game was
+            // actually up rather than one span bridging the launcher time.
+            for (const PlaySegment &seg : segments)
+                record_play_session(ptKey, found.name, seg.start, seg.end,
+                                    seg.idleSeconds);
 
             // Steam persists its own total when the game exits — drop our cached
             // copy so the refreshed list picks the new figure up.
@@ -4246,7 +4390,7 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
                 material = syncOutput.contains("MATERIAL=1");
 
                 vlog::item("Play", "sync_local_data.py", vlog::Status::Ok,
-                           syncOutput.trimmed().replace('\n', " | ").toStdString());
+                           syncOutput.trimmed().remove('\r').replace('\n', " | ").toStdString());
 
                 // Whether the session moved the ranking is decided by
                 // is_material() in sync_local_data.py, using the bands in
@@ -4422,6 +4566,7 @@ QString VortexBridge::setGameExecutable(QString installDir, QString exeUrl) {
             QVariantMap row = m_gameList[i].toMap();
             row["gamePath"] = newPath;
             m_gameList[i] = row;
+            invalidateGameIndex();
         }
         vlog::line("Library", bg.name + " now launches " + exePath.string());
         return newPath;
@@ -4484,6 +4629,7 @@ bool VortexBridge::renameGame(QString installDir, QString newName) {
 
     if (index < m_gameList.size())
         m_gameList[index] = buildGameMap(bg);
+    invalidateGameIndex();
     scheduleArtNotify();
     emit favoritesChanged();
     emit gameRowChanged(installDir);
@@ -4538,6 +4684,7 @@ bool VortexBridge::renameGame(QString installDir, QString newName) {
 
                 if (at < m_gameList.size())
                     m_gameList[at] = buildGameMap(live);
+                invalidateGameIndex();
                 syncPlayedLedger();
                 scheduleArtNotify();
                 emit favoritesChanged();
@@ -4673,6 +4820,7 @@ double VortexBridge::updatePreference(QString name, double score) {
                              Qt::CaseInsensitive) == 0) {
             row["status"] = newStatus;
             m_gameList[i] = row;
+            invalidateGameIndex();
             break;
         }
     }
