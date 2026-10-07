@@ -25,7 +25,7 @@
 #endif
 
 #define AppName        "Vortex"
-#define AppVersion     "1.3.1"
+#define AppVersion     "1.3.2"
 #define AppPublisher   "Vortex"
 #define AppExeName     "VortexLauncher.exe"
 
@@ -51,9 +51,10 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
-; The payload is dominated by the bundled Python (numpy, pandas, scikit-learn),
-; which compresses well but slowly. LZMA2/max is worth the packaging time to
-; keep the download reasonable.
+; The payload is dominated by the bundled Python (numpy, pandas, scikit-learn)
+; and, since the trailer player, Qt WebEngine's Chromium (Qt6WebEngineCore.dll
+; alone is ~200 MB). Both compress well but slowly. LZMA2/max is worth the
+; packaging time to keep the download reasonable.
 Compression=lzma2/max
 SolidCompression=yes
 OutputDir=..\dist
@@ -67,8 +68,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; The whole staged payload: the launcher, the Qt runtime, the app-local VC++
-; runtime, the bundled Python interpreter and the analytics scripts.
+; The whole staged payload: the launcher, the Qt runtime (including WebEngine's
+; QtWebEngineProcess.exe and resources\, and the FFmpeg media backend the
+; trailers play through), the app-local VC++ runtime, the bundled Python
+; interpreter and the analytics scripts.
+;
+; YouTube trailers run in WebEngine's default profile, which is off the record,
+; so Chromium writes no cookies or cache that the uninstaller would need to
+; clean up.
 ;
 ; The staging script guarantees this tree contains no .env, no database and no
 ; personal data -- it refuses to produce a payload otherwise.

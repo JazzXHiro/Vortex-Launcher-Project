@@ -6,6 +6,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QtWebEngineQuick/qtwebenginequickglobal.h>
 
 using namespace Qt::StringLiterals;
 
@@ -14,6 +15,9 @@ using namespace Qt::StringLiterals;
 void installControllerSupport(QQmlApplicationEngine &engine);
 
 int main(int argc, char *argv[]) {
+  // Has to come before the application object (YouTubePlayer.qml). Cheap:
+  // Chromium itself starts only when the first WebEngineView is created.
+  QtWebEngineQuick::initialize();
   QGuiApplication app(argc, argv);
 
   // In a build tree the exe sits at out/build/<config>/VortexLauncher.exe while

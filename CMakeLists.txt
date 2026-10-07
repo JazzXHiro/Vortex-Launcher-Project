@@ -10,7 +10,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # 1. Find the Qt6 packages used by the C++ entry point and QML files.
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 QuickLayouts QuickDialogs2 QuickEffects QuickShapes)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 QuickLayouts QuickDialogs2 QuickEffects QuickShapes Multimedia WebEngineQuick)
 
 # 2. Tell the compiler to look in the 'source' folder for your friend's headers (.h)
 include_directories(source)
@@ -54,6 +54,8 @@ qt_add_executable(VortexLauncher
     # so AUTOMOC has to see this file — it is deliberately not part of
     # VORTEX_ENGINE_SOURCES, which the CLI builds with AUTOMOC off.
     ui/controller_support.cpp
+    ui/trailer_playlist_server.cpp
+    ui/trailer_playlist_server.h
     ${VORTEX_ENGINE_SOURCES}
     ${VORTEX_MANIFEST}
 )
@@ -91,6 +93,8 @@ qt_add_qml_module(VortexLauncher
         QtQuick.Effects
         QtQuick.Shapes
         QtQuick.Layouts
+        QtMultimedia
+        QtWebEngine
     QML_FILES
         ui/Theme.qml
         ui/main.qml
@@ -109,6 +113,8 @@ qt_add_qml_module(VortexLauncher
         ui/CoverGlow.qml
         ui/WheelScroller.qml
         ui/RoundedCorners.qml
+        ui/TrailerPlayer.qml
+        ui/YouTubePlayer.qml
     RESOURCES
         ui/assets/steam.png
         ui/assets/local.png
@@ -142,6 +148,10 @@ target_link_libraries(VortexLauncher PRIVATE
     # RadialGradient behind each Steam review card in BrowseDetails.qml.
     Qt6::QuickShapes
     Qt6::QuickLayouts
+    # Steam trailers on the details page (TrailerPlayer.qml).
+    Qt6::Multimedia
+    # YouTube trailers for games Steam has none for (YouTubePlayer.qml).
+    Qt6::WebEngineQuick
 )
 
 if(MSVC)

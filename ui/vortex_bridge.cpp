@@ -12,6 +12,7 @@
 #include "steam_manager.h"
 #include "secrets.h"
 #include "steamgriddb_manager.h"
+#include "trailer_playlist_server.h"
 #include "vortex_log.h"
 
 #include <QMetaObject>
@@ -39,6 +40,7 @@
 #include <QtMath>
 #include <QTimer>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QUuid>
 
 #include <functional>
@@ -202,6 +204,10 @@ static void resolveIgdb(BridgeGame &bg) {
         info = igdb_resolve_game(bg.name, false);
     else if (bg.source == "Steam")
         info = igdb_resolve_game(bg.name, false, bg.appid);
+    // A Riot install sits in a patchline folder (...\VALORANT\live), and IGDB
+    // matched "live" to Katamari Damacy Rolling Live. Riot's own title instead.
+    else if (bg.isRiot)
+        info = igdb_resolve_game(bg.scannedName.empty() ? bg.name : bg.scannedName);
     else
         info = igdb_resolve_game(local_game_title(bg.installDir));
 
@@ -2643,6 +2649,8 @@ void VortexBridge::loadSettings() {
         m_ignoreLikedGames = object.value("ignoreLikedGames").toBool(false);
     if (object.contains("useSteamPlaytime"))
         m_useSteamPlaytime = object.value("useSteamPlaytime").toBool(false);
+    if (object.contains("trailersStartMuted"))
+        m_trailersStartMuted = object.value("trailersStartMuted").toBool(false);
 }
 
 void VortexBridge::saveSettings() const {
@@ -2653,6 +2661,7 @@ void VortexBridge::saveSettings() const {
     // stats_manager::use_steam_playtime() reads this same key straight off disk,
     // so the CLI shows whichever total the launcher is showing.
     object["useSteamPlaytime"] = m_useSteamPlaytime;
+    object["trailersStartMuted"] = m_trailersStartMuted;
 
     QFile file(pathToQString(settingsPath()));
     if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -2721,6 +2730,14 @@ void VortexBridge::setUseSteamPlaytime(bool enabled) {
     // already on disk, and the recommender was never given either of them.
     // refreshGameList() re-syncs the Played ledger on its way through.
     refreshGameList();
+}
+
+void VortexBridge::setTrailersStartMuted(bool enabled) {
+    if (enabled == m_trailersStartMuted)
+        return;
+    m_trailersStartMuted = enabled;
+    saveSettings();
+    emit trailersStartMutedChanged();
 }
 
 // A row taken off the wishlist keeps its "wishlisted" flag at false rather than
@@ -3082,6 +3099,7 @@ void VortexBridge::loadBrowseDetails(qlonglong igdbId) {
     m_browseReviews.clear();
     m_browseReviewsLoading = false;
     emit browseReviewsChanged();
+    setBrowseTrailers({});
 
     if (!name.isEmpty() && !owned)
         resolveLiveArtwork(name, true);
@@ -3124,6 +3142,7 @@ void VortexBridge::loadBrowseDetailsForGame(QString name) {
     m_browseReviews.clear();
     m_browseReviewsLoading = false;
     emit browseReviewsChanged();
+    setBrowseTrailers({});
 
     // An owned game already knows its id from the scan; anything else goes
     // through the offline cache, then one lookup -- ensureMetadata()'s chain.
@@ -3176,6 +3195,7 @@ void VortexBridge::finishUnresolvedBrowseDetails(int seq) {
     const int appId = m_browseDetails.value("steamAppId").toInt();
     if (appId > 0)
         fetchSteamReviews(seq, appId);
+    loadBrowseTrailers(seq);
 }
 
 void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
@@ -3193,6 +3213,7 @@ void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
         "fields id,name,summary,storyline,first_release_date,"
         "total_rating,total_rating_count,aggregated_rating,aggregated_rating_count,"
         "rating,rating_count,cover.image_id,screenshots.image_id,"
+        "videos.video_id,videos.name,"
         "artworks.image_id,artworks.width,artworks.height,"
         "genres.name,themes.name,game_modes.name,player_perspectives.name,"
         "platforms.name,involved_companies.company.name,"
@@ -3246,6 +3267,7 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
         const int appId = m_browseDetails.value("steamAppId").toInt();
         if (appId > 0)
             fetchSteamReviews(seq, appId);
+        loadBrowseTrailers(seq);
         return;
     }
 
@@ -3301,6 +3323,22 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
         screenshots << one;
     }
     d["screenshots"] = screenshots;
+
+    // IGDB's videos are YouTube ids; the page plays them only when Steam has
+    // no trailers of its own (browseTrailers).
+    QVariantList youtubeVideos;
+    for (const QJsonValue &entry : game.value("videos").toArray()) {
+        const QJsonObject video = entry.toObject();
+        const QString videoId = video.value("video_id").toString();
+        if (videoId.isEmpty())
+            continue;
+        QVariantMap one;
+        one["id"]    = videoId;
+        one["name"]  = video.value("name").toString();
+        one["thumb"] = QStringLiteral("https://i.ytimg.com/vi/%1/hqdefault.jpg").arg(videoId);
+        youtubeVideos << one;
+    }
+    d["youtubeVideos"] = youtubeVideos;
 
     // IGDB's banner, the last resort after SteamGridDB and Steam's CDN. Its
     // artworks are community uploads of any shape -- Portal 2's first is its
@@ -3422,6 +3460,142 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
 
     if (steamAppId > 0)
         fetchSteamReviews(seq, steamAppId);
+    loadBrowseTrailers(seq);
+}
+
+// Steam's trailers for the open page: by IGDB's Steam app id when there is
+// one, else by Steam's own store search, which finds the many games sold on
+// Steam that IGDB has no Steam link for. The search is fuzzy -- "Alan Wake 2"
+// answers with a Beat Saber DLC -- so only a canonical-name match counts.
+void VortexBridge::loadBrowseTrailers(int seq) {
+    if (seq != m_browseDetailsSeq)
+        return;
+    const int appId = m_browseDetails.value("steamAppId").toInt();
+    if (appId > 0) {
+        fetchSteamTrailers(seq, appId);
+        return;
+    }
+
+    const QString name = m_browseDetails.value("name").toString();
+    const QString key = QString::fromStdString(make_canonical(name.toStdString()));
+    if (key.isEmpty())
+        return;
+    const auto cached = m_steamSearchCache.constFind(key);
+    if (cached != m_steamSearchCache.constEnd()) {
+        if (cached.value() > 0)
+            fetchSteamTrailers(seq, cached.value());
+        return;
+    }
+
+    setBrowseTrailers({}, true);
+    if (!m_network) m_network = new QNetworkAccessManager(this);
+
+    QUrl url(QStringLiteral("https://store.steampowered.com/api/storesearch/"));
+    QUrlQuery query;
+    query.addQueryItem("term", name);
+    query.addQueryItem("cc", "us");
+    query.addQueryItem("l", "english");
+    url.setQuery(query);
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, "VortexLauncher/1.0");
+
+    QNetworkReply *reply = m_network->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, seq, key]() {
+        reply->deleteLater();
+        // Not cached, so the next open asks Steam again.
+        if (reply->error() != QNetworkReply::NoError) {
+            if (seq == m_browseDetailsSeq)
+                setBrowseTrailers({});
+            return;
+        }
+
+        int found = 0;
+        const QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+        for (const QJsonValue &value : root.value("items").toArray()) {
+            const QJsonObject item = value.toObject();
+            if (item.value("type").toString() == "app"
+                && QString::fromStdString(make_canonical(
+                       item.value("name").toString().toStdString())) == key) {
+                found = item.value("id").toInt();
+                break;
+            }
+        }
+        m_steamSearchCache.insert(key, found);
+        if (seq != m_browseDetailsSeq)
+            return;
+        if (found > 0)
+            fetchSteamTrailers(seq, found);
+        else
+            setBrowseTrailers({});
+    });
+}
+
+void VortexBridge::fetchSteamTrailers(int seq, int appId) {
+    const auto cached = m_browseTrailersCache.constFind(appId);
+    if (cached != m_browseTrailersCache.constEnd()) {
+        setBrowseTrailers(cached.value());
+        return;
+    }
+
+    setBrowseTrailers({}, true);
+    if (!m_network) m_network = new QNetworkAccessManager(this);
+
+    QUrl url(QStringLiteral("https://store.steampowered.com/api/appdetails"));
+    url.setQuery(QStringLiteral("appids=%1&filters=movies").arg(appId));
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::UserAgentHeader, "VortexLauncher/1.0");
+
+    QNetworkReply *reply = m_network->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, seq, appId]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            if (seq == m_browseDetailsSeq)
+                setBrowseTrailers({});
+            return;
+        }
+
+        const QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+        const QJsonObject app = root.value(QString::number(appId)).toObject();
+
+        // Steam moved its trailers to adaptive streams in 2025 and dropped
+        // the mp4 links; older answers still carry them, and either plays.
+        QVariantList trailers;
+        for (const QJsonValue &value : app.value("data").toObject().value("movies").toArray()) {
+            const QJsonObject movie = value.toObject();
+            const QJsonObject mp4 = movie.value("mp4").toObject();
+            QString stream = mp4.value("max").toString();
+            if (stream.isEmpty())
+                stream = mp4.value("480").toString();
+            if (stream.isEmpty()) {
+                if (!m_trailerServer)
+                    m_trailerServer = new TrailerPlaylistServer(m_network, this);
+                stream = m_trailerServer->localUrlFor(movie.value("hls_h264").toString());
+            }
+            if (stream.isEmpty())
+                continue;
+            QVariantMap one;
+            one["name"]  = movie.value("name").toString();
+            one["thumb"] = movie.value("thumbnail").toString();
+            one["url"]   = stream;
+            trailers << one;
+        }
+        // Kept even when the page has moved on, since it is still right.
+        m_browseTrailersCache.insert(appId, trailers);
+        if (seq == m_browseDetailsSeq)
+            setBrowseTrailers(trailers);
+    });
+}
+
+QVariantMap VortexBridge::trailerSeek(QString url, qint64 positionMs) const {
+    return m_trailerServer ? m_trailerServer->seek(url, positionMs) : QVariantMap();
+}
+
+void VortexBridge::setBrowseTrailers(const QVariantList &trailers, bool loading) {
+    if (trailers == m_browseTrailers && loading == m_browseTrailersLoading)
+        return;
+    m_browseTrailers = trailers;
+    m_browseTrailersLoading = loading;
+    emit browseTrailersChanged();
 }
 
 void VortexBridge::fetchSteamReviews(int seq, int appId) {
@@ -3785,8 +3959,10 @@ void VortexBridge::loadGames() {
             // game folder) is that game, not a second copy of it. Marked
             // before the removed check, so a removed one stays removed.
             for (size_t r = 0; r < riotGames.size() && !bg.isRiot; ++r)
-                if (riot_install_matches(riotGames[r], bg.installDir))
+                if (riot_install_matches(riotGames[r], bg.installDir)) {
                     bg.isRiot = riotListed[r] = true;
+                    bg.name   = riotGames[r].title; // not the folder's name
+                }
             if (isRemovedIn(removedSnapshot, bg)) continue;
             // The same test Play uses, so the card's EA mark means it will
             // launch through the EA app and not just that EA made it.

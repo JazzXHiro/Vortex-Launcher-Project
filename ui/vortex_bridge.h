@@ -84,6 +84,11 @@ class VortexBridge : public QObject {
     // happened while it was on.
     Q_PROPERTY(bool         useSteamPlaytime READ useSteamPlaytime NOTIFY useSteamPlaytimeChanged)
 
+    // Whether a trailer on the details page starts with its sound off. The
+    // player's own mute button still works either way; this is only where it
+    // starts.
+    Q_PROPERTY(bool         trailersStartMuted READ trailersStartMuted NOTIFY trailersStartMutedChanged)
+
     // ---- Scan progress ---------------------------------------------------
     // The library scan used to hide behind a full-screen modal overlay with an
     // indeterminate spinner, so a cold-cache machine looked hung for as long as
@@ -130,6 +135,14 @@ class VortexBridge : public QObject {
     Q_PROPERTY(bool         browseDetailsLoading READ browseDetailsLoading NOTIFY browseDetailsChanged)
     Q_PROPERTY(QVariantMap  browseReviews        READ browseReviews        NOTIFY browseReviewsChanged)
     Q_PROPERTY(bool         browseReviewsLoading READ browseReviewsLoading NOTIFY browseReviewsChanged)
+    // Steam's trailers for the open page, as {name, thumb, url} rows with an
+    // HLS stream in url. Looked up by the page's Steam app id, else by an
+    // exact name match in Steam's store search; empty when Steam has none,
+    // and the page falls back to IGDB's YouTube videos in browseDetails.
+    Q_PROPERTY(QVariantList browseTrailers       READ browseTrailers       NOTIFY browseTrailersChanged)
+    // True while Steam is still being asked, so the page holds the YouTube
+    // fallback back rather than showing it only to swap it out.
+    Q_PROPERTY(bool         browseTrailersLoading READ browseTrailersLoading NOTIFY browseTrailersChanged)
     // What the tab shows before anything is typed: recent releases, newest
     // first, in the same row shape as browseResults.
     Q_PROPERTY(QVariantList browseNewReleases        READ browseNewReleases        NOTIFY browseNewReleasesChanged)
@@ -162,6 +175,7 @@ public:
     bool         ignorePlayedGames() const { return m_ignorePlayedGames; }
     bool         ignoreLikedGames() const { return m_ignoreLikedGames; }
     bool         useSteamPlaytime() const { return m_useSteamPlaytime; }
+    bool         trailersStartMuted() const { return m_trailersStartMuted; }
     QString      recommendationStatus() const { return m_recommendationStatus; }
 
     bool         scanActive() const { return m_scanActive; }
@@ -179,6 +193,8 @@ public:
     bool         browseDetailsLoading() const { return m_browseDetailsLoading; }
     QVariantMap  browseReviews()        const { return m_browseReviews; }
     bool         browseReviewsLoading() const { return m_browseReviewsLoading; }
+    QVariantList browseTrailers()       const { return m_browseTrailers; }
+    bool         browseTrailersLoading() const { return m_browseTrailersLoading; }
     QVariantList browseNewReleases()        const { return m_browseNewReleases; }
     bool         browseNewReleasesLoading() const { return m_browseNewReleasesLoading; }
     QString      browseNewReleasesStatus()  const { return m_browseNewReleasesStatus; }
@@ -240,6 +256,15 @@ public:
     // the list; unlike the three above it does not re-rank, because it changes
     // which number is displayed, not what the recommender was given.
     Q_INVOKABLE void   setUseSteamPlaytime(bool enabled);
+
+    // Persists the "start trailers muted" toggle. Display only.
+    Q_INVOKABLE void   setTrailersStartMuted(bool enabled);
+
+    // Where to play a Steam trailer from to land at positionMs -- {url,
+    // offsetMs, durationMs} -- since the player cannot seek one in place (see
+    // trailer_playlist_server.h). Empty for any other URL; the player then
+    // seeks as usual.
+    Q_INVOKABLE QVariantMap trailerSeek(QString url, qint64 positionMs) const;
 
     // Full scan: Steam + local dirs + SteamGridDB artwork. Runs on a background thread.
     Q_INVOKABLE void   loadGames();
@@ -401,6 +426,7 @@ signals:
     void ignorePlayedGamesChanged();
     void ignoreLikedGamesChanged();
     void useSteamPlaytimeChanged();
+    void trailersStartMutedChanged();
     void recommendationStatusChanged();
     void localDirectoriesChanged();
     void directoryRemoved(QString folder, int gamesRemoved, int artworkDeleted);
@@ -424,6 +450,7 @@ signals:
     void browseResultsChanged();
     void browseDetailsChanged();
     void browseReviewsChanged();
+    void browseTrailersChanged();
     void browseNewReleasesChanged();
 
 private:
@@ -508,6 +535,7 @@ private:
     bool                    m_ignorePlayedGames = false;
     bool                    m_ignoreLikedGames = false;
     bool                    m_useSteamPlaytime = false;
+    bool                    m_trailersStartMuted = false;
     QString                 m_recommendationStatus = "Recommendations not loaded";
     fs::path                m_baseDir;    // resolved project root (contains Images/)
 
@@ -660,6 +688,8 @@ private:
     bool                    m_browseDetailsLoading = false;
     QVariantMap             m_browseReviews;
     bool                    m_browseReviewsLoading = false;
+    QVariantList            m_browseTrailers;
+    bool                    m_browseTrailersLoading = false;
     QVariantList            m_browseNewReleases;
     bool                    m_browseNewReleasesLoading = false;
     QString                 m_browseNewReleasesStatus;
@@ -680,12 +710,22 @@ private:
     // Steam's review summary and top reviews by app id, as the page shows
     // them; only successful answers, for this session.
     QHash<int, QVariantMap> m_browseReviewsCache;
+    // Steam's trailers by app id, and the app id Steam's store search found
+    // for a canonical name (0 for none), both for this session.
+    QHash<int, QVariantList> m_browseTrailersCache;
+    // Serves Steam's HLS trailers as one-variant playlists; see
+    // trailer_playlist_server.h for why. Created with the first trailer list.
+    class TrailerPlaylistServer *m_trailerServer = nullptr;
+    QHash<QString, int>     m_steamSearchCache;
 
     void        applyBrowseResults(int seq, const QByteArray &json, const QString &error);
     void        applyNewReleases(const QByteArray &json, const QString &error);
     void        applyBrowseDetails(int seq, const QByteArray &game, const QByteArray &ttb,
                                    const QString &error);
     void        fetchSteamReviews(int seq, int appId);
+    void        loadBrowseTrailers(int seq);
+    void        fetchSteamTrailers(int seq, int appId);
+    void        setBrowseTrailers(const QVariantList &trailers, bool loading = false);
     void        queryBrowseDetails(int seq, qlonglong igdbId);
     void        finishUnresolvedBrowseDetails(int seq);
 

@@ -99,6 +99,28 @@ if ($qtCore.Count -eq 0) {
 }
 Write-Note "Found $($qtCore[0].Name)"
 
+# The trailer players. Without these the launcher still starts and the details
+# page still loads, so nothing fails until a recipient clicks a trailer:
+# Chromium's helper process and data files for YouTubePlayer.qml, and the
+# FFmpeg backend for TrailerPlayer.qml's Steam streams. windeployqt supplies
+# them all; a build that predates the trailers, or a deploy that skipped
+# WebEngine, does not.
+$TrailerRuntime = @(
+    'QtWebEngineProcess.exe',
+    'Qt6WebEngineCore.dll',
+    'resources\qtwebengine_resources.pak',
+    'resources\icudtl.dat',
+    'resources\v8_context_snapshot.bin',
+    'translations\qtwebengine_locales\en-US.pak',
+    'multimedia\ffmpegmediaplugin.dll',
+    'avcodec-*.dll', 'avformat-*.dll', 'avutil-*.dll', 'swresample-*.dll', 'swscale-*.dll'
+)
+$missing = @($TrailerRuntime | Where-Object { -not (Test-Path (Join-Path $BuildDir $_)) })
+if ($missing.Count -gt 0) {
+    throw "The trailer runtime is incomplete in $BuildDir -- missing:`n    $($missing -join "`n    ")`nRebuild Release so windeployqt deploys Qt WebEngine and Qt Multimedia."
+}
+Write-Note 'Found the WebEngine and FFmpeg runtime for trailers'
+
 
 # ---------------------------------------------------------------------------
 # 2. Copy the build output to a clean staging folder
@@ -129,7 +151,11 @@ $ArtifactFiles = @(
     '*.pdb', '*.ilk', '*.exp', '*.lib', '*.obj', '*.lnk',
     'CMakeCache.txt', '.ninja_deps', '.ninja_log', 'build.ninja',
     'VSInheritEnvironments.txt', 'cmake_install.cmake',
-    'vortexlauncher_qmltyperegistrations.cpp'
+    'vortexlauncher_qmltyperegistrations.cpp',
+    # windeployqt --compiler-runtime drops the redistributable installer beside
+    # the exe as well as the DLLs. It needs administrator rights, so a per-user
+    # install can never run it -- section 4 deploys the DLLs app-local instead.
+    'vc_redist.x64.exe'
 )
 
 # The developer's own runtime state. Every one of these is written by the

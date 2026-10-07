@@ -159,6 +159,28 @@ Popup {
     property int lightboxIndex: -1
     readonly property var screenshots: browseRoot.details.screenshots || []
 
+    // The TRAILERS row: Steam's own when it has any, streamed by TrailerPlayer;
+    // IGDB's YouTube videos otherwise, played by YouTubePlayer. The fallback
+    // waits for Steam's answer, so it is never shown only to be swapped out.
+    readonly property bool trailersLoading: !!browseRoot.api && browseRoot.api.browseTrailersLoading
+    readonly property var trailers: {
+        const steam = browseRoot.api && browseRoot.api.browseTrailers ? browseRoot.api.browseTrailers : []
+        if (steam.length > 0)
+            return steam.map(t => ({ name: t.name, thumb: t.thumb, url: t.url, youtubeId: "" }))
+        if (browseRoot.trailersLoading)
+            return []
+        return (browseRoot.details.youtubeVideos || [])
+            .map(v => ({ name: v.name, thumb: v.thumb, url: "", youtubeId: v.id }))
+    }
+    // Index into trailers of the one playing in the trailer lightbox, or -1.
+    // The player exists only while this is set; see trailerLoader.
+    property int trailerIndex: -1
+    readonly property var currentTrailer:
+        browseRoot.trailerIndex >= 0 && browseRoot.trailerIndex < browseRoot.trailers.length
+            ? browseRoot.trailers[browseRoot.trailerIndex] : null
+    // A late answer can change the list under an open lightbox.
+    onTrailersChanged: if (browseRoot.trailerIndex >= browseRoot.trailers.length) browseRoot.trailerIndex = -1
+
     // ── Uninstall confirm step ──────────────────────────────────────────────
     // Steam games hand off to Steam, which prompts on its own. A local game is
     // deleted off the disk by us, with nothing to undo it, so that one gets a
@@ -176,6 +198,7 @@ Popup {
         browseRoot.gameRow = null
         browseRoot.cancelUninstall()
         browseRoot.lightboxIndex = -1
+        browseRoot.trailerIndex = -1
         browseRoot.storyExpanded = false
         browseRoot.api.loadBrowseDetails(item.igdbId)
         browseRoot.open()
@@ -187,6 +210,7 @@ Popup {
         if (!name || !browseRoot.api) return
         browseRoot.cancelUninstall()
         browseRoot.lightboxIndex = -1
+        browseRoot.trailerIndex = -1
         browseRoot.storyExpanded = false
         browseRoot.fromRecommendation = true
         browseRoot.launchOrigin = origin || "Recommendations"
@@ -265,6 +289,16 @@ Popup {
         body.contentY = Math.max(0, Math.min(limit, body.contentY + delta))
     }
 
+    function stepTrailer(step) {
+        const n = browseRoot.trailers.length
+        if (n === 0) return
+        browseRoot.trailerIndex = (browseRoot.trailerIndex + step + n) % n
+    }
+
+    function toggleTrailer() {
+        if (trailerLoader.item) trailerLoader.item.togglePlay()
+    }
+
     function stepLightbox(step) {
         const n = browseRoot.screenshots.length
         if (n === 0) return
@@ -277,6 +311,11 @@ Popup {
             if (direction !== "left" && direction !== "right") return
             browseRoot.armedChoice = browseRoot.armedChoice === browseRoot.armedCancel
                                      ? browseRoot.armedDelete : browseRoot.armedCancel
+            return
+        }
+        if (browseRoot.trailerIndex >= 0) {
+            if (direction === "left") browseRoot.stepTrailer(-1)
+            else if (direction === "right") browseRoot.stepTrailer(1)
             return
         }
         if (browseRoot.lightboxIndex >= 0) {
@@ -304,6 +343,10 @@ Popup {
             else browseRoot.armedChoice = browseRoot.armedCancel
             return
         }
+        if (browseRoot.trailerIndex >= 0) {
+            browseRoot.toggleTrailer()
+            return
+        }
         if (browseRoot.lightboxIndex >= 0) {
             browseRoot.stepLightbox(1)
             return
@@ -319,11 +362,15 @@ Popup {
         }
     }
 
-    // One level back: the uninstall confirm, then the lightbox, then the page.
+    // One level back: the uninstall confirm, then a lightbox, then the page.
     // True means handled.
     function handleBack() {
         if (browseRoot.uninstallArmed) {
             browseRoot.cancelUninstall()
+            return true
+        }
+        if (browseRoot.trailerIndex >= 0) {
+            browseRoot.trailerIndex = -1
             return true
         }
         if (browseRoot.lightboxIndex < 0)
@@ -368,6 +415,7 @@ Popup {
     onClosed: {
         browseRoot.focusedAction = -1
         browseRoot.lightboxIndex = -1
+        browseRoot.trailerIndex = -1
         browseRoot.cancelUninstall()
     }
 
@@ -387,6 +435,21 @@ Popup {
         sequence: "Right"
         enabled: browseRoot.visible && browseRoot.lightboxIndex >= 0
         onActivated: browseRoot.stepLightbox(1)
+    }
+    Shortcut {
+        sequence: "Left"
+        enabled: browseRoot.visible && browseRoot.trailerIndex >= 0
+        onActivated: browseRoot.stepTrailer(-1)
+    }
+    Shortcut {
+        sequence: "Right"
+        enabled: browseRoot.visible && browseRoot.trailerIndex >= 0
+        onActivated: browseRoot.stepTrailer(1)
+    }
+    Shortcut {
+        sequence: "Space"
+        enabled: browseRoot.visible && browseRoot.trailerIndex >= 0
+        onActivated: browseRoot.toggleTrailer()
     }
 
     width: parent.width * 0.9; height: parent.height * 0.9
@@ -1014,6 +1077,126 @@ Popup {
                         }
                     }
 
+                    // Trailers
+                    Column {
+                        width: parent.width
+                        spacing: 14
+                        visible: !browseRoot.loading && browseRoot.trailers.length > 0
+                        opacity: browseRoot.revealAt(2)
+                        transform: Translate { y: 16 * (1 - browseRoot.revealAt(2)) }
+
+                        SectionTitle { text: "TRAILERS" }
+
+                        ListView {
+                            id: trailerList
+                            // Same padding as the screenshot row below, for the
+                            // same hover growth.
+                            readonly property int popRoom: 10
+                            x: -popRoom
+                            width: parent.width + 2 * popRoom
+                            height: 180 + 2 * popRoom
+                            leftMargin: popRoom
+                            rightMargin: popRoom
+                            orientation: ListView.Horizontal
+                            spacing: 14
+                            clip: true
+                            model: browseRoot.trailers
+                            boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                            delegate: Item {
+                                id: trailerCard
+                                required property var modelData
+                                required property int index
+                                readonly property bool hovered: trailerArea.containsMouse && browseRoot.mouseInControl
+
+                                width: 320; height: trailerList.height
+                                z: trailerCard.hovered ? 1 : 0
+
+                                Rectangle {
+                                    anchors.centerIn: parent
+                                    width: 320; height: 180; radius: 10
+                                    color: Theme.bgRaised
+                                    border.width: 2
+                                    border.color: trailerCard.hovered ? Theme.focusRing : Theme.borderMuted
+                                    clip: true
+
+                                    scale: trailerCard.hovered ? 1.05 : 1.0
+                                    Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
+
+                                    // Steam's thumbnails are 293x165 and
+                                    // YouTube's hqdefault a 480x360 letterbox
+                                    // whose bars the crop takes off exactly.
+                                    Image {
+                                        anchors.fill: parent
+                                        anchors.margins: 2
+                                        asynchronous: true
+                                        fillMode: Image.PreserveAspectCrop
+                                        source: trailerCard.modelData.thumb
+                                        opacity: status === Image.Ready ? 1.0 : 0.0
+                                        Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                                    }
+
+                                    // The name, over a fade so it reads on any frame.
+                                    Rectangle {
+                                        anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 2 }
+                                        height: 54
+                                        visible: trailerCard.modelData.name !== ""
+                                        gradient: Gradient {
+                                            GradientStop { position: 0.0; color: "transparent" }
+                                            GradientStop { position: 1.0; color: Theme.overlayStrong }
+                                        }
+                                        Text {
+                                            anchors { left: parent.left; right: parent.right; bottom: parent.bottom
+                                                      leftMargin: 12; rightMargin: 12; bottomMargin: 9 }
+                                            text: trailerCard.modelData.name
+                                            color: Theme.textPrimary
+                                            font.pixelSize: 12; font.bold: true
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+
+                                    // Play badge.
+                                    Rectangle {
+                                        anchors.centerIn: parent
+                                        width: 56; height: 56; radius: 28
+                                        color: trailerCard.hovered ? Theme.bgEmphasis : Theme.overlayButton
+                                        border.width: 2
+                                        border.color: trailerCard.hovered ? Theme.focusRing : Theme.borderControl
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+
+                                        Shape {
+                                            anchors.centerIn: parent
+                                            anchors.horizontalCenterOffset: 2
+                                            width: 18; height: 20
+                                            preferredRendererType: Shape.CurveRenderer
+                                            ShapePath {
+                                                strokeWidth: 0
+                                                strokeColor: "transparent"
+                                                fillColor: Theme.textPrimary
+                                                startX: 0; startY: 0
+                                                PathLine { x: 18; y: 10 }
+                                                PathLine { x: 0; y: 20 }
+                                                PathLine { x: 0; y: 0 }
+                                            }
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: trailerArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            browseRoot.lightboxIndex = -1
+                                            browseRoot.trailerIndex = trailerCard.index
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Screenshots
                     Column {
                         width: parent.width
@@ -1406,6 +1589,95 @@ Popup {
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onClicked: browseRoot.stepLightbox(arrow.modelData)
+                    }
+                }
+            }
+        }
+
+        // ── Trailer lightbox ────────────────────────────────────────────────
+        // The player lives in the Loader, so it exists only while this shows:
+        // closing it, or the page, destroys the player and frees its decoder
+        // or Chromium renderer.
+        Rectangle {
+            id: trailerBox
+            anchors.fill: parent
+            visible: browseRoot.visible && browseRoot.currentTrailer !== null
+            color: Theme.scrim
+            radius: 20
+
+            // Swallows clicks on the backdrop; a click there closes.
+            MouseArea {
+                anchors.fill: parent
+                onClicked: browseRoot.trailerIndex = -1
+            }
+
+            Loader {
+                id: trailerLoader
+                anchors.fill: parent
+                anchors.margins: 70
+                active: trailerBox.visible
+                sourceComponent: browseRoot.currentTrailer && browseRoot.currentTrailer.youtubeId !== ""
+                                 ? youtubeComponent : steamComponent
+            }
+
+            Component {
+                id: steamComponent
+                TrailerPlayer {
+                    api: browseRoot.api
+                    source: browseRoot.currentTrailer ? browseRoot.currentTrailer.url : ""
+                    startMuted: !!browseRoot.api && browseRoot.api.trailersStartMuted
+                }
+            }
+            Component {
+                id: youtubeComponent
+                YouTubePlayer {
+                    videoId: browseRoot.currentTrailer ? browseRoot.currentTrailer.youtubeId : ""
+                    startMuted: !!browseRoot.api && browseRoot.api.trailersStartMuted
+                }
+            }
+
+            Text {
+                anchors { bottom: parent.bottom; horizontalCenter: parent.horizontalCenter; bottomMargin: 26 }
+                width: parent.width - 2 * 140
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideMiddle
+                text: (browseRoot.currentTrailer && browseRoot.currentTrailer.name
+                       ? browseRoot.currentTrailer.name + "   ·   " : "")
+                      + (browseRoot.trailerIndex + 1) + " / " + browseRoot.trailers.length
+                color: Theme.textMuted
+                font.pixelSize: 13
+            }
+
+            Repeater {
+                model: [-1, 1]
+                delegate: Rectangle {
+                    id: trailerArrow
+                    required property int modelData
+                    readonly property bool hovered: trailerArrowArea.containsMouse
+
+                    anchors.verticalCenter: parent.verticalCenter
+                    x: trailerArrow.modelData < 0 ? 16 : trailerBox.width - width - 16
+                    width: 46; height: 46; radius: 23
+                    visible: browseRoot.trailers.length > 1
+                    color: trailerArrow.hovered ? Theme.bgEmphasis : Theme.overlayButton
+                    border.color: trailerArrow.hovered ? Theme.focusRing : Theme.borderControl
+
+                    Image {
+                        anchors.centerIn: parent
+                        width: 20; height: 20
+                        source: trailerArrow.modelData < 0 ? "assets/arrow_left.png"
+                                                           : "assets/arrow_right.png"
+                        sourceSize.width: 40
+                        sourceSize.height: 40
+                        fillMode: Image.PreserveAspectFit
+                        smooth: true
+                    }
+                    MouseArea {
+                        id: trailerArrowArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: browseRoot.stepTrailer(trailerArrow.modelData)
                     }
                 }
             }

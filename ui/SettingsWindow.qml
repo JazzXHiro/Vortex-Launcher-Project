@@ -1070,6 +1070,86 @@ Popup {
                                     contentItem: Item {}
                                 }
                             }
+
+                            Text {
+                                Layout.topMargin: 8
+                                text: "TRAILERS"
+                                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                            }
+
+                            // Where a trailer's sound starts on the details page.
+                            // The player's own mute button works either way.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.maximumWidth: 420
+                                spacing: 14
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 3
+
+                                    Text {
+                                        text: "Start trailers muted"
+                                        color: Theme.textBody; font.pixelSize: 14
+                                    }
+
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: "Trailers on a game's page play with the sound off until you unmute them."
+                                        color: Theme.textMuted; font.pixelSize: 12
+                                        wrapMode: Text.WordWrap
+                                    }
+                                }
+
+                                Switch {
+                                    id: trailersMutedSwitch
+
+                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+
+                                    Layout.alignment: Qt.AlignTop
+                                    padding: 0
+                                    implicitWidth: 52
+                                    implicitHeight: 30
+
+                                    Binding {
+                                        target: trailersMutedSwitch
+                                        property: "checked"
+                                        value: settingsRoot.api ? settingsRoot.api.trailersStartMuted : false
+                                    }
+
+                                    onToggled: {
+                                        if (settingsRoot.api)
+                                            settingsRoot.api.setTrailersStartMuted(trailersMutedSwitch.checked);
+                                    }
+
+                                    indicator: Rectangle {
+                                        implicitWidth: 52
+                                        implicitHeight: 30
+                                        radius: height / 2
+                                        color: trailersMutedSwitch.checked ? Theme.positiveBg : Theme.bgSurface
+                                        border.width: 1
+                                        border.color: trailersMutedSwitch.checked
+                                                      ? Theme.positive
+                                                      : (trailersMutedSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
+
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                        Rectangle {
+                                            width: 22; height: 22
+                                            radius: height / 2
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            x: trailersMutedSwitch.checked ? parent.width - width - 4 : 4
+                                            color: trailersMutedSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
+
+                                            Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                            Behavior on color { ColorAnimation { duration: 150 } }
+                                        }
+                                    }
+
+                                    contentItem: Item {}
+                                }
+                            }
                         }
                     }
                 }
