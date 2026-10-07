@@ -874,12 +874,12 @@ Popup {
                         onVisibleChanged: if (visible) pickVariant()
                         Component.onCompleted: pickVariant()
                         width: parent.width
-                        height: 340
+                        height: 380
 
                         LoadingGamepad {
                             anchors.centerIn: parent
-                            anchors.verticalCenterOffset: -35
-                            width: 224; height: 196
+                            anchors.verticalCenterOffset: -36
+                            width: 360; height: 315
                             variant: loadingIcon.variant
                             running: parent.visible
                         }
@@ -1307,7 +1307,7 @@ Popup {
             readonly property bool emphasized: closeArea.containsMouse && browseRoot.mouseInControl
 
             anchors { top: parent.top; right: parent.right; margins: 20 }
-            width: 44; height: 44; radius: 22
+            width: 44; height: 44; radius: 10
             color: closeButton.emphasized ? "#B32A2A2A" : "#80000000"
             border.width: closeButton.emphasized ? 2 : 1
             border.color: closeButton.emphasized ? Theme.focusRing : Theme.borderControl

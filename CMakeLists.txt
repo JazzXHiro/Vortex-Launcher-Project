@@ -107,6 +107,7 @@ qt_add_qml_module(VortexLauncher
         ui/HeartIcon.qml
         ui/CoverGlow.qml
         ui/WheelScroller.qml
+        ui/RoundedCorners.qml
     RESOURCES
         ui/assets/steam.png
         ui/assets/local.png

@@ -1668,7 +1668,11 @@ void VortexBridge::pumpLiveArtwork() {
             art["liveLogoUrl"]  = QString::fromStdString(sgdb.logo);
             const bool reachable = sgdb.reachable;
             QMetaObject::invokeMethod(this, [this, name, art, reachable]() {
+                // The slot is SteamGridDB's. Steam's probes are cheap HEADs and
+                // may sit waiting on IGDB, so they do not hold it.
+                --m_liveArtRunning;
                 finishLiveArtwork(name, art, reachable);
+                pumpLiveArtwork();
             }, Qt::QueuedConnection);
         });
         connect(thread, &QThread::finished, thread, &QThread::deleteLater);
@@ -1688,6 +1692,20 @@ void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art
         row = findGameByName(m_browseSnapshots, name);   // a Discover page's game
     const int appId = row.value("steamAppId").toInt();
 
+    // A Discover page asked before IGDB answered, and SteamGridDB left a gap
+    // Steam might fill: hold on until the app id is known.
+    if (appId <= 0
+        && (art.value("liveHeroUrl").toString().isEmpty()
+            || art.value("liveLogoUrl").toString().isEmpty())
+        && liveArtAwaitsBrowseAppId(name)) {
+        QVariantMap parked;
+        parked["name"]       = name;
+        parked["art"]        = art;
+        parked["definitive"] = definitive;
+        m_liveArtAwaitingBrowse.insert(liveArtKey(name), parked);
+        return;
+    }
+
     QList<QPair<QString, QString>> probes;   // art key -> URL
     if (appId > 0) {
         if (art.value("liveHeroUrl").toString().isEmpty())
@@ -1700,8 +1718,6 @@ void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art
 
     auto done = [this](const QString &name, const QVariantMap &art, bool definitive) {
         applyLiveArtwork(name, art, definitive);
-        --m_liveArtRunning;
-        pumpLiveArtwork();
     };
 
     if (probes.isEmpty()) {
@@ -1736,6 +1752,32 @@ void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art
             if (--pending->remaining == 0)
                 done(name, pending->art, pending->definitive);
         });
+    }
+}
+
+// The open Discover page is on this game and IGDB has not answered yet.
+bool VortexBridge::liveArtAwaitsBrowseAppId(const QString &name) const {
+    return m_browseDetailsLoading
+        && QString::compare(m_browseDetails.value("name").toString(), name,
+                            Qt::CaseInsensitive) == 0;
+}
+
+// Sends on every parked answer whose page is no longer waiting. `answered` is
+// the game IGDB has just described -- its row now holds whatever Steam app id
+// there is, so its answer keeps its own verdict. Any other went on without the
+// id it waited for (IGDB failed, or the page moved on), so it is not
+// definitive and Steam is still asked on a later run.
+void VortexBridge::releaseLiveArtAwaitingBrowse(const QString &answered) {
+    const QList<QString> keys = m_liveArtAwaitingBrowse.keys();
+    for (const QString &key : keys) {
+        const QVariantMap parked = m_liveArtAwaitingBrowse.value(key);
+        const QString name = parked.value("name").toString();
+        if (liveArtAwaitsBrowseAppId(name))
+            continue;
+        m_liveArtAwaitingBrowse.remove(key);
+        const bool definitive = parked.value("definitive").toBool()
+            && !answered.isEmpty() && key == liveArtKey(answered);
+        finishLiveArtwork(name, parked.value("art").toMap(), definitive);
     }
 }
 
@@ -3015,14 +3057,32 @@ void VortexBridge::loadBrowseDetails(qlonglong igdbId) {
         seed["genres"] = genres;
     }
     seed["igdbId"] = igdbId;
+
+    // The banner and logo need only the name, which the grid row already
+    // has, so their lookup starts now rather than once IGDB has answered: a
+    // cached answer goes straight up, and SteamGridDB runs alongside IGDB.
+    // Only Steam's CDN, the fallback, waits for IGDB's Steam app id.
+    const QString name = seed.value("name").toString();
+    const bool owned = !name.isEmpty() && !findGameByName(m_gameList, name).isEmpty();
+    if (!name.isEmpty() && !owned) {
+        const auto cached = m_liveArtCache.constFind(liveArtKey(name));
+        if (cached != m_liveArtCache.constEnd()) {
+            seed["bannerUrl"] = cached.value().value("liveHeroUrl").toString();
+            seed["logoUrl"]   = cached.value().value("liveLogoUrl").toString();
+        }
+    }
+
     m_browseDetails = seed;
     m_browseDetailsLoading = true;
     emit browseDetailsChanged();
+    releaseLiveArtAwaitingBrowse();     // the last page's game, if it had one
 
     m_browseReviews.clear();
     m_browseReviewsLoading = false;
     emit browseReviewsChanged();
 
+    if (!name.isEmpty() && !owned)
+        resolveLiveArtwork(name, true);
     queryBrowseDetails(seq, igdbId);
 }
 
@@ -3057,6 +3117,7 @@ void VortexBridge::loadBrowseDetailsForGame(QString name) {
     m_browseDetails = seed;
     m_browseDetailsLoading = true;
     emit browseDetailsChanged();
+    releaseLiveArtAwaitingBrowse();     // the last page's game, if it had one
 
     m_browseReviews.clear();
     m_browseReviewsLoading = false;
@@ -3109,12 +3170,22 @@ void VortexBridge::finishUnresolvedBrowseDetails(int seq) {
         return;
     m_browseDetailsLoading = false;
     emit browseDetailsChanged();
+    releaseLiveArtAwaitingBrowse();
     const int appId = m_browseDetails.value("steamAppId").toInt();
     if (appId > 0)
         fetchSteamReviews(seq, appId);
 }
 
 void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
+    // Asked already this session: the stored answer goes through the same
+    // path a fresh one would, so ownership, art and the snapshot are worked
+    // out again from what is true now -- only the round trip is skipped.
+    const auto cached = m_browseDetailsCache.constFind(igdbId);
+    if (cached != m_browseDetailsCache.constEnd()) {
+        applyBrowseDetails(seq, cached.value().first, cached.value().second, QString());
+        return;
+    }
+
     const std::string id = std::to_string(igdbId);
     const std::string gameBody =
         "fields id,name,summary,storyline,first_release_date,"
@@ -3129,7 +3200,7 @@ void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
     const std::string ttbBody =
         "fields hastily,normally,completely; where game_id = " + id + ";";
 
-    QThread *thread = QThread::create([this, seq, gameBody, ttbBody]() {
+    QThread *thread = QThread::create([this, seq, igdbId, gameBody, ttbBody]() {
         QByteArray game, ttb;
         QString error;
         try {
@@ -3141,7 +3212,14 @@ void VortexBridge::queryBrowseDetails(int seq, qlonglong igdbId) {
         } catch (const std::exception &e) {
             error = QString::fromStdString(e.what());
         }
-        QMetaObject::invokeMethod(this, [this, seq, game, ttb, error]() {
+        QMetaObject::invokeMethod(this, [this, seq, igdbId, game, ttb, error]() {
+            // Kept even when the page has moved on, since it is still right.
+            // Not a failure, nor an answer missing its time to beat (an empty
+            // reply, as against IGDB's "[]" for a game it has none for), so
+            // the next open asks again rather than showing less all session.
+            if (error.isEmpty() && !ttb.isEmpty()
+                && !QJsonDocument::fromJson(game).array().at(0).toObject().isEmpty())
+                m_browseDetailsCache.insert(igdbId, { game, ttb });
             applyBrowseDetails(seq, game, ttb, error);
         }, Qt::QueuedConnection);
     });
@@ -3160,6 +3238,7 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
         vlog::line("Browse", "Details failed: " + error.toStdString());
         m_browseDetails["error"] = QStringLiteral("Could not load this game from IGDB.");
         emit browseDetailsChanged();
+        releaseLiveArtAwaitingBrowse();     // no app id is coming
         // A recommendation's seed can already know its Steam app; the reviews
         // do not depend on IGDB, so they are still worth showing.
         const int appId = m_browseDetails.value("steamAppId").toInt();
@@ -3322,9 +3401,12 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
     if (!replaced)
         m_browseSnapshots << snapshot;
 
-    // After the snapshot is in, so finishLiveArtwork() finds its Steam app id.
+    // After the snapshot is in, so finishLiveArtwork() finds its Steam app id
+    // -- both for a lookup starting only now and for one that started with
+    // the page and has been waiting on that id.
     if (lookUp)
         resolveLiveArtwork(name, true);
+    releaseLiveArtAwaitingBrowse(name);
 
     QVariantMap meta;
     meta["igdbId"]     = igdbId;
@@ -3341,6 +3423,16 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
 }
 
 void VortexBridge::fetchSteamReviews(int seq, int appId) {
+    // Fetched already this session: nothing in it depends on anything but
+    // the app, so it goes straight up.
+    const auto cached = m_browseReviewsCache.constFind(appId);
+    if (cached != m_browseReviewsCache.constEnd()) {
+        m_browseReviewsLoading = false;
+        m_browseReviews = cached.value();
+        emit browseReviewsChanged();
+        return;
+    }
+
     m_browseReviewsLoading = true;
     emit browseReviewsChanged();
 
@@ -3353,17 +3445,18 @@ void VortexBridge::fetchSteamReviews(int seq, int appId) {
     request.setHeader(QNetworkRequest::UserAgentHeader, "VortexLauncher/1.0");
 
     QNetworkReply *reply = m_network->get(request);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, seq]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, seq, appId]() {
         reply->deleteLater();
-        if (seq != m_browseDetailsSeq)
-            return;
 
-        m_browseReviewsLoading = false;
         QVariantMap result;
         const QJsonObject root = reply->error() == QNetworkReply::NoError
             ? QJsonDocument::fromJson(reply->readAll()).object() : QJsonObject();
 
         if (root.value("success").toInt() != 1) {
+            // Not cached, so the next open asks Steam again.
+            if (seq != m_browseDetailsSeq)
+                return;
+            m_browseReviewsLoading = false;
             result["error"] = QStringLiteral("Steam reviews are unavailable right now.");
             m_browseReviews = result;
             emit browseReviewsChanged();
@@ -3395,6 +3488,11 @@ void VortexBridge::fetchSteamReviews(int seq, int appId) {
             reviews << one;
         }
         result["reviews"] = reviews;
+        // Kept even when the page has moved on, since it is still right.
+        m_browseReviewsCache.insert(appId, result);
+        if (seq != m_browseDetailsSeq)
+            return;
+        m_browseReviewsLoading = false;
         m_browseReviews = result;
         emit browseReviewsChanged();
     });

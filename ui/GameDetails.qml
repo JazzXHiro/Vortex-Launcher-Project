@@ -1241,7 +1241,7 @@ Popup {
                 closeArea.containsMouse && detailsRoot.mouseInControl
 
             anchors { top: parent.top; right: parent.right; margins: 20 }
-            width: 44; height: 44; radius: 22
+            width: 44; height: 44; radius: 10
             color: closeButton.emphasized ? "#B32A2A2A" : "#80000000"
             border.width: closeButton.emphasized ? 2 : 1
             border.color: closeButton.emphasized ? Theme.focusRing : Theme.borderControl

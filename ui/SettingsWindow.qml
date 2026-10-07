@@ -188,7 +188,7 @@ Popup {
             Rectangle {
                 anchors { top: parent.top; right: parent.right; margins: 20 }
                 z: 5
-                width: 32; height: 32; radius: 16
+                width: 32; height: 32; radius: 8
                 color: closeArea.containsMouse ? Theme.bgEmphasis : "transparent"
                 Text { anchors.centerIn: parent; text: "✕"; color: Theme.textMuted; font.pixelSize: 14 }
                 MouseArea {
@@ -346,7 +346,7 @@ Popup {
                                     // Remove button
                                     Rectangle {
                                         anchors { right: parent.right; rightMargin: 12; verticalCenter: parent.verticalCenter }
-                                        width: 26; height: 26; radius: 13
+                                        width: 26; height: 26; radius: 6
                                         visible: !dirRow.armed
                                         opacity: rowHover.containsMouse || removeArea.containsMouse ? 1.0 : 0.35
                                         color: removeArea.containsMouse ? Theme.dangerRest : "transparent"

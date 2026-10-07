@@ -601,6 +601,13 @@ private:
     void        applyLiveArtwork(const QString &name, const QVariantMap &art,
                                  bool definitive);
     QVariantMap savedRowFor(const QString &name) const;
+    // A Discover page starts its SteamGridDB lookup as it opens, before IGDB
+    // has said which Steam app the game is. An answer that still wants Steam's
+    // CDN parks here, by lower-cased name, until IGDB lands with the app id or
+    // the page gives up waiting for it.
+    bool        liveArtAwaitsBrowseAppId(const QString &name) const;
+    void        releaseLiveArtAwaitingBrowse(const QString &answered = QString());
+    QHash<QString, QVariantMap> m_liveArtAwaitingBrowse;
 
     // live_artwork.json: the URLs each lookup found, keyed by lower-cased
     // name, so a game is asked about once per machine rather than once per
@@ -662,6 +669,12 @@ private:
     // Raw IGDB facts keyed by canonical name, for save_game_metadata() when a
     // browse game is marked played: the recommender needs its genres.
     QHash<QString, QVariantMap> m_browseMetadata;
+    // IGDB's raw /games and /game_time_to_beats answers by IGDB id, so a
+    // details page opened again this session skips both requests.
+    QHash<qlonglong, QPair<QByteArray, QByteArray>> m_browseDetailsCache;
+    // Steam's review summary and top reviews by app id, as the page shows
+    // them; only successful answers, for this session.
+    QHash<int, QVariantMap> m_browseReviewsCache;
 
     void        applyBrowseResults(int seq, const QByteArray &json, const QString &error);
     void        applyNewReleases(const QByteArray &json, const QString &error);

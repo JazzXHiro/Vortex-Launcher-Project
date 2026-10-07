@@ -1377,7 +1377,10 @@ Window {
                         tileMenu.openFor(overflowButton, gameDelegate.liveName,
                                          gameDelegate.modelData.installDir || "",
                                          gameDelegate.launchable,
-                                         gameDelegate.sourceLabel === "Local")
+                                         gameDelegate.sourceLabel === "Local",
+                                         // Not on an uninstalled Favorites row.
+                                         !(root.activeTab === "Favorites"
+                                           && gameDelegate.modelData.installed !== true))
                     }
 
                     // Drawn on root's glowStage, behind the page: see
@@ -1402,9 +1405,16 @@ Window {
                         Rectangle {
                             id: capsuleContainer
                             width: 240; height: 360
-                            color: Theme.bgRaised; radius: 12
-                            border.color: gameDelegate.highlighted ? Theme.focusRing : Theme.borderControl
+                            color: Theme.bgRaised; radius: 8
+                            // No focus ring: the lift, the glow and the control
+                            // row already mark the lit card.
+                            border.color: Theme.borderControl
                             border.width: 2; clip: true
+
+                            // See RoundedCorners.qml.
+                            layer.enabled: true
+                            layer.smooth: true
+                            layer.effect: RoundedCorners { radius: capsuleContainer.radius }
 
                             Image {
                                 id: gameCover
@@ -1488,13 +1498,10 @@ Window {
                                     }
                                     height: 140
 
-                                    // Square, because the artwork underneath is
-                                    // square: clip on a rounded Rectangle clips
-                                    // to the bounding box, not the rounded
-                                    // shape, so the cover fills the corners the
-                                    // capsule's own radius only appears to cut.
-                                    // Rounding the strip pulled it off those
-                                    // corners and left a crescent of bare art.
+                                    // Square: the capsule's mask rounds it along
+                                    // with the art, and rounding it separately
+                                    // would leave a crescent of bare art at the
+                                    // corners.
 
                                     // Transparent at the top so the cover reads
                                     // straight into the wash, solid at the
@@ -1509,25 +1516,21 @@ Window {
                                     }
                                 }
 
-                                // The white pill this had before the artboard
-                                // pass: centred across the card rather than
-                                // filling a corner of it.
-                                //
-                                // Pinned near the bottom edge rather than to the
-                                // wash's centre: the wash is 140 tall now, and
-                                // its centre would float the pill a third of the
-                                // way up the cover. Down here it sits on the
-                                // solid end of the gradient, which is what gives
-                                // the white its contrast.
+                                // The white pill, in the bottom-left corner with
+                                // the overflow button opposite it: one control
+                                // row along the foot of the cover, sitting on
+                                // the solid end of the gradient, which is what
+                                // gives the white its contrast.
                                 Rectangle {
                                     id: playButton
                                     readonly property bool hovered:
                                         playArea.containsMouse && root.mouseInControl
 
-                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    anchors.left: parent.left
                                     anchors.bottom: parent.bottom
-                                    anchors.bottomMargin: 16
-                                    width: 104; height: 32; radius: 16
+                                    anchors.leftMargin: 16
+                                    anchors.bottomMargin: 10
+                                    width: 96; height: 38; radius: 19
 
                                     // Nothing to launch on a Played row whose
                                     // files are gone; the strip still reads fine
@@ -1539,7 +1542,7 @@ Window {
 
                                     Row {
                                         anchors.centerIn: parent
-                                        spacing: 7
+                                        spacing: 8
 
                                         // Same asset as the details pages' PLAY.
                                         // Decoded at twice the drawn size so it
@@ -1558,9 +1561,9 @@ Window {
                                             anchors.verticalCenter: parent.verticalCenter
                                             text: "PLAY"
                                             color: playButton.hovered ? Theme.textPrimary : Theme.textInverse
-                                            font.pixelSize: 11
+                                            font.pixelSize: 12
                                             font.bold: true
-                                            font.letterSpacing: 1
+                                            font.letterSpacing: 1.5
                                         }
                                     }
 
@@ -1572,9 +1575,75 @@ Window {
                                         onClicked: gameDelegate.play()
                                     }
                                 }
+
+                                // ── Overflow button ─────────────────────────
+                                //
+                                // Bottom-right, level with the play pill. Lives
+                                // on the art rather than over the delegate so it
+                                // scales with the cover and stays in line with
+                                // the pill; the Column's z keeps it above
+                                // cardArea for clicks, as it does the pill.
+                                //
+                                // Just the dots, no disc behind them.
+                                Item {
+                                    id: overflowButton
+                                    readonly property bool hovered:
+                                        overflowArea.containsMouse && root.mouseInControl
+                                    // While its own menu is open the menu's first
+                                    // cell stands in for this button, so it steps
+                                    // aside rather than being caught in the menu's
+                                    // frosted backdrop as a smeared grey disc.
+                                    readonly property bool menuOpen:
+                                        tileMenu.visible
+                                        && tileMenu.gameName === gameDelegate.liveName
+
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: playButton.verticalCenter
+                                    anchors.rightMargin: 10
+                                    width: 38; height: 38
+
+                                    opacity: overflowButton.menuOpen ? 0.0 : 1.0
+                                    Behavior on opacity { NumberAnimation { duration: 150 } }
+
+                                    // Drawn rather than typed: the ⋮ glyph renders
+                                    // at a different weight and baseline in every
+                                    // font, and the rest of this UI has no font
+                                    // family set at all.
+                                    Column {
+                                        anchors.centerIn: parent
+                                        spacing: 3
+                                        Repeater {
+                                            model: 3
+                                            Rectangle {
+                                                width: 4; height: 4; radius: 2
+                                                color: overflowButton.hovered ? Theme.accent : Theme.bgDot
+                                            }
+                                        }
+                                    }
+
+                                    // Only the middle 22x26 takes the click --
+                                    // the glyph plus a little margin; the item
+                                    // stays 38px because the menu is laid over
+                                    // its box.
+                                    MouseArea {
+                                        id: overflowArea
+                                        anchors.centerIn: parent
+                                        width: 22; height: 26
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            if (root.padActive)
+                                                gameGrid.currentIndex = gameDelegate.index
+                                            gameDelegate.openTileMenu()
+                                        }
+                                    }
+                                }
                             }
 
-                            scale: gameDelegate.highlighted ? 1.04 : 1.0
+                            // Held while the card's menu is open: the button
+                            // now rides the scale, and the menu is placed over
+                            // it once, at the size it had when it opened.
+                            scale: (gameDelegate.highlighted || overflowButton.menuOpen) ? 1.04 : 1.0
                             Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
                         }
 
@@ -1729,81 +1798,6 @@ Window {
                             detailPopup.launchOrigin = "Library"
                             detailPopup.selectedGameName = gameDelegate.liveName
                             detailPopup.open()
-                        }
-                    }
-
-                    // ── Overflow button ─────────────────────────────────────
-                    //
-                    // Declared AFTER cardArea, and as its sibling rather than a
-                    // child of the art: cardArea fills the whole card, so
-                    // anything earlier in the file sits under it and would never
-                    // see the click.
-                    //
-                    // Anchored to the delegate rather than to the art it sits
-                    // on: capsuleContainer is a child of the Column, so it is
-                    // neither parent nor sibling here and anchoring to it is
-                    // refused outright. The Column centres 360px of art plus a
-                    // ~20px title in 400px, so the art starts 4px down -- 14
-                    // puts the button 10px inside its top-right corner, and it
-                    // stays put while the art scales under it on hover.
-                    Rectangle {
-                        id: overflowButton
-                        readonly property bool hovered:
-                            overflowArea.containsMouse && root.mouseInControl
-                        // While its own menu is open the menu's first cell
-                        // stands in for this button, so it steps aside rather
-                        // than being caught in the menu's frosted backdrop as a
-                        // smeared grey disc.
-                        readonly property bool menuOpen:
-                            tileMenu.visible
-                            && tileMenu.gameName === gameDelegate.liveName
-
-                        anchors {
-                            top: parent.top
-                            right: parent.right
-                            topMargin: 12
-                            rightMargin: 11
-                        }
-                        width: 32; height: 32; radius: 16
-                        z: 2                     // above the lifted column
-
-                        // Semi-opaque rather than solid: the cover art stays
-                        // readable underneath it.
-                        color: overflowButton.hovered ? Theme.overlayBadge : Theme.overlayButton
-                        border.width: 1
-                        border.color: overflowButton.hovered ? Theme.focusRing : Theme.borderStrong
-
-                        visible: opacity > 0
-                        opacity: (gameDelegate.highlighted && !overflowButton.menuOpen)
-                                 ? 0.6 : 0.0
-                        Behavior on opacity { NumberAnimation { duration: 150 } }
-                        Behavior on color { ColorAnimation { duration: 120 } }
-
-                        // Drawn rather than typed: the ⋮ glyph renders at a
-                        // different weight and baseline in every font, and the
-                        // rest of this UI has no font family set at all.
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: 3
-                            Repeater {
-                                model: 3
-                                Rectangle {
-                                    width: 4; height: 4; radius: 2
-                                    color: overflowButton.hovered ? Theme.accent : Theme.bgDot
-                                }
-                            }
-                        }
-
-                        MouseArea {
-                            id: overflowArea
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                if (root.padActive)
-                                    gameGrid.currentIndex = gameDelegate.index
-                                gameDelegate.openTileMenu()
-                            }
                         }
                     }
                 }
@@ -2156,11 +2150,15 @@ Window {
                                                     id: recommendationCard
                                                     width: 240
                                                     height: 360
-                                                    radius: 12
+                                                    radius: 8
                                                     color: Theme.bgSurface
                                                     border.width: 2
-                                                    border.color: recommendationDelegate.highlighted ? Theme.focusRing : Theme.borderMuted
+                                                    border.color: Theme.borderMuted
                                                     clip: true
+                                                    // See RoundedCorners.qml.
+                                                    layer.enabled: true
+                                                    layer.smooth: true
+                                                    layer.effect: RoundedCorners { radius: recommendationCard.radius }
 
                                                     Image {
                                                         id: recommendationCover
@@ -2530,11 +2528,15 @@ Window {
                                 id: wishlistCard
                                 width: 240
                                 height: 360
-                                radius: 12
+                                radius: 8
                                 color: Theme.bgSurface
                                 border.width: 2
-                                border.color: wishlistDelegate.highlighted ? Theme.focusRing : Theme.borderMuted
+                                border.color: Theme.borderMuted
                                 clip: true
+                                // See RoundedCorners.qml.
+                                layer.enabled: true
+                                layer.smooth: true
+                                layer.effect: RoundedCorners { radius: wishlistCard.radius }
 
                                 Image {
                                     id: wishlistCover

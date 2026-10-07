@@ -422,11 +422,15 @@ Item {
                     id: resultCard
                     width: resultDelegate.width
                     height: resultDelegate.compact ? newRail.coverHeight : 360
-                    radius: resultDelegate.compact ? 10 : 12
+                    radius: 8
                     color: Theme.bgSurface
                     border.width: 2
-                    border.color: resultDelegate.highlighted ? Theme.focusRing : Theme.borderMuted
+                    border.color: Theme.borderMuted
                     clip: true
+                    // See RoundedCorners.qml.
+                    layer.enabled: true
+                    layer.smooth: true
+                    layer.effect: RoundedCorners { radius: resultCard.radius }
 
                     Image {
                         id: resultCover

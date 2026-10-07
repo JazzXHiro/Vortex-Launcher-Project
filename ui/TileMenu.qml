@@ -51,6 +51,9 @@ Popup {
     // A local uninstall deletes the folder itself, so it gets a confirm step;
     // Steam games hand off to Steam, which prompts on its own.
     property bool isLocal: false
+    // A hearted game that is not installed has no library row to remove --
+    // the heart is the only thing keeping it in the launcher.
+    property bool canRemove: true
 
     // favoriteGames is referenced so this re-reads on favoritesChanged --
     // isFavorite() alone is a plain call with nothing to notify it.
@@ -59,11 +62,15 @@ Popup {
         && !!menuRoot.api.favoriteGames
         && menuRoot.api.isFavorite(menuRoot.gameName)
 
-    // The rows, top to bottom. Uninstall drops out where it cannot apply, so
-    // the pad never lands on a row that does nothing.
-    readonly property var items: menuRoot.canUninstall
-                                 ? ["remove", "uninstall", "like"]
-                                 : ["remove", "like"]
+    // The rows, top to bottom. Remove and uninstall drop out where they cannot
+    // apply, so the pad never lands on a row that does nothing.
+    readonly property var items: {
+        const rows = []
+        if (menuRoot.canRemove) rows.push("remove")
+        if (menuRoot.canUninstall) rows.push("uninstall")
+        rows.push("like")
+        return rows
+    }
 
     // Which confirm is showing, if any: "" for the icon list, "remove" or
     // "uninstall" for its two-button step.
@@ -118,8 +125,9 @@ Popup {
     // A lit cell lets a little of the cover art through, like the panel does.
     readonly property real fillAlpha: 0.7
 
-    // Set when opened: true when there was no room below, in which case the
-    // button becomes the BOTTOM cell and the list stretches upwards out of it.
+    // Set when opened: true unless there was no room above, in which case the
+    // button becomes the TOP cell and the list stretches downwards instead.
+    // Upwards, the button is the BOTTOM cell and the list grows out of it.
     property bool openUpward: false
 
     // 0 → 1 as the menu unrolls; the enter and exit transitions drive it.
@@ -130,13 +138,14 @@ Popup {
     readonly property real targetWidth: menuRoot.confirming !== "" ? 250 : menuRoot.pillWidth
     readonly property real targetHeight: menuRoot.headerHeight + menuBody.implicitHeight
 
-    function openFor(anchorItem, name, dir, uninstallable, local) {
+    function openFor(anchorItem, name, dir, uninstallable, local, removable) {
         if (!anchorItem)
             return
         menuRoot.gameName     = name
         menuRoot.installDir   = dir
         menuRoot.canUninstall = !!uninstallable
         menuRoot.isLocal      = !!local
+        menuRoot.canRemove    = removable !== false
         menuRoot.confirming   = ""
         menuRoot.armedChoice  = -1
 
@@ -146,20 +155,28 @@ Popup {
         const frame = menuRoot.parent
         if (!frame)
             return
+        // Both corners mapped, not width/height read off the item: the card's
+        // button sits on the cover and rides its hover scale, so its drawn
+        // size is not its declared one.
         const at = anchorItem.mapToItem(frame, 0, 0)
+        const far = anchorItem.mapToItem(frame, anchorItem.width, anchorItem.height)
         menuRoot.anchorX = at.x
         menuRoot.anchorY = at.y
-        menuRoot.anchorW = anchorItem.width
-        menuRoot.anchorH = anchorItem.height
+        menuRoot.anchorW = far.x - at.x
+        menuRoot.anchorH = far.y - at.y
         if (menuRoot.backdropItem) {
             const origin = menuRoot.backdropItem.mapToItem(frame, 0, 0)
             menuRoot.backdropOrigin = Qt.point(origin.x, origin.y)
         }
 
+        // Upward by preference: the button sits at the foot of the card,
+        // beside PLAY, so the list grows back up over the cover instead of
+        // spilling off the bottom into the row below. Downward only when the
+        // card is so near the top of the window that there is no room above.
         // Decided once per opening: flipping while the confirm step resizes
         // the panel would tear it off the button.
-        menuRoot.openUpward = menuRoot.anchorY - menuRoot.rim + menuRoot.targetHeight
-                              > frame.height - 12
+        menuRoot.openUpward = menuRoot.anchorY + menuRoot.anchorH + menuRoot.rim
+                              - menuRoot.targetHeight >= 12
 
         menuRoot.reposition()
         menuRoot.open()
@@ -618,14 +635,26 @@ Popup {
 
                             Behavior on color { ColorAnimation { duration: 120 } }
 
-                            // ✕ -- same glyph the settings directory list uses
-                            // for "take this out", so it means the same thing.
-                            Text {
+                            // ✕ -- the settings directory list's "take this out"
+                            // mark, so it means the same thing. Drawn from two
+                            // bars rather than typed, like the bin beside it:
+                            // the glyph comes from whatever fallback font has
+                            // it, and renders hairline-thin there.
+                            Item {
                                 visible: itemSlot.modelData === "remove"
                                 anchors.centerIn: parent
-                                text: "✕"
-                                color: itemButton.glyphColor
-                                font.pixelSize: 14
+                                width: 12; height: 12
+                                Repeater {
+                                    model: [45, -45]
+                                    Rectangle {
+                                        required property int modelData
+                                        anchors.centerIn: parent
+                                        width: 15; height: 2.5; radius: 1.25
+                                        rotation: modelData
+                                        antialiasing: true
+                                        color: itemButton.glyphColor
+                                    }
+                                }
                             }
 
                             // A bin, drawn rather than typed for the same reason
