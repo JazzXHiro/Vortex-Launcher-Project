@@ -25,7 +25,7 @@
 #endif
 
 #define AppName        "Vortex"
-#define AppVersion     "1.3.2"
+#define AppVersion     "1.3.3"
 #define AppPublisher   "Vortex"
 #define AppExeName     "VortexLauncher.exe"
 
