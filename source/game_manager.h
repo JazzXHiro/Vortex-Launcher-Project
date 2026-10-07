@@ -9,6 +9,8 @@
 
 namespace fs = std::filesystem;
 
+struct RiotGame;
+
 struct temp_GameEntry {
   std::string name;  // Name of the game
   fs::path gamePath; // Path of the game executable
@@ -71,8 +73,20 @@ LocalSession run_local_session(const fs::path &gamePath,
 LocalSession run_ea_session(const std::string &contentId,
                             const fs::path &installDir,
                             const std::function<void()> &onStarted = {});
+
+// Launches a game the Riot Client installed (see read_riot_install) through
+// the Riot Client, and blocks until it has closed -- the same wait as
+// run_ea_session(), sign-in and Vanguard's start-up included. Only the game's
+// own runs count; League's lobby client, which also lives in the install
+// folder, is not play but keeps the session open between matches.
+LocalSession run_riot_session(const RiotGame &game,
+                              const std::function<void()> &onStarted = {});
 bool is_game_running_in_dir(const fs::path &installDir);
 // Closes every process running from installDir: WM_CLOSE to its windows first
 // so the game can save, then TerminateProcess on whatever is still up after
 // graceSeconds. Blocks for up to that long. Returns how many it found.
-int quit_games_in_dir(const fs::path &installDir, int graceSeconds = 5);
+//
+// allowForce=false sends the WM_CLOSE alone and returns at once -- for Riot
+// games, where a kill is refused by Vanguard and penalised mid-match.
+int quit_games_in_dir(const fs::path &installDir, int graceSeconds = 5,
+                      bool allowForce = true);

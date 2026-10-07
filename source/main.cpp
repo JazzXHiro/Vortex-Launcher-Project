@@ -14,6 +14,7 @@
 #include "igdb_manager.h"
 #include "metadata_manager.h"
 #include "preference_manager.h"
+#include "riot_manager.h"
 #include "stats_manager.h"
 #include "steam_manager.h"
 #include "steamgriddb_manager.h"
@@ -180,6 +181,11 @@ static void remove_game_directory(std::vector<fs::path> &dirs, size_t index) {
     }
     for (const SteamGame &g : read_installed_steam_games()) {
         keepNames.push_back(g.name);
+    }
+    // Riot games stay listed from Riot's own install list either way.
+    for (const RiotGame &g : read_installed_riot_games()) {
+        keepNames.push_back(g.title);
+        keepNames.push_back(igdb_resolve_game(g.title, false).name);
     }
 
     std::set<std::string> keepLookup;
@@ -358,6 +364,8 @@ static std::vector<UnifiedGame> get_local_games() {
   
   std::vector<UnifiedGame> games;
   games.reserve(localGames.size());
+  const std::vector<RiotGame> riotGames = read_installed_riot_games(true);
+  std::vector<bool> riotListed(riotGames.size(), false);
   for (const auto& g : localGames) {
       UnifiedGame ug;
       ug.source = GameSource::Local;
@@ -365,6 +373,23 @@ static std::vector<UnifiedGame> get_local_games() {
       ug.igdb_id = g.igdb_id;
       ug.installDir = g.installDir;
       ug.gamePath = g.gamePath;
+      // A local folder that is a Riot install is that game, not a second copy.
+      for (size_t r = 0; r < riotGames.size(); ++r)
+          if (riot_install_matches(riotGames[r], ug.installDir))
+              riotListed[r] = true;
+      games.push_back(std::move(ug));
+  }
+  // Riot's own install list, so a Riot game needs no local folder. Listed as
+  // Local, as an EA install is; Play sends it through the Riot Client.
+  for (size_t r = 0; r < riotGames.size(); ++r) {
+      if (riotListed[r]) continue;
+      const IgdbGameInfo info = igdb_resolve_game(riotGames[r].title);
+      UnifiedGame ug;
+      ug.source = GameSource::Local;
+      ug.name = info.name;
+      ug.igdb_id = info.id;
+      ug.installDir = riotGames[r].installDir;
+      ug.gamePath = riotGames[r].clientExe;
       games.push_back(std::move(ug));
   }
   return games;
@@ -587,6 +612,15 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
                   } else {
                       cout << "[WARN] Failed to send uninstall request to Steam.\n";
                   }
+              } else if (RiotGame riot; read_riot_install(selected.installDir, riot)) {
+                  // Riot removes its own games; deleting the folder under the
+                  // client would leave it still listed as installed.
+                  if (uninstall_riot_game(riot)) {
+                      cout << "[✓] Uninstall request sent to the Riot Client for \"" << selected.name << "\".\n";
+                      cout << "    The Riot Client will handle the rest.\n";
+                  } else {
+                      cout << "[WARN] Failed to send uninstall request to the Riot Client.\n";
+                  }
               } else {
                   int possibleSteamAppId = get_steam_appid_for_install_dir(selected.installDir);
                   if (possibleSteamAppId > 0) {
@@ -637,10 +671,14 @@ static void run_games_menu(std::vector<UnifiedGame>& games, const std::string& m
         } else {
             // Blocks until the game and any launcher it came from have closed.
             // Only the runs of the game itself come back, idle included. An EA
-            // app install is launched through the EA app instead.
+            // app install is launched through the EA app instead, and a Riot
+            // game through the Riot Client.
+            RiotGame riot;
             EaGame ea;
             const LocalSession session =
-                read_ea_install(selected.installDir, ea)
+                read_riot_install(selected.installDir, riot)
+                    ? run_riot_session(riot)
+                : read_ea_install(selected.installDir, ea)
                     ? run_ea_session(ea.contentId, selected.installDir)
                     : run_local_session(selected.gamePath, selected.installDir);
 

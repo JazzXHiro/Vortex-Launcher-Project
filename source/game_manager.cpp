@@ -1,5 +1,6 @@
 #include "game_manager.h"
 #include "ea_manager.h"
+#include "riot_manager.h"
 #include "vortex_log.h"
 #include "app_paths.h"
 #include "igdb_manager.h"
@@ -227,6 +228,7 @@ void scan_directory_for_games(const fs::path &gameDir,
         // Storefronts and launchers -- they own games, they are not games
         "steam", "epicgames", "epicgameslauncher", "ubisoftconnect", "uplay",
         "eaapp", "eadesktop", "origin", "goggalaxy", "battlenet", "riotgames",
+        "riotclient",
         "rockstargames", "rockstargameslauncher", "playnite", "heroic",
         "itch", "itchio", "xboxapp",
         // Creative and productivity tools
@@ -1165,35 +1167,61 @@ LocalSession run_local_session(const fs::path &gamePath,
   return session;
 }
 
-LocalSession run_ea_session(const std::string &contentId,
-                            const fs::path &installDir,
-                            const std::function<void()> &onStarted) {
-  LocalSession session;
 #ifdef _WIN32
-  vlog::line("Play", "EA game -- launching through the EA app (offerIds=" +
-                         contentId + ")");
-  if (!launch_ea_game(contentId))
-    return session;
+namespace {
+
+// Riot ships a product's lobby inside its own folder -- League's
+// LeagueClient*.exe -- and nothing about its files says it is not the game.
+// It is not play, but a match is only ever started from it, so while it is up
+// the session is still open.
+bool is_riot_client_stem(const std::wstring &stem) {
+  return stem.rfind(L"leagueclient", 0) == 0 ||
+         stem.rfind(L"riotclient", 0) == 0;
+}
+
+// Waits on a game a store's own app was just asked to start, and blocks until
+// it has closed. No process is handed back and the first exe the store starts
+// is often an anti-cheat launcher, so the game is told apart purely by where
+// it runs from.
+//
+// Nothing here opens a process for more than PROCESS_QUERY_LIMITED_INFORMATION
+// (procs_in_dir), the access Task Manager uses, and loaded_game_module() is
+// never called: a Vanguard- or EAC-protected game is only ever looked at from
+// the outside.
+//
+// isClient, when set, names the store's own lobby processes in installDir;
+// they are never game time, but hold the session open between runs.
+LocalSession watch_store_session(const fs::path &installDir,
+                                 const std::string &store,
+                                 bool (*isClient)(const std::wstring &),
+                                 const std::function<void()> &onStarted) {
+  LocalSession session;
   session.started = true;
 
-  // The EA app signs in and syncs cloud saves before it starts anything --
-  // 13s warm and over 40s cold for Apex, far past run_local_session's grace --
-  // so the wait for the game is as long as monitor_steam_session's.
+  // The store signs in and syncs before it starts anything -- 13s warm and
+  // over 40s cold for Apex in the EA app, far past run_local_session's grace
+  // -- so the wait for the game is as long as monitor_steam_session's.
   const int kStartupTimeoutSeconds = 120;
   // A game that closes and comes straight back, say to apply a setting, is
   // still the same session.
   const int kRestartGraceSeconds = 10;
 
-  // No process is handed back and the exe EA starts is its anti-cheat
-  // launcher, so the game is told apart purely by where it runs from.
   GameDirs gameDirs;
   GameDirs *const knownGameDirs =
       find_game_dir(installDir, gameDirs).empty() ? nullptr : &gameDirs;
-  const auto runningGame = [&]() -> std::string {
-    for (const DirProcess &p : procs_in_dir(installDir))
-      if (classify(p, L"", L"", false, knownGameDirs) == ProcKind::Game)
-        return file_name_of(p.path);
-    return {};
+  const auto poll = [&](bool &clientUp) -> std::string {
+    clientUp = false;
+    std::string game;
+    for (const DirProcess &p : procs_in_dir(installDir)) {
+      if (isClient && isClient(fs::path(p.lower).stem().wstring())) {
+        clientUp = true;
+        continue;
+      }
+      if (game.empty() &&
+          classify(p, L"", L"", false, knownGameDirs) == ProcKind::Game)
+        game = file_name_of(p.path);
+    }
+    return game;
   };
 
   const std::time_t launchedAt = std::time(nullptr);
@@ -1206,9 +1234,11 @@ LocalSession run_ea_session(const std::string &contentId,
 
   for (;;) {
     const std::time_t now = std::time(nullptr);
-    const std::string game = runningGame();
-    if (!game.empty()) {
+    bool clientUp = false;
+    const std::string game = poll(clientUp);
+    if (!game.empty() || clientUp)
       lastSeen = now;
+    if (!game.empty()) {
       if (!inGame) {
         inGame = true;
         segStart = now;
@@ -1218,8 +1248,9 @@ LocalSession run_ea_session(const std::string &contentId,
         vlog::line("Play", "game started: " + game + " (after " +
                                vlog::duration(static_cast<long long>(
                                    now - launchedAt)) +
-                               " in the EA app)");
-        // QUIT only once there is a game to quit, not while EA signs in.
+                               " in the " + store + ")");
+        // QUIT only once there is a game to quit, not while the store signs
+        // in.
         if (!notified && onStarted)
           onStarted();
         notified = true;
@@ -1239,7 +1270,7 @@ LocalSession run_ea_session(const std::string &contentId,
     if (!inGame) {
       if (session.segments.empty()) {
         if (now - launchedAt >= kStartupTimeoutSeconds) {
-          vlog::line("Play", "EA app did not start the game within " +
+          vlog::line("Play", "the " + store + " did not start the game within " +
                                  std::to_string(kStartupTimeoutSeconds) +
                                  "s -- nothing recorded");
           break;
@@ -1250,9 +1281,43 @@ LocalSession run_ea_session(const std::string &contentId,
     }
     Sleep(2000);
   }
+  return session;
+}
+
+} // namespace
+#endif
+
+LocalSession run_ea_session(const std::string &contentId,
+                            const fs::path &installDir,
+                            const std::function<void()> &onStarted) {
+  LocalSession session;
+#ifdef _WIN32
+  vlog::line("Play", "EA game -- launching through the EA app (offerIds=" +
+                         contentId + ")");
+  if (!launch_ea_game(contentId))
+    return session;
+  session = watch_store_session(installDir, "EA app", nullptr, onStarted);
 #else
   std::cout << "[MOCK] Linux: Skipping EA launch for " << contentId << "\n";
   (void)installDir;
+  (void)onStarted;
+#endif
+  return session;
+}
+
+LocalSession run_riot_session(const RiotGame &game,
+                              const std::function<void()> &onStarted) {
+  LocalSession session;
+#ifdef _WIN32
+  vlog::line("Play", "Riot game -- launching through the Riot Client "
+                     "(--launch-product=" + game.product +
+                         " --launch-patchline=" + game.patchline + ")");
+  if (!launch_riot_game(game))
+    return session;
+  session = watch_store_session(game.installDir, "Riot Client",
+                                is_riot_client_stem, onStarted);
+#else
+  std::cout << "[MOCK] Linux: Skipping Riot launch for " << game.product << "\n";
   (void)onStarted;
 #endif
   return session;
@@ -1285,8 +1350,19 @@ static BOOL CALLBACK post_close_to_pid(HWND hwnd, LPARAM lParam) {
 }
 #endif
 
-int quit_games_in_dir(const fs::path &installDir, int graceSeconds) {
+int quit_games_in_dir(const fs::path &installDir, int graceSeconds,
+                      bool allowForce) {
 #ifdef _WIN32
+  // Only the close request, as Alt+F4 sends it: a Vanguard-protected game
+  // refuses PROCESS_TERMINATE anyway, and killing one mid-match counts as
+  // leaving it. The game puts up its own prompt and the session sees it go.
+  if (!allowForce) {
+    const std::vector<DWORD> pids = pids_in_dir(installDir);
+    for (DWORD pid : pids)
+      EnumWindows(post_close_to_pid, static_cast<LPARAM>(pid));
+    return static_cast<int>(pids.size());
+  }
+
   // A game the session found outside the folder -- Minecraft, started by
   // Prism -- goes first, and on its own: closing the launcher does not close
   // it, and it gets longer to save, since a world killed mid-save is lost.
@@ -1333,6 +1409,7 @@ int quit_games_in_dir(const fs::path &installDir, int graceSeconds) {
 #else
   (void)installDir;
   (void)graceSeconds;
+  (void)allowForce;
   return 0;
 #endif
 }

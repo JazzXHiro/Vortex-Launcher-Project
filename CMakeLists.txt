@@ -26,6 +26,7 @@ set(VORTEX_ENGINE_SOURCES
     source/json_text.cpp
     source/metadata_manager.cpp
     source/preference_manager.cpp
+    source/riot_manager.cpp
     source/secrets.cpp
     source/stats_manager.cpp
     source/steam_manager.cpp
@@ -112,6 +113,7 @@ qt_add_qml_module(VortexLauncher
         ui/assets/steam.png
         ui/assets/local.png
         ui/assets/ea.png
+        ui/assets/riot.png
         ui/assets/thumb_up.png
         ui/assets/thumb_down.png
         ui/assets/arrow_left.png

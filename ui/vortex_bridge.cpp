@@ -7,6 +7,7 @@
 #include "json_text.h"
 #include "metadata_manager.h"
 #include "preference_manager.h"
+#include "riot_manager.h"
 #include "stats_manager.h"
 #include "steam_manager.h"
 #include "secrets.h"
@@ -1090,6 +1091,7 @@ QVariantMap VortexBridge::buildGameMap(const BridgeGame &bg) const {
     game["name"]       = QString::fromStdString(bg.name);
     game["source"]     = QString::fromStdString(bg.source);
     game["isEa"]       = bg.isEa;
+    game["isRiot"]     = bg.isRiot;
     game["appid"]      = bg.appid;
     game["installDir"] = QString::fromStdString(bg.installDir.string());
     game["gamePath"]   = QString::fromStdString(bg.gamePath.string());   // empty for Steam
@@ -3737,6 +3739,10 @@ void VortexBridge::loadGames() {
         std::vector<temp_GameEntry> localEntries;
         for (const fs::path &dir : readLocalGameDirectories(baseDir))
             scan_directory_for_games(dir, localEntries, false);
+        // Riot's own install list, so VALORANT is found wherever the Riot
+        // Client put it, no folder needed.
+        const std::vector<RiotGame> riotGames = read_installed_riot_games(true);
+        std::vector<bool> riotListed(riotGames.size(), false);
 
         // Games the user removed from the library are dropped HERE, before
         // either vector exists, rather than when the QVariantList is built:
@@ -3775,18 +3781,42 @@ void VortexBridge::loadGames() {
             bg.igdb_id    = g.igdb_id;
             bg.installDir = g.installDir;
             bg.gamePath   = g.gamePath;
+            // A local folder that is a Riot install (D:\Riot Games added as a
+            // game folder) is that game, not a second copy of it. Marked
+            // before the removed check, so a removed one stays removed.
+            for (size_t r = 0; r < riotGames.size() && !bg.isRiot; ++r)
+                if (riot_install_matches(riotGames[r], bg.installDir))
+                    bg.isRiot = riotListed[r] = true;
             if (isRemovedIn(removedSnapshot, bg)) continue;
             // The same test Play uses, so the card's EA mark means it will
             // launch through the EA app and not just that EA made it.
             EaGame ea;
-            bg.isEa       = read_ea_install(bg.installDir, ea);
+            bg.isEa       = !bg.isRiot && read_ea_install(bg.installDir, ea);
             applyOverride(bg);
             internalGames.push_back(std::move(bg));
+        }
+        int riotCount = 0;
+        for (size_t r = 0; r < riotGames.size(); ++r) {
+            if (riotListed[r]) continue;
+            const RiotGame &g = riotGames[r];
+            // Filed as Local, like an EA install: the filters, playtime keys
+            // and analytics need nothing new, and the card's mark says Riot.
+            BridgeGame bg;
+            bg.name       = g.title;
+            bg.source     = "Local";
+            bg.installDir = g.installDir;
+            bg.gamePath   = g.clientExe; // what Play actually starts
+            bg.isRiot     = true;
+            if (isRemovedIn(removedSnapshot, bg)) continue;
+            applyOverride(bg);
+            internalGames.push_back(std::move(bg));
+            ++riotCount;
         }
 
         const int total = static_cast<int>(internalGames.size());
         vlog::line("Scan", std::to_string(steamGames.size()) + " Steam + " +
-                           std::to_string(localEntries.size()) + " local = " +
+                           std::to_string(localEntries.size()) + " local + " +
+                           std::to_string(riotCount) + " Riot = " +
                            std::to_string(total) + " games");
 
         // Publish now. From here the library is on screen and usable; the two
@@ -4402,9 +4432,13 @@ void VortexBridge::launchGameFrom(QString name, QString origin) {
             // Blocks until the game and any launcher it came from have closed,
             // sampling idle per run itself. A game the EA app installed bounces
             // through the EA app when started directly, so it is launched there
-            // and waited for instead; every other local game is untouched.
+            // and waited for instead, as is a Riot game through the Riot
+            // Client; every other local game is untouched.
+            RiotGame riot;
             EaGame ea;
-            if (read_ea_install(found.installDir, ea))
+            if (read_riot_install(found.installDir, riot))
+                local = run_riot_session(riot, markRunning);
+            else if (read_ea_install(found.installDir, ea))
                 local = run_ea_session(ea.contentId, found.installDir,
                                        markRunning);
             else
@@ -4546,8 +4580,13 @@ void VortexBridge::quitGame(QString name) {
                                                     : bg.gamePath.parent_path();
         vlog::line("Play", "quitting " + bg.name);
         // Blocks through the grace period, so off the UI thread. The launch
-        // thread notices the exit and flips the button back to PLAY.
-        QThread *thread = QThread::create([dir]() { quit_games_in_dir(dir); });
+        // thread notices the exit and flips the button back to PLAY. A Riot
+        // game is only asked to close, never killed: Vanguard refuses the
+        // kill, and a match left that way is penalised.
+        const bool allowForce = !bg.isRiot;
+        QThread *thread = QThread::create([dir, allowForce]() {
+            quit_games_in_dir(dir, 5, allowForce);
+        });
         connect(thread, &QThread::finished, thread, &QThread::deleteLater);
         thread->start();
         return;
@@ -4560,6 +4599,15 @@ void VortexBridge::quitGame(QString name) {
 void VortexBridge::uninstallGame(QString name) {
     for (const BridgeGame &bg : m_internalGames) {
         if (QString::fromStdString(bg.name) == name) {
+            // The Riot Client removes its own games, after its own prompt.
+            // Deleting the folder under it would leave Riot -- and so this
+            // scan -- still listing the game.
+            RiotGame riot;
+            if (bg.source != "Steam" && read_riot_install(bg.installDir, riot)) {
+                if (uninstall_riot_game(riot))
+                    watchRiotUninstall(riot.installDir);
+                return;
+            }
             int steamAppId = bg.source == "Steam"
                                  ? bg.appid
                                  : get_steam_appid_for_install_dir(bg.installDir);
@@ -4577,6 +4625,43 @@ void VortexBridge::uninstallGame(QString name) {
             return;
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// watchRiotUninstall — re-scan once the Riot Client has removed the game.
+//
+// The same shape as watchSteamUninstall below: the client's uninstall returns
+// before the player has confirmed anything, so the folder is polled until it
+// goes, and the poll gives up after a while in case they cancelled.
+// ─────────────────────────────────────────────────────────────────────────────
+void VortexBridge::watchRiotUninstall(const fs::path &installDir) {
+    const QString key = QString::fromStdString(installDir.string()).toLower();
+    if (m_pendingRiotUninstalls.contains(key))
+        return;
+    m_pendingRiotUninstalls.insert(key);
+
+    constexpr int kPollMs   = 2000;
+    constexpr int kGiveUpMs = 30 * 60 * 1000;
+
+    auto *timer = new QTimer(this);
+    timer->setInterval(kPollMs);
+    auto elapsed = std::make_shared<QElapsedTimer>();
+    elapsed->start();
+    connect(timer, &QTimer::timeout, this, [this, timer, elapsed, installDir, key]() {
+        std::error_code ec;
+        const bool gone = !fs::exists(installDir, ec);
+        if (!gone && elapsed->elapsed() < kGiveUpMs)
+            return;
+        timer->stop();
+        timer->deleteLater();
+        m_pendingRiotUninstalls.remove(key);
+        if (gone) {
+            vlog::line("Library", "Riot Client removed " + installDir.string()
+                                      + " -- rescanning");
+            loadGames();
+        }
+    });
+    timer->start();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5008,6 +5093,12 @@ void VortexBridge::removeLocalGameDirectory(QString folderPath) {
         }
         for (const SteamGame &g : read_installed_steam_games())
             keepNames.push_back(g.name);
+        // A Riot game stays listed from Riot's own install list after its
+        // folder is dropped, so its artwork stays too.
+        for (const RiotGame &g : read_installed_riot_games()) {
+            keepNames.push_back(g.title);
+            keepNames.push_back(igdb_resolve_game(g.title, false).name);
+        }
 
         std::vector<std::string> removedNames;
         removedNames.reserve(removedGames.size());

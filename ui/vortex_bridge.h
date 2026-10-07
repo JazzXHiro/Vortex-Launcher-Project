@@ -27,6 +27,7 @@ struct BridgeGame {
     std::string scannedName; // the name pass 1 found, before any rename
     std::string customName;  // the user's own title, "" when not renamed
     bool        isEa     = false; // a Local game the EA app launches (read_ea_install)
+    bool        isRiot   = false; // a Local game the Riot Client launches (read_riot_install)
 };
 
 class VortexBridge : public QObject {
@@ -489,6 +490,10 @@ private:
     // watchSteamUninstall(). Stops a second press from starting a second poll.
     QSet<int>               m_pendingSteamUninstalls;
     void watchSteamUninstall(int appid);
+    // Riot installs handed to the Riot Client's uninstall; see
+    // watchRiotUninstall(). Keyed by the lowercased install folder.
+    QSet<QString>           m_pendingRiotUninstalls;
+    void watchRiotUninstall(const fs::path &installDir);
     // Main thread only; the launch thread posts its changes over.
     QStringList             m_launchingGames;
     QStringList             m_runningGames;

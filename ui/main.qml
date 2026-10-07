@@ -1253,6 +1253,12 @@ Window {
                             ? gameDelegate.liveDetails.isEa === true
                             : gameDelegate.modelData.isEa === true
 
+                    // A Local row the Riot Client launches, read the same way.
+                    readonly property bool fromRiot:
+                        (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
+                            ? gameDelegate.liveDetails.isRiot === true
+                            : gameDelegate.modelData.isRiot === true
+
                     // applyGameMetadata() hands over the whole comma-separated
                     // list ("Role-playing (RPG), Simulator, Strategy"); only the
                     // first one fits under a 240px card.
@@ -1698,6 +1704,19 @@ Window {
                                         visible: gameDelegate.fromEa
                                     }
 
+                                    // Riot's own disc, from the Riot Client's
+                                    // icon, unfiltered like the two above. The
+                                    // asset is 256x256.
+                                    Image {
+                                        anchors.fill: parent
+                                        source: "assets/riot.png"
+                                        sourceSize.width: 16
+                                        sourceSize.height: 16
+                                        fillMode: Image.PreserveAspectFit
+                                        smooth: true
+                                        visible: gameDelegate.fromRiot
+                                    }
+
                                     // White on transparent, baked at build time.
                                     Image {
                                         anchors.fill: parent
@@ -1708,6 +1727,7 @@ Window {
                                         smooth: true
                                         opacity: 0.7
                                         visible: !gameDelegate.fromSteam && !gameDelegate.fromEa
+                                                 && !gameDelegate.fromRiot
                                     }
                                 }
 
