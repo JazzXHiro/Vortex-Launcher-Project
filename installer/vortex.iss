@@ -1,7 +1,11 @@
 ; Inno Setup script for Vortex.
 ;
 ; Build with:  scripts\package_release.ps1   (which stages the payload first)
-; or directly: ISCC.exe /DPayloadDir=..\dist\payload installer\vortex.iss
+; or directly: ISCC.exe /DPayloadDir=..\dist\payload /DAppVersion=1.3.4 installer\vortex.iss
+;
+; AppVersion has no default. It is project() in CMakeLists.txt, which the
+; packaging script reads from the build's CMakeCache.txt and passes in, so the
+; number is bumped in one place only.
 ;
 ; ---------------------------------------------------------------------------
 ; Why this is a per-user install
@@ -24,8 +28,11 @@
   #define PayloadDir "..\dist\payload"
 #endif
 
+#ifndef AppVersion
+  #error AppVersion is not defined -- build with scripts\package_release.ps1, or pass /DAppVersion=<version from CMakeLists.txt>
+#endif
+
 #define AppName        "Vortex"
-#define AppVersion     "1.3.3"
 #define AppPublisher   "Vortex"
 #define AppExeName     "VortexLauncher.exe"
 

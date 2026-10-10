@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(Vortex VERSION 1.0 LANGUAGES CXX)
+project(Vortex VERSION 1.3.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -168,6 +168,11 @@ target_link_libraries(VortexLauncher PRIVATE
     # YouTube trailers for games Steam has none for (YouTubePlayer.qml).
     Qt6::WebEngineQuick
 )
+
+# The settings panel shows this as Qt.application.version (see main_ui.cpp).
+# Taken from project() so there is one number to bump in this file; the
+# installer reads the same value (scripts/package_release.ps1).
+target_compile_definitions(VortexLauncher PRIVATE VORTEX_VERSION="${PROJECT_VERSION}")
 
 if(MSVC)
     # /utf-8 makes MSVC read these sources as UTF-8 instead of the system code

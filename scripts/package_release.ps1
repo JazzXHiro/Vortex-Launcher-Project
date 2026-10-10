@@ -121,6 +121,19 @@ if ($missing.Count -gt 0) {
 }
 Write-Note 'Found the WebEngine and FFmpeg runtime for trailers'
 
+# The installer's version is project() in CMakeLists.txt, read from this build's
+# cache rather than the source: the cache holds the number the launcher was
+# compiled with, so the installer and the settings panel can never disagree.
+$CMakeCache = Join-Path $BuildDir 'CMakeCache.txt'
+$versionLine = if (Test-Path $CMakeCache) {
+    Select-String -Path $CMakeCache -Pattern '^CMAKE_PROJECT_VERSION:STATIC=(.+)$' | Select-Object -First 1
+}
+if (-not $versionLine) {
+    throw "No CMAKE_PROJECT_VERSION in $CMakeCache -- reconfigure the build so the installer has a version."
+}
+$AppVersion = $versionLine.Matches[0].Groups[1].Value.Trim()
+Write-Note "Version $AppVersion (from CMakeLists.txt)"
+
 
 # ---------------------------------------------------------------------------
 # 2. Copy the build output to a clean staging folder
@@ -529,13 +542,13 @@ if (-not $iscc) {
     Write-Warning 'Inno Setup 6 not found, so the installer was not compiled.'
     Write-Host    '  Install it from https://jrsoftware.org/isdl.php and re-run,'
     Write-Host    '  or compile manually:'
-    Write-Host    "      ISCC.exe /DPayloadDir=`"$StageDir`" `"$IssPath`""
+    Write-Host    "      ISCC.exe /DPayloadDir=`"$StageDir`" /DAppVersion=$AppVersion `"$IssPath`""
     Write-Host "`nThe payload itself is complete and verified at $StageDir" -ForegroundColor Green
     return
 }
 
 Write-Step 'Compiling the installer'
-& $iscc "/DPayloadDir=$StageDir" $IssPath
+& $iscc "/DPayloadDir=$StageDir" "/DAppVersion=$AppVersion" $IssPath
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
 $setup = Join-Path $OutDir 'VortexSetup.exe'

@@ -19,6 +19,9 @@ int main(int argc, char *argv[]) {
   // Chromium itself starts only when the first WebEngineView is created.
   QtWebEngineQuick::initialize();
   QGuiApplication app(argc, argv);
+  // VORTEX_VERSION comes from project() in CMakeLists.txt. QML reads it back as
+  // Qt.application.version (SettingsWindow.qml).
+  QCoreApplication::setApplicationVersion(QStringLiteral(VORTEX_VERSION));
 
   // In a build tree the exe sits at out/build/<config>/VortexLauncher.exe while
   // the data files (local_game_dirs.txt, preferences.json, Images/, …) sit at

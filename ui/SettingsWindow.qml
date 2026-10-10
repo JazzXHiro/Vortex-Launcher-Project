@@ -175,6 +175,13 @@ Popup {
                     }
                 }
             }
+
+            // Set from project() in CMakeLists.txt via main_ui.cpp.
+            Text {
+                anchors { left: parent.left; bottom: parent.bottom; margins: 25 }
+                text: "VORTEX v" + Qt.application.version
+                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+            }
         }
 
         Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; color: Theme.divider }
