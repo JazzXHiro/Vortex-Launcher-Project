@@ -857,7 +857,7 @@ static void writeInstalledGames(const fs::path &baseDir,
 
     out << "# Games installed as of the last successful scan.\n";
     out << "# Written by the launcher; read by analytics/sync_local_data.py.\n";
-    out << "# Format: NAME|SOURCE|IGDB_ID|PLAYTIME_SECONDS|LAST_PLAYED\n";
+    out << "# Format: NAME|SOURCE|IGDB_ID|PLAYTIME_SECONDS|LAST_PLAYED|INSTALL_DIR\n";
     for (const BridgeGame &game : games) {
         // Steam's own totals, carried across so the recommender can use
         // them.
@@ -890,9 +890,48 @@ static void writeInstalledGames(const fs::path &baseDir,
             lastPlayed = get_steam_last_played(game.appid);
         }
 
+        // INSTALL_DIR goes last, after every column the analytics side reads
+        // by position. It is what the next scan uses to tell that a game now
+        // resolves to a different IGDB id -- see readPreviousIgdbIds().
         out << game.name << "|" << game.source << "|" << game.igdb_id
-            << "|" << playtimeSeconds << "|" << lastPlayed << "\n";
+            << "|" << playtimeSeconds << "|" << lastPlayed
+            << "|" << game.installDir.string() << "\n";
     }
+}
+
+// Each install directory's IGDB id as of the last scan, keyed like the name
+// overrides. The directory is the one thing that stays put when the id
+// changes; the name usually changes with it. Read from the end of the line,
+// because a path never holds a pipe but a title might. Files written before
+// INSTALL_DIR existed yield nothing, so the first scan after an upgrade simply
+// detects no changes.
+static QHash<QString, long long> readPreviousIgdbIds(const fs::path &baseDir) {
+    QHash<QString, long long> ids;
+    std::ifstream file(baseDir / "installed_games.txt");
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+
+        std::vector<std::string> fields;
+        for (size_t start = 0;;) {
+            const size_t pipe = line.find('|', start);
+            fields.push_back(line.substr(start, pipe == std::string::npos
+                                                    ? std::string::npos
+                                                    : pipe - start));
+            if (pipe == std::string::npos) break;
+            start = pipe + 1;
+        }
+        // NAME|SOURCE|IGDB_ID|PLAYTIME_SECONDS|LAST_PLAYED|INSTALL_DIR
+        if (fields.size() < 6 || fields.back().empty()) continue;
+
+        const std::string &id = fields[fields.size() - 4];
+        if (id.empty() || id.size() > 18
+            || id.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        ids.insert(overrideKey(fs::path(fields.back())), std::stoll(id));
+    }
+    return ids;
 }
 
 static QVariantMap recommendationFromGameMap(QVariantMap game, double score, bool matched) {
@@ -2505,6 +2544,18 @@ void VortexBridge::syncPlayedLedger() {
     emit playedGamesChanged();
 }
 
+void VortexBridge::dropPlayedKey(const QString &key) {
+    bool changed = false;
+    for (int i = m_playedLedger.size() - 1; i >= 0; --i) {
+        if (m_playedLedger[i].toMap().value("key").toString() == key) {
+            m_playedLedger.removeAt(i);
+            changed = true;
+        }
+    }
+    if (changed)
+        savePlayedLedger();
+}
+
 // Everything ever played, live rows first so an installed game keeps its real
 // install path and a working Play button. Computed on demand for the same
 // reason favoriteGames() is: the alternative is a cached list that goes stale
@@ -4027,6 +4078,65 @@ void VortexBridge::loadGames() {
             reportScanProgress("Fetching details", i + 1, total);
         }
 
+        // --- Playtime keys that moved ---------------------------------------
+        // A game that resolves to a different IGDB id than last scan -- a bad
+        // igdb_cache.txt entry corrected, or IGDB itself re-matching the title
+        // -- has a new playtime key, and everything it played is still filed
+        // under the old one. renameGame() moves it for a rename; this is the
+        // same move for every other way the id can change.
+        //
+        // Before both imports below, which key off the new id: left until after,
+        // the Steam import would seed an empty new key with Steam's whole
+        // total, and the rekey would then add the old row's hours on top.
+        //
+        // Only when the old key was this game's alone. If another installed
+        // game still resolves to it, or two folders shared it last time, the
+        // hours there are not separable and moving them would take someone
+        // else's play.
+        {
+            const QHash<QString, long long> previous = readPreviousIgdbIds(baseDir);
+            QHash<long long, int> holders;
+            for (const long long id : previous)
+                ++holders[id];
+            QSet<QString> liveKeys;
+            for (const BridgeGame &bg : internalGames)
+                liveKeys.insert(QString::fromStdString(makePtKey(bg)));
+
+            QStringList movedFrom;
+            for (const BridgeGame &bg : internalGames) {
+                if (bg.igdb_id <= 0) continue;
+                const auto was = previous.constFind(overrideKey(bg.installDir));
+                if (was == previous.constEnd() || *was <= 0 || *was == bg.igdb_id)
+                    continue;
+
+                const std::string oldKey = "igdb_" + std::to_string(*was);
+                const std::string newKey = makePtKey(bg);
+                if (holders.value(*was) > 1
+                    || liveKeys.contains(QString::fromStdString(oldKey))) {
+                    vlog::line("Scan", bg.name + ": IGDB id " + std::to_string(*was) +
+                                       " -> " + std::to_string(bg.igdb_id) +
+                                       ", playtime left on " + oldKey +
+                                       " (shared with another game)");
+                    continue;
+                }
+
+                if (rekey_play_stats(oldKey, newKey, bg.name))
+                    vlog::line("Scan", bg.name + ": IGDB id " + std::to_string(*was) +
+                                       " -> " + std::to_string(bg.igdb_id) +
+                                       ", playtime moved " + oldKey + " -> " + newKey);
+                movedFrom << QString::fromStdString(oldKey);
+            }
+
+            // Queued ahead of the delivery below, whose syncPlayedLedger()
+            // then writes each game's row under its new key.
+            if (!movedFrom.isEmpty()) {
+                QMetaObject::invokeMethod(this, [this, movedFrom]() {
+                    for (const QString &key : movedFrom)
+                        dropPlayedKey(key);
+                }, Qt::QueuedConnection);
+            }
+        }
+
         // --- Steam baseline import ----------------------------------------
         // Take Steam's lifetime total for any game Vortex has not accounted for
         // yet, so a library that was played for years before the launcher
@@ -5030,16 +5140,8 @@ bool VortexBridge::renameGame(QString installDir, QString newName) {
 
                 const std::string newKey = makePtKey(live);
                 rekey_play_stats(oldKey, newKey, live.name);
-                if (newKey != oldKey) {
-                    // The hours moved to the new key; a ledger row left on the
-                    // old one would show up as a second, uninstalled game.
-                    const QString stale = QString::fromStdString(oldKey);
-                    for (int i = m_playedLedger.size() - 1; i >= 0; --i) {
-                        if (m_playedLedger[i].toMap().value("key").toString() == stale)
-                            m_playedLedger.removeAt(i);
-                    }
-                    savePlayedLedger();
-                }
+                if (newKey != oldKey)
+                    dropPlayedKey(QString::fromStdString(oldKey));
 
                 if (at < m_gameList.size())
                     m_gameList[at] = buildGameMap(live);

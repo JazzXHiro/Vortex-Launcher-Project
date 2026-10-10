@@ -547,10 +547,9 @@ static string search_friendly(const string &name) {
 //   2. First standalone game
 //   3. First result as fallback
 //
-// Step 2 matters because the substring pass returns results in no fixed order,
-// and a game whose IGDB title does not equal its folder name ("NTE: Neverness
-// to Everness" for a "Neverness To Everness" folder) would otherwise resolve to
-// whichever of its updates or DLCs happened to come back first.
+// Step 2 keeps an update or DLC from winning when it comes back ahead of its
+// base game. The substring pass, whose rows are unordered, uses the stricter
+// extract_substring_info() instead.
 static IgdbGameInfo extract_best_info(const string &json, const string &query) {
   const string queryCanon = make_canonical(query);
   IgdbGameInfo first;
@@ -569,6 +568,57 @@ static IgdbGameInfo extract_best_info(const string &json, const string &query) {
       return info; // canonical match — wins immediately
   }
   return firstStandalone.name.empty() ? first : firstStandalone;
+}
+
+// Row cap for the substring pass. Shared with extract_substring_info() so it
+// can tell when IGDB had more matches than it sent back.
+static const int SUBSTRING_LIMIT = 50;
+
+// Pick from a substring-pass response.
+//
+// Every row contains the query, so the one with the fewest extra characters is
+// the closest: "NTE: Neverness to Everness" beats its "- Founder's Pack" DLC
+// even when the DLC came back first. extract_best_info()'s "first standalone"
+// rule has no such ordering, and the substring pass returns rows unsorted.
+//
+// `complete` is false when the response hit SUBSTRING_LIMIT without a canonical
+// match. The rows are then an arbitrary sample of a larger set -- the real game
+// may simply not be in it, as with "Control" -- so the pick is only a guess and
+// the caller should prefer a relevance-ranked search over it.
+static IgdbGameInfo extract_substring_info(const string &json,
+                                           const string &query,
+                                           bool &complete) {
+  const string queryCanon = make_canonical(query);
+  IgdbGameInfo closest;
+  size_t closestLen = string::npos;
+  bool closestStandalone = false;
+  int rows = 0;
+  size_t cursor = 0;
+
+  while (cursor != string::npos) {
+    IgdbGameInfo info = extract_info_at(json, cursor);
+    if (info.name.empty())
+      break;
+    ++rows;
+    const string canon = make_canonical(info.name);
+    if (canon == queryCanon) {
+      complete = true;
+      return info; // canonical match — wins immediately
+    }
+    // A standalone game always beats an update or DLC; within each group the
+    // shorter canonical name is closer to the query.
+    const bool better =
+        closest.name.empty() ||
+        (info.standalone && !closestStandalone) ||
+        (info.standalone == closestStandalone && canon.size() < closestLen);
+    if (better) {
+      closest = info;
+      closestLen = canon.size();
+      closestStandalone = info.standalone;
+    }
+  }
+  complete = rows < SUBSTRING_LIMIT;
+  return closest;
 }
 
 // ---------- Cache -------------------------------------------
@@ -868,23 +918,53 @@ IgdbGameInfo igdb_resolve_game(const std::string &folderName,
     }
   }
 
-  // First pass: Case-insensitive substring match.
-  // This bypasses IGDB's popularity bias which buries exact generic matches (like "The Finals") under blockbusters (like "Final Fantasy").
+  // First pass: case-insensitive exact name match.
+  //
+  // The substring pass below cannot be trusted for short, common titles: it
+  // returns at most 50 rows in no fixed order, so for "Control" the real game
+  // was not among them and the fallback picked "Planetary Pest Control".
+  // Asking for the exact name first settles those before a substring can.
   if (resolved.name.empty()) {
-    const string name_body =
-        "where name ~ *\"" + safe + "\"*; " + IGDB_FIELDS + " limit 50;";
+    const string exact_body =
+        "where name ~ \"" + safe + "\"; " + IGDB_FIELDS + " limit 10;";
+    try {
+      const string exact_resp =
+          https_post(L"api.igdb.com", L"/v4/games", headers, exact_body);
+      apiAnswered = true;
+      resolved = extract_best_info(exact_resp, folderName);
+    } catch (const std::exception &e) {
+      vlog::item("IGDB", folderName, vlog::Status::Fail,
+                 std::string("exact name lookup failed: ") + e.what());
+    }
+  }
+
+  // Second pass: Case-insensitive substring match.
+  // This bypasses IGDB's popularity bias which buries exact generic matches (like "The Finals") under blockbusters (like "Final Fantasy").
+  //
+  // A pick from a truncated response is held back rather than accepted: it was
+  // chosen from an arbitrary sample, so the fuzzy pass gets the first say and
+  // the guess is only used if that finds nothing.
+  IgdbGameInfo substringGuess;
+  if (resolved.name.empty()) {
+    const string name_body = "where name ~ *\"" + safe + "\"*; " + IGDB_FIELDS +
+                             " limit " + std::to_string(SUBSTRING_LIMIT) + ";";
     try {
       const string name_resp =
           https_post(L"api.igdb.com", L"/v4/games", headers, name_body);
       apiAnswered = true;
-      resolved = extract_best_info(name_resp, folderName);
+      bool complete = false;
+      IgdbGameInfo pick = extract_substring_info(name_resp, folderName, complete);
+      if (complete)
+        resolved = pick;
+      else
+        substringGuess = pick;
     } catch (const std::exception &e) {
       vlog::item("IGDB", folderName, vlog::Status::Fail,
                  std::string("name search failed: ") + e.what());
     }
   }
 
-  // Second pass: IGDB's fuzzy `search` over the name reduced to bare words.
+  // Third pass: IGDB's fuzzy `search` over the name reduced to bare words.
   // search_friendly() returns empty for a fully non-Latin title, and its
   // comment is explicit that callers must skip the attempt in that case --
   // searching for "" matches the whole catalogue.
@@ -901,6 +981,10 @@ IgdbGameInfo igdb_resolve_game(const std::string &folderName,
       } catch (...) {}
     }
   }
+
+  // Last resort: the substring pass's guess from a truncated response.
+  if (resolved.name.empty() && !substringGuess.name.empty())
+    resolved = substringGuess;
 
   if (resolved.name.empty()) {
     if (interactive) {

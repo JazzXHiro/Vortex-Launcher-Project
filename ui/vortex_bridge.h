@@ -600,6 +600,12 @@ private:
     // is what keeps it afterwards.
     void        syncPlayedLedger();
 
+    // Removes the rows filed under a playtime key whose hours rekey_play_stats()
+    // has moved elsewhere. Left behind, each would show up as a second,
+    // uninstalled copy of the game; the next syncPlayedLedger() writes the row
+    // under the new key.
+    void        dropPlayedKey(const QString &key);
+
     // General app settings, so later toggles have somewhere to live rather
     // than each growing its own file.
     void        loadSettings();

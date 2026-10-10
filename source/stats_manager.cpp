@@ -385,59 +385,100 @@ recorded_sessions(const std::string& game_key) {
     return sessions;
 }
 
+// Re-files every line of a key-prefixed file from old_prefix to new_prefix, or
+// with `drop` removes those lines instead. Through a temporary, so a failed
+// write cannot truncate the only history there is, and only when some line
+// actually matches -- a key with nothing filed under it costs a read, not a
+// rewrite. Returns true when the file changed.
+static bool rekey_lines(const fs::path& path, const std::string& old_prefix,
+                        const std::string& new_prefix, bool drop = false) {
+    std::ifstream in(path);
+    if (!in.is_open()) return false;
+
+    std::vector<std::string> lines;
+    bool matched = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.compare(0, old_prefix.size(), old_prefix) == 0) {
+            matched = true;
+            if (drop) continue;
+            line = new_prefix + line.substr(old_prefix.size());
+        }
+        lines.push_back(std::move(line));
+    }
+    in.close();
+    if (!matched) return false;
+
+    const fs::path temp_path = path.string() + ".tmp";
+    {
+        std::ofstream out(temp_path, std::ios::trunc);
+        if (!out.is_open()) return false;
+        for (const std::string& kept : lines)
+            out << kept << "\n";
+        if (!out) {
+            out.close();
+            std::error_code ec;
+            fs::remove(temp_path, ec);
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    fs::rename(temp_path, path, ec);
+    if (ec) {
+        fs::remove(temp_path, ec);
+        return false;
+    }
+    return true;
+}
+
 bool rekey_play_stats(const std::string& old_key, const std::string& new_key,
                       const std::string& new_name) {
     if (old_key.empty() || new_key.empty()) return false;
 
     auto stats = load_stats();
     auto it = stats.find(old_key);
-    if (it == stats.end()) return false;
 
     if (old_key == new_key) {
-        if (new_name.empty() || it->second.name == new_name) return false;
+        if (it == stats.end() || new_name.empty() || it->second.name == new_name)
+            return false;
         it->second.name = new_name;
         save_stats(stats);
         return true;
     }
 
+    bool changed = false;
+
     // Added rather than overwritten: a row already under the new key is play
     // that happened too, and dropping either side would lose hours.
-    const StatEntry moved = it->second;
-    stats.erase(it);
-    StatEntry &dest = stats[new_key];
-    dest.time     += moved.time;
-    dest.idle     += moved.idle;
-    dest.baseline += moved.baseline;
-    dest.name      = new_name.empty() ? moved.name : new_name;
-    save_stats(stats);
+    if (it != stats.end()) {
+        const StatEntry moved = it->second;
+        stats.erase(it);
+        StatEntry &dest = stats[new_key];
+        dest.time     += moved.time;
+        dest.idle     += moved.idle;
+        dest.baseline += moved.baseline;
+        dest.name      = new_name.empty() ? moved.name : new_name;
+        save_stats(stats);
+        changed = true;
+    }
 
     // The sessions log is keyed the same way, and getLastPlayedDate() and
     // sync_local_data.py both read it by key -- leaving it behind would show
-    // the hours with "Never" beside them. Through a temporary, so a failed
-    // write cannot truncate the only history there is.
-    const fs::path sessions_path = get_sessions_file_path();
-    std::ifstream in(sessions_path);
-    if (!in.is_open()) return true;
+    // the hours with "Never" beside them.
+    if (rekey_lines(get_sessions_file_path(), old_key + " |", new_key + " |"))
+        changed = true;
 
-    const fs::path temp_path = sessions_path.string() + ".tmp";
-    {
-        std::ofstream out(temp_path, std::ios::trunc);
-        if (!out.is_open()) return true;
+    // So is the launcher import marker. Left on the old key, the next scan
+    // finds the new key unmarked and imports the launcher's history again --
+    // the overlap check keeps the logged sessions from doubling, but nothing
+    // stops the unlogged remainder going in twice. A new key that is already
+    // marked keeps its own line and the old one goes.
+    if (rekey_lines(get_launcher_imports_path(), old_key + "|", new_key + "|",
+                    launcher_history_imported(new_key)))
+        changed = true;
 
-        const std::string prefix = old_key + " |";
-        std::string line;
-        while (std::getline(in, line)) {
-            if (line.compare(0, prefix.size(), prefix) == 0)
-                line = new_key + line.substr(old_key.size());
-            out << line << "\n";
-        }
-    }
-    in.close();
-
-    std::error_code ec;
-    fs::rename(temp_path, sessions_path, ec);
-    if (ec) fs::remove(temp_path, ec);
-    return true;
+    return changed;
 }
 
 // Scans settings.json for one boolean. A full JSON parser would be the third in

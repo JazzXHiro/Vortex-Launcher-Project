@@ -75,13 +75,14 @@ void mark_launcher_history_imported(const std::string& game_key,
 std::vector<std::pair<std::time_t, std::time_t>>
 recorded_sessions(const std::string& game_key);
 
-// Moves a game's playtime from old_key to new_key, in both the stats file and
-// the sessions log, and stamps new_name on the row.
+// Moves a game's playtime from old_key to new_key -- the stats file, the
+// sessions log and the launcher import marker -- and stamps new_name on the row.
 //
-// For a rename: the new title can resolve to a different IGDB id, which changes
-// the key, and without this the hours stay filed under a key nothing reads any
-// more. A row already under new_key is added to, not replaced. With equal keys
-// only the name is updated. Returns true when anything was written.
+// For a rename, or a scan that resolves the game to a different IGDB id than
+// last time: either changes the key, and without this the hours stay filed
+// under a key nothing reads any more. A row already under new_key is added to,
+// not replaced. With equal keys only the name is updated. Returns true when
+// anything was written. The UI's played_games.json is the caller's to update.
 bool rekey_play_stats(const std::string& old_key, const std::string& new_key,
                       const std::string& new_name);
 
