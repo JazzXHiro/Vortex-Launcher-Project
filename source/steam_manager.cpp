@@ -1,6 +1,7 @@
 #include "steam_manager.h"
 
 #include "idle_tracker.h"
+#include "vortex_log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -437,6 +438,7 @@ bool monitor_steam_session(int appid, const fs::path &installDir,
 
     const std::time_t end = std::time(nullptr);
     const long long idleSeconds = idle.stop();
+    vlog::line("Play", idle.summary());
 
     if (outStart) *outStart = start;
     if (outEnd)   *outEnd   = end;

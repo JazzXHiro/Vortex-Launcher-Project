@@ -883,6 +883,7 @@ LocalSession run_local_session(const fs::path &gamePath,
   // sitting alone, which is exactly the time this exists not to count.
   const auto closeSegment = [&](std::time_t now, bool keep) {
     const long long idleSeconds = idle ? idle->stop() : 0;
+    const std::string idleNote = idle ? idle->summary() : std::string();
     idle.reset();
     inGame = false;
     if (!keep)
@@ -893,6 +894,8 @@ LocalSession run_local_session(const fs::path &gamePath,
     if (idleSeconds > 0)
       detail += " (" + vlog::duration(idleSeconds) + " idle)";
     vlog::line("Play", detail);
+    if (!idleNote.empty())
+      vlog::line("Play", idleNote);
   };
 
   // Games a launcher runs from somewhere else -- Prism starts Minecraft as a
@@ -1257,6 +1260,7 @@ LocalSession watch_store_session(const fs::path &installDir,
       }
     } else if (inGame) {
       const long long idleSeconds = idle->stop();
+      const std::string idleNote = idle->summary();
       idle.reset();
       inGame = false;
       session.segments.push_back({segStart, now, idleSeconds, segExe});
@@ -1265,6 +1269,7 @@ LocalSession watch_store_session(const fs::path &installDir,
       if (idleSeconds > 0)
         detail += " (" + vlog::duration(idleSeconds) + " idle)";
       vlog::line("Play", detail);
+      vlog::line("Play", idleNote);
     }
 
     if (!inGame) {

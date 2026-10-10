@@ -9,6 +9,21 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+# 0. Debug builds run on the release Qt libraries.
+# Qt's debug WebEngine is all of Chromium unoptimised (an 822 MB DLL), and a
+# YouTube trailer in it freezes for a third of a second every few seconds.
+# WebEngine cannot be swapped on its own -- it has to sit on the Qt it was
+# built against -- so a Debug build links every Qt library in its release
+# form, and the release C++ runtime with it, since two runtimes in one process
+# do not mix. Vortex's own code stays unoptimised with full debug info; what
+# goes is stepping into Qt and Qt's internal asserts. Turn this off to go back
+# to debug Qt.
+option(VORTEX_DEBUG_WITH_RELEASE_QT "Link Debug builds against the release Qt libraries" ON)
+if(MSVC AND VORTEX_DEBUG_WITH_RELEASE_QT)
+    # Read when the imported Qt targets are created, so before find_package.
+    set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
+endif()
+
 # 1. Find the Qt6 packages used by the C++ entry point and QML files.
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 QuickLayouts QuickDialogs2 QuickEffects QuickShapes Multimedia WebEngineQuick)
 
@@ -161,6 +176,11 @@ if(MSVC)
     # and silences C4819 on the box-drawing characters in the comment banners.
     target_compile_options(VortexLauncher PRIVATE /EHsc /utf-8)
     target_compile_options(VortexCLI PRIVATE /EHsc /utf-8)
+
+    # The release runtime to match release Qt (see VORTEX_DEBUG_WITH_RELEASE_QT).
+    if(VORTEX_DEBUG_WITH_RELEASE_QT)
+        set_property(TARGET VortexLauncher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+    endif()
 endif()
 
 # The launcher runs the analytics scripts from "analytics/" next to the executable
@@ -203,11 +223,18 @@ if(WIN32)
     )
 
     if(VORTEX_DEPLOY_QT AND WINDEPLOYQT_EXECUTABLE)
-        # Without this the exe cannot start: a Debug build links the "d"-suffixed
-        # Qt DLLs (Qt6Cored.dll and friends) which do not exist beside the binary.
+        # Without this the exe cannot start: the Qt DLLs it links do not exist
+        # beside the binary. A Debug build takes the release ones unless
+        # VORTEX_DEBUG_WITH_RELEASE_QT is off, when it links the "d"-suffixed
+        # Qt6Cored.dll and friends.
+        if(VORTEX_DEBUG_WITH_RELEASE_QT)
+            set(VORTEX_DEPLOY_CONFIG --release)
+        else()
+            set(VORTEX_DEPLOY_CONFIG "$<IF:$<CONFIG:Debug>,--debug,--release>")
+        endif()
         add_custom_command(TARGET VortexLauncher POST_BUILD
             COMMAND "${WINDEPLOYQT_EXECUTABLE}"
-                "$<IF:$<CONFIG:Debug>,--debug,--release>"
+                "${VORTEX_DEPLOY_CONFIG}"
                 --qmldir "${CMAKE_CURRENT_SOURCE_DIR}/ui"
                 --no-translations
                 # Copies msvcp140.dll / vcruntime140*.dll beside the binary so a

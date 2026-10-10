@@ -1,6 +1,7 @@
 // Input sampling behind IdleTracker. See idle_tracker.h for why this exists.
 
 #include "idle_tracker.h"
+#include "vortex_log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,11 +44,21 @@ public:
         }
     }
 
-    // True when any pad reported new input since the last call.
+    // True when any pad shows someone using it since the last call.
     //
     // This is the whole reason the class exists: XInput activity does not
     // update GetLastInputInfo, so without it a session played entirely on a
     // controller reads as one long idle stretch.
+    //
+    // A changed packet number is NOT that signal. It moves on any change at
+    // all, so a stick drifting a few units at rest, or a virtual pad
+    // (ViGEm, DS4Windows, a Moonlight stream) re-sending near-identical
+    // reports, ticked it on every sample and held idle at zero for whole
+    // sessions. Input is a button pressed or released, a trigger pulled, or a
+    // stick out past its deadzone -- the deadzones XInput itself recommends,
+    // which are what a real hand clears and drift does not. Holding a stick
+    // steadily out, auto-running, still counts: that is a stick off centre,
+    // not a small change.
     bool sawInput() {
         if (!m_getState) return false;
 
@@ -62,20 +73,55 @@ public:
                 m_known[slot] = false;
                 continue;
             }
-            if (m_known[slot] && state.dwPacketNumber != m_packet[slot])
-                moved = true;
-            m_packet[slot] = state.dwPacketNumber;
-            m_known[slot]  = true;
+            ++connected[slot];
+
+            const XINPUT_GAMEPAD &pad = state.Gamepad;
+            // The first sample after a pad appears is its baseline: a button
+            // already down is not new input, and there is nothing to compare.
+            if (m_known[slot]) {
+                if (state.dwPacketNumber != m_packet[slot])
+                    ++changed[slot];
+                const bool used =
+                    pad.wButtons != m_buttons[slot] || pad.wButtons != 0 ||
+                    pad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
+                    pad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
+                    outside(pad.sThumbLX, pad.sThumbLY,
+                            XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) ||
+                    outside(pad.sThumbRX, pad.sThumbRY,
+                            XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+                if (used) {
+                    ++counted[slot];
+                    moved = true;
+                }
+            }
+            m_packet[slot]  = state.dwPacketNumber;
+            m_buttons[slot] = pad.wButtons;
+            m_known[slot]   = true;
         }
         return moved;
     }
 
+    // Per slot, for IdleTracker::summary(): samples the pad was connected
+    // for, samples its packet number moved on, samples that were real input.
+    long long connected[XUSER_MAX_COUNT] = {};
+    long long changed[XUSER_MAX_COUNT]   = {};
+    long long counted[XUSER_MAX_COUNT]   = {};
+
 private:
     using XInputGetStateFn = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
 
+    // Measured as a radius, so a diagonal is held to the same distance as a
+    // straight push.
+    static bool outside(SHORT x, SHORT y, int deadzone) {
+        const long long dx = x, dy = y;
+        return dx * dx + dy * dy >
+               static_cast<long long>(deadzone) * deadzone;
+    }
+
     XInputGetStateFn m_getState = nullptr;
-    DWORD            m_packet[XUSER_MAX_COUNT] = {};
-    bool             m_known[XUSER_MAX_COUNT]  = {};
+    DWORD            m_packet[XUSER_MAX_COUNT]  = {};
+    WORD             m_buttons[XUSER_MAX_COUNT] = {};
+    bool             m_known[XUSER_MAX_COUNT]   = {};
 };
 
 unsigned long system_idle_ms() {
@@ -93,6 +139,37 @@ unsigned long system_idle_ms() {
 #endif  // _WIN32
 
 }  // namespace
+
+std::string IdleTracker::summary() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_samples == 0)
+        return "idle check: no samples taken";
+
+    std::string out = "idle check: longest without keyboard/mouse " +
+                      vlog::duration(static_cast<long long>(m_maxSystemIdleMs / 1000UL));
+
+    std::string pads;
+    for (int slot = 0; slot < kPadSlots; ++slot) {
+        const long long seen = m_padConnected[slot];
+        if (seen == 0) continue;
+        const auto pct = [seen](long long n) {
+            return std::to_string(n * 100 / seen) + "%";
+        };
+        if (!pads.empty()) pads += ", ";
+        pads += "pad " + std::to_string(slot + 1) + " reported changes on " +
+                pct(m_padChanged[slot]) + " of samples, real input on " +
+                pct(m_padCounted[slot]);
+    }
+    if (pads.empty()) {
+        out += "; no controller connected";
+    } else {
+        out += ", without controller input " +
+               vlog::duration(static_cast<long long>(m_maxPadQuietMs / 1000UL)) +
+               " (" + pads + ")";
+    }
+    out += "; idle counts after " + vlog::duration(idle_threshold_seconds());
+    return out;
+}
 
 long long idle_threshold_seconds() {
     return static_cast<long long>(kIdleThresholdMs / 1000UL);
@@ -155,14 +232,20 @@ void IdleTracker::run() {
     // hand back GetLastInputInfo's figure, which counts from the last keyboard
     // or mouse touch -- for a controller player, possibly the whole session --
     // and the following pad press would then charge all of it as idle.
-    const auto take = [&pads, &lastPadInput]() -> unsigned long {
+    const auto take = [this, &pads, &lastPadInput]() -> unsigned long {
         const auto now = std::chrono::steady_clock::now();
         if (pads.sawInput()) lastPadInput = now;
-        const auto sincePadMs =
+        const unsigned long sincePadMs = static_cast<unsigned long>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - lastPadInput).count();
-        return std::min(system_idle_ms(),
-                        static_cast<unsigned long>(sincePadMs));
+                now - lastPadInput).count());
+        const unsigned long systemMs = system_idle_ms();
+        {
+            std::lock_guard<std::mutex> guard(m_mutex);
+            ++m_samples;
+            m_maxSystemIdleMs = std::max(m_maxSystemIdleMs, systemMs);
+            m_maxPadQuietMs   = std::max(m_maxPadQuietMs, sincePadMs);
+        }
+        return std::min(systemMs, sincePadMs);
     };
 
     for (;;) {
@@ -189,6 +272,12 @@ void IdleTracker::run() {
     accumulate(finalIdleMs);
     if (m_prevIdleMs >= kIdleThresholdMs)
         m_idleSeconds += static_cast<long long>(m_prevIdleMs / 1000UL);
+
+    for (int slot = 0; slot < kPadSlots; ++slot) {
+        m_padConnected[slot] = pads.connected[slot];
+        m_padChanged[slot]   = pads.changed[slot];
+        m_padCounted[slot]   = pads.counted[slot];
+    }
 #else
     // No input source to sample off Windows; the session simply reports no idle
     // rather than guessing at one.

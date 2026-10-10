@@ -17,6 +17,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
 
 class IdleTracker {
@@ -36,16 +37,36 @@ public:
     // Safe to call when start() never ran, or twice; returns the same figure.
     long long stop();
 
+    // One line saying why the session came out with the idle it did, for the
+    // log, read after stop(): the longest stretch without keyboard or mouse,
+    // the longest without controller input, and per connected pad how often it
+    // reported a change against how often that change was real input.
+    //
+    // Idle is the shorter of those two stretches, so a figure of 0 over a long
+    // session has exactly two explanations, and this tells them apart. Without
+    // it, an 11-hour session with no idle left nothing to go on.
+    std::string summary() const;
+
+    static constexpr int kPadSlots = 4;
+
 private:
     void run();
     void accumulate(unsigned long idleMs);
 
     std::thread             m_thread;
-    std::mutex              m_mutex;
+    mutable std::mutex      m_mutex;
     std::condition_variable m_wake;
     bool                    m_stopping    = false;
     long long               m_idleSeconds = 0;
     unsigned long           m_prevIdleMs  = 0;
+
+    // Diagnostics only; nothing here feeds the idle figure.
+    long long     m_samples          = 0;
+    unsigned long m_maxSystemIdleMs  = 0;
+    unsigned long m_maxPadQuietMs    = 0;
+    long long     m_padConnected[kPadSlots] = {};
+    long long     m_padChanged[kPadSlots]   = {};
+    long long     m_padCounted[kPadSlots]   = {};
 };
 
 // How long the player must go without touching anything before that stretch
