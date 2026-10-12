@@ -44,6 +44,7 @@ set(VORTEX_ENGINE_SOURCES
     source/riot_manager.cpp
     source/secrets.cpp
     source/stats_manager.cpp
+    source/steam_client_internal.cpp
     source/steam_manager.cpp
     source/steamgriddb_manager.cpp
     source/vortex_log.cpp
@@ -130,6 +131,11 @@ qt_add_qml_module(VortexLauncher
         ui/RoundedCorners.qml
         ui/TrailerPlayer.qml
         ui/YouTubePlayer.qml
+        ui/SteamLogin.qml
+        ui/ImpactStage.qml
+        ui/LightSweep.qml
+        ui/InstallSweep.qml
+        ui/InstallPicker.qml
     RESOURCES
         ui/assets/steam.png
         ui/assets/local.png

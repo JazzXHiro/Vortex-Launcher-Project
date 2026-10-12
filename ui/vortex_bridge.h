@@ -89,6 +89,23 @@ class VortexBridge : public QObject {
     // starts.
     Q_PROPERTY(bool         trailersStartMuted READ trailersStartMuted NOTIFY trailersStartMutedChanged)
 
+    // ---- Owned Steam games that are not installed ------------------------
+    // The Library's NOT INSTALLED toggle. Steam keeps no complete list of what
+    // an account owns on disk, so these come from the Web API, authorised by
+    // the token of a Steam session signed in through SteamLogin.qml.
+    //
+    // ownedSteamGames holds only what is NOT installed, in the same row shape
+    // as gameList plus notInstalled=true, so the grid can append it as is.
+    Q_PROPERTY(bool         showUninstalled READ showUninstalled NOTIFY showUninstalledChanged)
+    Q_PROPERTY(QVariantList ownedSteamGames READ ownedSteamGames NOTIFY ownedSteamGamesChanged)
+    // Whether a Steam session is believed to be signed in. Persisted, so the
+    // launcher knows to ask the session for a token at startup; cleared when
+    // the session turns out to have expired.
+    Q_PROPERTY(bool         steamSignedIn    READ steamSignedIn    NOTIFY steamAccountChanged)
+    // One line for the Library to show above the grid: why the list is empty
+    // or stale. Empty when there is nothing to say.
+    Q_PROPERTY(QString      steamOwnedStatus READ steamOwnedStatus NOTIFY steamAccountChanged)
+
     // ---- Scan progress ---------------------------------------------------
     // The library scan used to hide behind a full-screen modal overlay with an
     // indeterminate spinner, so a cold-cache machine looked hung for as long as
@@ -155,10 +172,22 @@ class VortexBridge : public QObject {
     Q_PROPERTY(QStringList launchingGames READ launchingGames NOTIFY launchStateChanged)
     Q_PROPERTY(QStringList runningGames   READ runningGames   NOTIFY launchStateChanged)
 
+    // Steam installs under way, keyed by appid as a string (QML map keys are
+    // strings): { state, percent, done, total, bytesPerSecond, secondsLeft }.
+    // state is "starting", "paused", "downloading" or "done". Drives the sweep
+    // over a card; an appid that is not in here is not installing.
+    Q_PROPERTY(QVariantMap steamInstalls READ steamInstalls NOTIFY steamInstallsChanged)
+
+    // Windows' "Animation effects" (Settings > Accessibility > Visual effects)
+    // is off. Read once at startup; decorative motion, such as the install
+    // sweep, stays still while it is set.
+    Q_PROPERTY(bool reduceMotion READ reduceMotion CONSTANT)
+
 public:
     explicit VortexBridge(QObject *parent = nullptr);
 
     QVariantList gameList()    const { return m_gameList;    }
+    QVariantMap  steamInstalls() const { return m_steamInstalls; }
     QStringList  launchingGames() const { return m_launchingGames; }
     QStringList  runningGames()   const { return m_runningGames;   }
     QVariantList recommendationList() const { return m_recommendationList; }
@@ -176,6 +205,11 @@ public:
     bool         ignoreLikedGames() const { return m_ignoreLikedGames; }
     bool         useSteamPlaytime() const { return m_useSteamPlaytime; }
     bool         trailersStartMuted() const { return m_trailersStartMuted; }
+    bool         showUninstalled() const { return m_showUninstalled; }
+    QVariantList ownedSteamGames() const { return m_ownedSteamGames; }
+    bool         reduceMotion() const;
+    bool         steamSignedIn()   const { return m_steamSignedIn; }
+    QString      steamOwnedStatus() const;
     QString      recommendationStatus() const { return m_recommendationStatus; }
 
     bool         scanActive() const { return m_scanActive; }
@@ -213,6 +247,15 @@ public:
     // game whose folder disagrees with its IGDB title showed NO ART forever.
     // installDir is fixed at scan time and survives the rename.
     Q_INVOKABLE QVariantMap gameDetailsForInstallDir(QString installDir) const;
+
+    // The cover an owned, not-installed Steam card should show now, or "" for
+    // the row's own. Reference artRevision in the same binding: a replacement
+    // lands after the list was published, and is not republished with it.
+    Q_INVOKABLE QString ownedSteamCover(int appId) const;
+    // The card's cover failed to load. Steps it down the chain -- Steam's
+    // library_600x900.jpg, SteamGridDB's grid for the appid, Steam's
+    // header.jpg -- one link per call.
+    Q_INVOKABLE void ownedSteamCoverFailed(int appId, QString url);
 
     // The Image.sourceSize that decodes `source` no larger than a width x height
     // box (logical pixels, at dpr) needs: covering the box when `crop`, fitting
@@ -259,6 +302,45 @@ public:
 
     // Persists the "start trailers muted" toggle. Display only.
     Q_INVOKABLE void   setTrailersStartMuted(bool enabled);
+
+    // Persists the Library's NOT INSTALLED toggle. Turning it on asks for a
+    // fresh owned-games list when signed in to Steam.
+    Q_INVOKABLE void   setShowUninstalled(bool enabled);
+
+    // Hands over the Web API token SteamLogin.qml read from the signed-in
+    // store session, and fetches the owned list with it in the background.
+    // Empty means the session has none -- signed out, or expired. The token is
+    // held in memory for this one fetch and never written anywhere.
+    Q_INVOKABLE void   setSteamWebToken(QString token);
+
+    // Forgets the Steam session: clears the cookies of `profile` (the
+    // WebEngineProfile SteamLogin.qml signs in with), the signed-in flag and
+    // the cached owned list.
+    Q_INVOKABLE void   signOutSteam(QObject *profile);
+
+    // Opens Steam's install dialog for an owned game, then follows the
+    // download once the player confirms there, and rescans when it is done.
+    Q_INVOKABLE void   installSteamGame(int appid);
+
+    // The launcher's own drive picker. Asks for Steam's libraries off the UI
+    // thread -- reaching the client can take a moment -- and answers through
+    // steamLibrariesReady(). clientRoute says whether an install will go
+    // straight in without Steam's dialog.
+    Q_INVOKABLE void   requestSteamLibraries();
+
+    // Installs into the library Steam numbers `folderIndex`, through the
+    // running client with no Steam window, and follows the download.
+    Q_INVOKABLE void   installSteamGameTo(int appid, int folderIndex);
+
+    // Stops a download that has not finished and deletes its files, with no
+    // Steam window. The card's overlay goes at once; the rest runs off the UI
+    // thread and is logged under [SteamInstall].
+    Q_INVOKABLE void   cancelSteamInstall(int appid);
+
+    // Pauses a download, keeping what it has fetched, or resumes it from
+    // there. The card's button flips at once; Steam is told off the UI thread.
+    Q_INVOKABLE void   pauseSteamInstall(int appid);
+    Q_INVOKABLE void   resumeSteamInstall(int appid);
 
     // Where to play a Steam trailer from to land at positionMs -- {url,
     // offsetMs, durationMs} -- since the player cannot seek one in place (see
@@ -311,6 +393,14 @@ public:
     // searched by from then on. An empty name puts the scanned one back.
     // Refused (false) while a scan is running.
     Q_INVOKABLE bool   renameGame(QString installDir, QString newName);
+
+    // Sets an owned game's playtime by hand, for play Vortex never saw. Only
+    // the imported baseline moves, so the result can never fall below the time
+    // Vortex recorded -- read the row back to see whether it clamped. Re-syncs
+    // the analytics database and re-ranks recommendations in the background.
+    // Refused (false) while a scan or rename is running, while the game is
+    // running, and for a Steam game showing Steam's own figure.
+    Q_INVOKABLE bool   setPlaytime(QString installDir, int hours, int minutes);
 
     // Puts one back. Needs a full rescan: the game is gone from
     // m_internalGames, and only the scan can rebuild it from the disk.
@@ -427,6 +517,11 @@ signals:
     void ignoreLikedGamesChanged();
     void useSteamPlaytimeChanged();
     void trailersStartMutedChanged();
+    void showUninstalledChanged();
+    void ownedSteamGamesChanged();
+    void steamAccountChanged();
+    // Asks SteamLogin.qml for a token; it answers through setSteamWebToken().
+    void steamTokenWanted();
     void recommendationStatusChanged();
     void localDirectoriesChanged();
     void directoryRemoved(QString folder, int gamesRemoved, int artworkDeleted);
@@ -452,6 +547,11 @@ signals:
     void browseReviewsChanged();
     void browseTrailersChanged();
     void browseNewReleasesChanged();
+    void steamInstallsChanged();
+    // rows: { folderIndex, path, drive, label, freeBytes, totalBytes, isDefault }
+    void steamLibrariesReady(QVariantList libraries, bool clientRoute);
+    // An install could not be started at all; `message` is for the player.
+    void steamInstallFailed(int appid, QString message);
 
 private:
     QVariantList            m_gameList;
@@ -517,6 +617,40 @@ private:
     // watchSteamUninstall(). Stops a second press from starting a second poll.
     QSet<int>               m_pendingSteamUninstalls;
     void watchSteamUninstall(int appid);
+    // Installs being followed, by appid. Polled once a second off the UI
+    // thread while any is active; m_steamInstalls is what QML sees.
+    struct InstallWatch {
+        QString       name;
+        QString       route;            // "client" or "dialog"
+        QElapsedTimer clock;            // since the request
+        bool          seenActive = false;   // Steam has picked it up
+        bool          bytesLogged = false;
+        int           lastDecile = -1;
+        int           percent = 0;      // never goes down
+        QString       phase;            // last logged phase
+        // (ms since the request, bytes downloaded) over the last few seconds,
+        // for the network rate: Steam reports only a disk-write rate.
+        QList<QPair<qint64, qulonglong>> downloadSamples;
+        // The player's last pause/resume, held against the poll for a few
+        // seconds while Steam catches up; see pauseSteamInstall().
+        bool          pendingPaused = false;
+        QElapsedTimer pendingSince;     // invalid when nothing is pending
+    };
+    QHash<int, InstallWatch> m_installWatches;
+    // Cancels still clearing files; installs of these wait. See cancelSteamInstall().
+    QSet<int>               m_cancellingInstalls;
+    QVariantMap             m_steamInstalls;
+    QTimer                 *m_installPoll = nullptr;
+    bool                    m_installPollBusy = false;
+    void trackSteamInstall(int appid, const QString &route);
+    void pollSteamInstalls();
+    void applySteamInstallStatus(int appid, int phase, qulonglong done, qulonglong total,
+                                 qulonglong downloaded, uint secondsLeft, const QString &source);
+    void finishSteamInstall(int appid, const QString &outcome, bool rescan);
+    void setSteamInstallPaused(int appid, bool paused);
+    // Rewrites one entry's state in m_steamInstalls and notifies.
+    void setSteamInstallState(int appid, const QString &state);
+    QString ownedSteamName(int appid) const;
     // Riot installs handed to the Riot Client's uninstall; see
     // watchRiotUninstall(). Keyed by the lowercased install folder.
     QSet<QString>           m_pendingRiotUninstalls;
@@ -536,6 +670,41 @@ private:
     bool                    m_ignoreLikedGames = false;
     bool                    m_useSteamPlaytime = false;
     bool                    m_trailersStartMuted = false;
+
+    // ---- Owned Steam games ------------------------------------------------
+    bool                    m_showUninstalled = false;
+    bool                    m_steamSignedIn   = false;
+    // Everything the account owns, as GetOwnedGames last answered: appid,
+    // name, playtimeMinutes, lastPlayed. Cached on disk so the list shows at
+    // startup and offline; rebuildOwnedSteamGames() narrows it to what is not
+    // installed.
+    QVariantList            m_ownedSteamAll;
+    QVariantList            m_ownedSteamGames;
+    bool                    m_ownedFetchInFlight = false;
+    QString                 m_ownedFetchError;    // last fetch's failure, "" when fine
+    QElapsedTimer           m_ownedFetchClock;    // since the last successful fetch
+    void        requestOwnedSteamRefresh(bool force);
+    void        rebuildOwnedSteamGames();
+    void        loadOwnedSteamCache();
+    void        saveOwnedSteamCache() const;
+    fs::path    ownedSteamCachePath() const;
+
+    // Covers that replaced a missing library_600x900.jpg, by appid:
+    // { cover, at, fromSgdb }. On disk as owned_steam_art.json so the chain
+    // runs once per machine; a header.jpg stand-in asks SteamGridDB again
+    // after a week.
+    QHash<int, QVariantMap> m_ownedArtCache;
+    QHash<int, QString>     m_ownedCoverOverride;   // this session's answers
+    QSet<int>               m_ownedArtAsked;        // queued, in flight or answered
+    QList<int>              m_ownedArtQueue;
+    int                     m_ownedArtRunning = 0;
+    fs::path    ownedArtCachePath() const;
+    void        loadOwnedArtCache();
+    void        saveOwnedArtCache() const;
+    bool        ownedArtCacheIsFresh(int appId) const;
+    void        pumpOwnedArtLookups();
+    void        setOwnedSteamCover(int appId, const QString &url, bool definitive,
+                                   bool fromSgdb);
     QString                 m_recommendationStatus = "Recommendations not loaded";
     fs::path                m_baseDir;    // resolved project root (contains Images/)
 

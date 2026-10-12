@@ -54,7 +54,8 @@ struct HInternet {
 };
 #endif
 
-static string https_get(const wstring &host, const wstring &path,
+// Shared with steam_manager.cpp (owned games), declared in the header.
+string https_get(const wstring &host, const wstring &path,
                         const wstring &headers) {
 #ifdef _WIN32
   HInternet session;
@@ -830,5 +831,43 @@ SgdbArtUrls steamgriddb_art_urls(const std::string &name) {
     urls.hero = extract_json_value(body, "url");
   if (get("/api/v2/logos/game/" + id, body))
     urls.logo = extract_json_value(body, "url");
+  return urls;
+}
+
+SgdbArtUrls steamgriddb_grid_url_for_steam_app(int app_id) {
+  SgdbArtUrls urls;
+  if (app_id <= 0)
+    return urls;
+
+  const string api_key = get_secret("STEAMGRIDDB_API_KEY");
+  if (api_key.empty() || api_key == "YOUR_API_KEY_HERE")
+    return urls; // no key is an answer, not an outage
+
+  const wstring headers = L"Authorization: Bearer " + widen_ascii(api_key);
+
+  // Keyed on the appid, not a name search: the appid is exactly the game
+  // Steam owns, where an autocomplete on the title can land on a namesake.
+  // 600x900 first, as everywhere else; then the other portrait sizes, which a
+  // card crops to the same shape, rather than nothing.
+  for (const char *dims : {"600x900", "342x482,660x930"}) {
+    string body;
+    try {
+      body = https_get(L"www.steamgriddb.com",
+                       widen_ascii("/api/v2/grids/steam/" + std::to_string(app_id) +
+                                   "?dimensions=" + dims),
+                       headers);
+    } catch (const std::exception &e) {
+      const int status = http_status_from_error(e.what());
+      if (status == 401 || status == 403)
+        s_last_auth_ok = false;
+      if (status != 404)
+        urls.reachable = false;
+      return urls; // a 404 is SteamGridDB not knowing the appid at all
+    }
+    s_last_auth_ok = true;
+    urls.grid = extract_json_value(body, "url");
+    if (!urls.grid.empty())
+      break;
+  }
   return urls;
 }

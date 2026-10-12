@@ -11,8 +11,8 @@ Popup {
     id: settingsRoot
 
     property var api: vortexApi
-    readonly property var sections: ["Directories", "Removed games", "Recommendations"]
-    property string activeSection: "Directories"
+    readonly property var sections: ["General", "Directories", "Removed games", "Recommendations", "Connections"]
+    property string activeSection: "General"
     property string statusMessage: ""
 
     // Mood ids match scoring.MOOD_LABELS / MOOD_NAMES in analytics/scoring.py
@@ -41,6 +41,11 @@ Popup {
     // The FolderDialog lives in main.qml so the top-bar shortcut and this panel
     // share one picker; main.qml calls reportAddResult() with the outcome.
     signal requestAddDirectory()
+
+    // The Steam session lives in main.qml's SteamLogin, which this panel
+    // cannot reach by id.
+    signal requestSteamSignIn()
+    signal requestSteamSignOut()
 
     // This panel renders in the overlay layer, above the full-screen loading
     // spinner, so it reports scan progress itself.
@@ -224,6 +229,93 @@ Popup {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     currentIndex: settingsRoot.sections.indexOf(settingsRoot.activeSection)
+
+                    // ── PAGE: General ────────────────────────────────────────
+                    ColumnLayout {
+                        spacing: 18
+
+                        Text {
+                            text: "TRAILERS"
+                            color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                        }
+
+                        // Where a trailer's sound starts on the details page.
+                        // The player's own mute button works either way.
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.maximumWidth: 420
+                            spacing: 14
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 3
+
+                                Text {
+                                    text: "Start trailers muted"
+                                    color: Theme.textBody; font.pixelSize: 14
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "Trailers on a game's page play with the sound off until you unmute them."
+                                    color: Theme.textMuted; font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
+
+                            Switch {
+                                id: trailersMutedSwitch
+
+                                HoverHandler { cursorShape: Qt.PointingHandCursor }
+
+                                Layout.alignment: Qt.AlignTop
+                                padding: 0
+                                implicitWidth: 52
+                                implicitHeight: 30
+
+                                Binding {
+                                    target: trailersMutedSwitch
+                                    property: "checked"
+                                    value: settingsRoot.api ? settingsRoot.api.trailersStartMuted : false
+                                }
+
+                                onToggled: {
+                                    if (settingsRoot.api)
+                                        settingsRoot.api.setTrailersStartMuted(trailersMutedSwitch.checked);
+                                }
+
+                                indicator: Rectangle {
+                                    implicitWidth: 52
+                                    implicitHeight: 30
+                                    radius: height / 2
+                                    color: trailersMutedSwitch.checked ? Theme.positiveBg : Theme.bgSurface
+                                    border.width: 1
+                                    border.color: trailersMutedSwitch.checked
+                                                  ? Theme.positive
+                                                  : (trailersMutedSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
+
+                                    Behavior on color { ColorAnimation { duration: 150 } }
+                                    Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                                    Rectangle {
+                                        width: 22; height: 22
+                                        radius: height / 2
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        x: trailersMutedSwitch.checked ? parent.width - width - 4 : 4
+                                        color: trailersMutedSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
+
+                                        Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                    }
+                                }
+
+                                contentItem: Item {}
+                            }
+                        }
+
+                        // Holds the rows at the top of the page.
+                        Item { Layout.fillHeight: true }
+                    }
 
                     // ── PAGE: Directories ────────────────────────────────────
                     ColumnLayout {
@@ -1077,87 +1169,86 @@ Popup {
                                     contentItem: Item {}
                                 }
                             }
+                        }
+                    }
 
-                            Text {
-                                Layout.topMargin: 8
-                                text: "TRAILERS"
-                                color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
-                            }
+                    // ── PAGE: Connections ────────────────────────────────────
+                    //
+                    // Accounts Vortex signs in to on your behalf.
+                    ColumnLayout {
+                        spacing: 18
 
-                            // Where a trailer's sound starts on the details page.
-                            // The player's own mute button works either way.
-                            RowLayout {
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Accounts Vortex can use to fill in your library."
+                            color: Theme.textMuted; font.pixelSize: 14
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                            text: "STEAM ACCOUNT"
+                            color: Theme.textFaint; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+                        }
+
+                        // The session behind the Library's NOT INSTALLED
+                        // toggle. Signing in happens on Steam's own page;
+                        // Vortex keeps the session, never the password.
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.maximumWidth: 420
+                            spacing: 14
+
+                            readonly property bool signedIn:
+                                !!settingsRoot.api && settingsRoot.api.steamSignedIn
+
+                            ColumnLayout {
                                 Layout.fillWidth: true
-                                Layout.maximumWidth: 420
-                                spacing: 14
+                                spacing: 3
 
-                                ColumnLayout {
-                                    Layout.fillWidth: true
-                                    spacing: 3
-
-                                    Text {
-                                        text: "Start trailers muted"
-                                        color: Theme.textBody; font.pixelSize: 14
-                                    }
-
-                                    Text {
-                                        Layout.fillWidth: true
-                                        text: "Trailers on a game's page play with the sound off until you unmute them."
-                                        color: Theme.textMuted; font.pixelSize: 12
-                                        wrapMode: Text.WordWrap
-                                    }
+                                Text {
+                                    text: parent.parent.signedIn ? "Signed in to Steam" : "Not signed in"
+                                    color: Theme.textBody; font.pixelSize: 14
                                 }
 
-                                Switch {
-                                    id: trailersMutedSwitch
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: "Lets the Library show the Steam games you own but haven't "
+                                          + "installed (the NOT INSTALLED toggle). You sign in once, on "
+                                          + "Steam's own page; signing out here forgets the session."
+                                    color: Theme.textMuted; font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
 
-                                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            Rectangle {
+                                id: steamAccountButton
+                                readonly property bool signedIn: parent.signedIn
+                                Layout.alignment: Qt.AlignTop
+                                implicitWidth: 92; implicitHeight: 28; radius: 14
+                                color: steamAccountArea.containsMouse ? Theme.accent : "transparent"
+                                border.color: steamAccountArea.containsMouse ? Theme.focusRing : Theme.borderControl
+                                border.width: 1
 
-                                    Layout.alignment: Qt.AlignTop
-                                    padding: 0
-                                    implicitWidth: 52
-                                    implicitHeight: 30
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: steamAccountButton.signedIn ? "SIGN OUT" : "SIGN IN"
+                                    color: steamAccountArea.containsMouse ? Theme.textInverse : Theme.textSecondary
+                                    font.pixelSize: 10; font.bold: true; font.letterSpacing: 1
+                                }
 
-                                    Binding {
-                                        target: trailersMutedSwitch
-                                        property: "checked"
-                                        value: settingsRoot.api ? settingsRoot.api.trailersStartMuted : false
-                                    }
-
-                                    onToggled: {
-                                        if (settingsRoot.api)
-                                            settingsRoot.api.setTrailersStartMuted(trailersMutedSwitch.checked);
-                                    }
-
-                                    indicator: Rectangle {
-                                        implicitWidth: 52
-                                        implicitHeight: 30
-                                        radius: height / 2
-                                        color: trailersMutedSwitch.checked ? Theme.positiveBg : Theme.bgSurface
-                                        border.width: 1
-                                        border.color: trailersMutedSwitch.checked
-                                                      ? Theme.positive
-                                                      : (trailersMutedSwitch.hovered ? Theme.borderControl : Theme.borderMuted)
-
-                                        Behavior on color { ColorAnimation { duration: 150 } }
-                                        Behavior on border.color { ColorAnimation { duration: 150 } }
-
-                                        Rectangle {
-                                            width: 22; height: 22
-                                            radius: height / 2
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            x: trailersMutedSwitch.checked ? parent.width - width - 4 : 4
-                                            color: trailersMutedSwitch.checked ? Theme.positive : Theme.bgSwitchHandle
-
-                                            Behavior on x { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                                            Behavior on color { ColorAnimation { duration: 150 } }
-                                        }
-                                    }
-
-                                    contentItem: Item {}
+                                MouseArea {
+                                    id: steamAccountArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: steamAccountButton.signedIn ? settingsRoot.requestSteamSignOut()
+                                                                           : settingsRoot.requestSteamSignIn()
                                 }
                             }
                         }
+
+                        // Holds the rows at the top of the page.
+                        Item { Layout.fillHeight: true }
                     }
                 }
             }

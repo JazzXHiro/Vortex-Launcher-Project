@@ -59,6 +59,25 @@ long long get_baseline_playtime(const std::string& game_key);
 bool import_steam_baseline(const std::string& game_key, const std::string& game_name,
                            long long steam_seconds);
 
+// Sets a game's displayed (active) playtime by hand, for play Vortex never saw
+// -- a console, another PC, the years before Vortex.
+//
+// Only the baseline moves: the sessions Vortex watched stay as recorded, and the
+// baseline becomes whatever the target needs beyond them. That makes the watched
+// active time a floor -- a target below it clamps up to it, since lowering it
+// would mean un-recording real sessions. Creates the row when there is none.
+//
+// Stamps the edit in playtime_edits.txt, which is the only date a game with no
+// sessions and no Steam record has to anchor its history to.
+//
+// Returns the active total that resulted, so the caller can tell a clamp from
+// the value it asked for.
+long long set_manual_playtime(const std::string& game_key, const std::string& game_name,
+                              long long target_active_seconds);
+
+// When the playtime of game_key was last set by hand, or 0 if it never was.
+std::time_t manual_edit_time(const std::string& game_key);
+
 // launcher_imports.txt -- games whose history from before Vortex was taken from
 // a launcher's own records (PrismLauncher's Minecraft logs and totals).
 //
@@ -76,7 +95,8 @@ std::vector<std::pair<std::time_t, std::time_t>>
 recorded_sessions(const std::string& game_key);
 
 // Moves a game's playtime from old_key to new_key -- the stats file, the
-// sessions log and the launcher import marker -- and stamps new_name on the row.
+// sessions log, the launcher import marker and the manual edit stamp -- and
+// stamps new_name on the row.
 //
 // For a rename, or a scan that resolves the game to a different IGDB id than
 // last time: either changes the key, and without this the hours stay filed

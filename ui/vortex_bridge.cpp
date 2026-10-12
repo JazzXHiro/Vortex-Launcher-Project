@@ -9,6 +9,7 @@
 #include "preference_manager.h"
 #include "riot_manager.h"
 #include "stats_manager.h"
+#include "steam_client_internal.h"
 #include "steam_manager.h"
 #include "secrets.h"
 #include "steamgriddb_manager.h"
@@ -46,6 +47,8 @@
 #include <functional>
 #include <memory>
 #include <QVersionNumber>
+#include <QtWebEngineCore/QWebEngineCookieStore>
+#include <QtWebEngineQuick/QQuickWebEngineProfile>
 
 #include <chrono>
 #include <algorithm>
@@ -56,6 +59,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -85,6 +93,7 @@ VortexBridge::VortexBridge(QObject *parent) : QObject(parent),
     seedPlayedLedgerFromStats();
     backfillPlayedLedgerMetadata();
     loadSettings();
+    loadOwnedSteamCache();
 }
 
 static std::string trimCopy(std::string value) {
@@ -869,25 +878,35 @@ static void writeInstalledGames(const fs::path &baseDir,
         // decays with recency and a lifetime total cannot be weighted on
         // its own.
         //
-        // 0 for local games: there is no external record of those, and
-        // any play Vortex saw is already in playtime_sessions.log.
+        // Only play the session log does NOT have is exported, for every
+        // game: synthesize_steam_sessions() turns this figure into synthetic
+        // sessions beside the logged ones, so anything already in
+        // playtime_sessions.log would be counted twice. While Vortex owns the
+        // total that is the baseline -- Steam's import, a launcher's unlogged
+        // remainder, or hours entered by hand. In "use Steam's own playtime"
+        // mode it is Steam's live figure less what Vortex logged, since
+        // Steam counts Vortex's sessions too.
         //
-        // Only the IMPORTED part is exported while Vortex owns the total.
-        // synthesize_steam_sessions() turns this figure into synthetic
-        // sessions, and playtime_sessions.log already carries every session
-        // Vortex recorded -- exporting Steam's live total, which contains those
-        // same sessions, would have the recommender count them twice. The
-        // baseline is exactly the history the log does not have.
-        //
-        // In "use Steam's own playtime" mode none of the total is Vortex's to
-        // begin with, so Steam's live figure is still what to send.
-        long long playtimeSeconds = 0;
+        // Recency needs a date to decay from: Steam's last-played, else the
+        // last session Vortex saw, else when the hours were entered. With
+        // none of them the history is left out rather than placed at "now".
+        const std::string ptKey = makePtKey(game);
+        const PlayStat stat = get_play_stat(ptKey);
+        const bool steam = game.source == "Steam" && game.appid > 0;
+        long long playtimeSeconds = stat.baseline_seconds;
+        if (steam && use_steam_playtime()) {
+            const long long logged = stat.seconds - stat.baseline_seconds;
+            playtimeSeconds = std::max(0LL, get_steam_playtime_seconds(game.appid) - logged);
+        }
         long long lastPlayed = 0;
-        if (game.source == "Steam" && game.appid > 0) {
-            playtimeSeconds = use_steam_playtime()
-                                  ? get_steam_playtime_seconds(game.appid)
-                                  : get_play_stat(makePtKey(game)).baseline_seconds;
-            lastPlayed = get_steam_last_played(game.appid);
+        if (playtimeSeconds > 0) {
+            if (steam)
+                lastPlayed = get_steam_last_played(game.appid);
+            if (lastPlayed <= 0)
+                for (const auto &session : recorded_sessions(ptKey))
+                    lastPlayed = std::max<long long>(lastPlayed, session.second);
+            if (lastPlayed <= 0)
+                lastPlayed = manual_edit_time(ptKey);
         }
 
         // INSTALL_DIR goes last, after every column the analytics side reads
@@ -1737,6 +1756,8 @@ void VortexBridge::finishLiveArtwork(const QString &name, const QVariantMap &art
         row = savedRowFor(name);
     if (row.isEmpty())
         row = findGameByName(m_browseSnapshots, name);   // a Discover page's game
+    if (row.isEmpty())
+        row = findGameByName(m_ownedSteamGames, name);   // owned, not installed
     const int appId = row.value("steamAppId").toInt();
 
     // A Discover page asked before IGDB answered, and SteamGridDB left a gap
@@ -1897,9 +1918,13 @@ void VortexBridge::applyLiveArtwork(const QString &name, const QVariantMap &art,
     apply(m_browseSnapshots);
 
     // An open Discover page on this game: whatever arrived goes up, and the
-    // wait is over either way, so IGDB's banner may stand in for the rest.
+    // wait is over either way, so IGDB's banner may stand in for the rest. A
+    // not-installed game's page asked under its Steam name, kept as
+    // liveArtName once IGDB's title replaces it.
     if (QString::compare(m_browseDetails.value("name").toString(), name,
-                         Qt::CaseInsensitive) == 0) {
+                         Qt::CaseInsensitive) == 0
+        || QString::compare(m_browseDetails.value("liveArtName").toString(), name,
+                            Qt::CaseInsensitive) == 0) {
         const QString hero = art.value("liveHeroUrl").toString();
         const QString logo = art.value("liveLogoUrl").toString();
         if (!hero.isEmpty())
@@ -2702,6 +2727,12 @@ void VortexBridge::loadSettings() {
         m_useSteamPlaytime = object.value("useSteamPlaytime").toBool(false);
     if (object.contains("trailersStartMuted"))
         m_trailersStartMuted = object.value("trailersStartMuted").toBool(false);
+    if (object.contains("showUninstalled"))
+        m_showUninstalled = object.value("showUninstalled").toBool(false);
+    // A flag only -- the session itself is in SteamLogin.qml's WebEngine
+    // profile, and nothing here can act as the account.
+    if (object.contains("steamSignedIn"))
+        m_steamSignedIn = object.value("steamSignedIn").toBool(false);
 }
 
 void VortexBridge::saveSettings() const {
@@ -2713,6 +2744,8 @@ void VortexBridge::saveSettings() const {
     // so the CLI shows whichever total the launcher is showing.
     object["useSteamPlaytime"] = m_useSteamPlaytime;
     object["trailersStartMuted"] = m_trailersStartMuted;
+    object["showUninstalled"] = m_showUninstalled;
+    object["steamSignedIn"] = m_steamSignedIn;
 
     QFile file(pathToQString(settingsPath()));
     if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
@@ -2972,6 +3005,24 @@ static QString browseErrorMessage(const QString &error) {
     return QStringLiteral("Could not reach IGDB. Check your connection.");
 }
 
+// The typed text in the shape of an IGDB slug: "Majora's Mask" ->
+// "majoras-mask", "Pokémon" -> "pokemon". Empty when nothing alphanumeric
+// is left.
+static QString igdbSlug(const QString &text) {
+    QString slug;
+    for (const QChar c : text.normalized(QString::NormalizationForm_D).toLower()) {
+        if (c.category() == QChar::Mark_NonSpacing || c == '\'' || c == QChar(0x2019))
+            continue;
+        if (c.isLetterOrNumber() && c.unicode() < 0x80)
+            slug += c;
+        else if (!slug.isEmpty() && !slug.endsWith('-'))
+            slug += '-';
+    }
+    while (slug.endsWith('-'))
+        slug.chop(1);
+    return slug;
+}
+
 void VortexBridge::searchCatalog(QString query) {
     query = query.trimmed();
     if (query.isEmpty()) {
@@ -2984,17 +3035,63 @@ void VortexBridge::searchCatalog(QString query) {
     m_browseStatus.clear();
     emit browseResultsChanged();
 
-    const std::string body =
-        "search \"" + apicalypseQuoted(query) + "\"; "
+    // IGDB's `search` only matches whole words, so "zeld" or "hal" finds
+    // nothing. Names that start with the text come first, then names that
+    // contain it anywhere, most-rated first; the word search only tops the
+    // list up. Name matching is accent-sensitive ("pokemon" misses "Pokémon"),
+    // so each test also tries the slug, which IGDB keeps in plain ASCII.
+    const std::string quoted = apicalypseQuoted(query);
+    const std::string slug = apicalypseQuoted(igdbSlug(query));
+    auto nameTest = [&](const char *open, const char *close) {
+        std::string test = "name ~ " + std::string(open) + "\"" + quoted + "\"" + close;
+        if (!slug.empty())
+            test = "(" + test + " | slug ~ " + open + "\"" + slug + "\"" + close + ")";
+        return test;
+    };
+    const std::string fields =
         "fields id,name,cover.image_id,first_release_date,total_rating,"
-        "genres.name,involved_companies.company.name,involved_companies.developer; "
-        "where version_parent = null; limit 50;";
+        "genres.name,involved_companies.company.name,involved_companies.developer; ";
+    // `search` cannot go in a multiquery: IGDB answers the whole request
+    // with an empty list if any part of it uses one.
+    const std::string matchBody =
+        "query games \"prefix\" { " + fields +
+        "where " + nameTest("", "*") + " & version_parent = null; "
+        "sort total_rating_count desc; limit 50; };"
+        "query games \"contains\" { " + fields +
+        "where " + nameTest("*", "*") + " & version_parent = null; "
+        "sort total_rating_count desc; limit 50; };";
+    const std::string searchBody =
+        "search \"" + quoted + "\"; " + fields + "where version_parent = null; limit 50;";
 
-    QThread *thread = QThread::create([this, seq, body]() {
+    QThread *thread = QThread::create([this, seq, matchBody, searchBody]() {
         QByteArray json;
         QString error;
         try {
-            json = QByteArray::fromStdString(igdb_query("games", body));
+            // One /games-shaped array, in order and without repeats, for
+            // browseRows().
+            QJsonArray games;
+            QSet<qlonglong> seen;
+            auto add = [&](const QJsonArray &found) {
+                for (const QJsonValue &game : found) {
+                    const qlonglong id = game.toObject().value("id").toVariant().toLongLong();
+                    if (games.size() < 50 && !seen.contains(id)) {
+                        seen.insert(id);
+                        games.append(game);
+                    }
+                }
+            };
+            const QJsonArray answers = QJsonDocument::fromJson(
+                QByteArray::fromStdString(igdb_query("multiquery", matchBody))).array();
+            for (const char *name : {"prefix", "contains"}) {
+                for (const QJsonValue &answer : answers) {
+                    if (answer.toObject().value("name").toString() == QLatin1String(name))
+                        add(answer.toObject().value("result").toArray());
+                }
+            }
+            if (games.size() < 50)
+                add(QJsonDocument::fromJson(
+                    QByteArray::fromStdString(igdb_query("games", searchBody))).array());
+            json = QJsonDocument(games).toJson(QJsonDocument::Compact);
         } catch (const std::exception &e) {
             error = QString::fromStdString(e.what());
         }
@@ -3169,6 +3266,8 @@ void VortexBridge::loadBrowseDetailsForGame(QString name) {
     QVariantMap row = findGameByName(m_gameList, name);
     if (row.isEmpty())
         row = findGameByName(m_recommendationList, name);
+    if (row.isEmpty())
+        row = findGameByName(m_ownedSteamGames, name);   // owned, not installed
 
     const auto known = [](const QString &value) {
         return (value.isEmpty() || value == "Unknown" || value == "N/A") ? QString() : value;
@@ -3185,10 +3284,34 @@ void VortexBridge::loadBrowseDetailsForGame(QString name) {
     seed["ttbNormally"] = known(row.value("timeToBeat").toString());
     seed["totalRating"] = row.value("rating").toDouble();
     seed["steamAppId"]  = row.value("steamAppId").toInt();
+
+    // An owned, not-installed Steam game shows SteamGridDB's hero and logo
+    // ahead of its row's Steam ones, and nothing until SteamGridDB has
+    // answered (BrowseDetails.qml). So the lookup starts with the page rather
+    // than after IGDB, under the Steam name the row has: IGDB's title can
+    // differ, and applyBrowseDetails() keeps this one.
+    const bool ownedNotInstalled = row.value("notInstalled").toBool();
+    const QString artName = seed.value("name").toString();
+    bool lookUp = false;
+    if (ownedNotInstalled && !artName.isEmpty()) {
+        const QString key = liveArtKey(artName);
+        const auto cached = m_liveArtCache.constFind(key);
+        if (cached != m_liveArtCache.constEnd()) {
+            seed["bannerUrl"] = cached.value().value("liveHeroUrl").toString();
+            seed["logoUrl"]   = cached.value().value("liveLogoUrl").toString();
+        }
+        lookUp = !liveArtCacheIsFresh(artName);
+        seed["liveArtName"] = artName;
+        seed["artPending"]  = lookUp
+            && (m_liveArtPending.contains(key) || !m_liveArtAsked.contains(key));
+    }
+
     m_browseDetails = seed;
     m_browseDetailsLoading = true;
     emit browseDetailsChanged();
     releaseLiveArtAwaitingBrowse();     // the last page's game, if it had one
+    if (lookUp)
+        resolveLiveArtwork(artName, true);
 
     m_browseReviews.clear();
     m_browseReviewsLoading = false;
@@ -3436,11 +3559,20 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
     // else the live lookup's -- SteamGridDB, then Steam's CDN for a Steam
     // game. Until that answers, artPending keeps IGDB's banner off screen so
     // it is not shown only to be swapped out.
+    //
+    // An owned, not-installed game's lookup started with the page, under its
+    // Steam name (loadBrowseDetailsForGame()); what it has so far carries over
+    // rather than being asked again under IGDB's title.
+    const QString artName = m_browseDetails.value("liveArtName").toString();
     const QString key = liveArtKey(name);
     bool lookUp = false;
     if (!owned.isEmpty()) {
         d["bannerUrl"] = owned.value("heroPath").toString();
         d["logoUrl"]   = owned.value("logoPath").toString();
+    } else if (!artName.isEmpty()) {
+        d["liveArtName"] = artName;
+        d["bannerUrl"]   = m_browseDetails.value("bannerUrl");
+        d["logoUrl"]     = m_browseDetails.value("logoUrl");
     } else {
         const auto cached = m_liveArtCache.constFind(key);
         if (cached != m_liveArtCache.constEnd()) {
@@ -3449,8 +3581,9 @@ void VortexBridge::applyBrowseDetails(int seq, const QByteArray &gameJson,
         }
         lookUp = !name.isEmpty() && !liveArtCacheIsFresh(name);
     }
-    d["artPending"] = lookUp
-        && (m_liveArtPending.contains(key) || !m_liveArtAsked.contains(key));
+    d["artPending"] = artName.isEmpty() || !owned.isEmpty()
+        ? lookUp && (m_liveArtPending.contains(key) || !m_liveArtAsked.contains(key))
+        : m_liveArtPending.contains(liveArtKey(artName));
 
     m_browseDetails = d;
     emit browseDetailsChanged();
@@ -3874,6 +4007,32 @@ void VortexBridge::initialize(int mood) {
     m_currentMood = mood;
     emit moodChanged();
     loadGames();
+
+    // Downloads already under way -- started before the launcher was, or left
+    // running from a previous session -- get their wave back as well.
+    QThread *thread = QThread::create([this]() {
+        std::vector<int> pending;
+        for (int appid : steam_pending_install_appids()) {
+            // Steam can leave a manifest behind after a cancelled download
+            // (StateFlags 514, but the client says Uninstalled). Following it
+            // would show "starting" for half an hour on nothing.
+            if (steam_install_progress(appid).phase == SteamInstallStatus::Phase::NotInstalled) {
+                vlog::line("SteamInstall", "Ignoring a leftover manifest: appid " +
+                                               std::to_string(appid) + " -- Steam says not installed");
+                continue;
+            }
+            pending.push_back(appid);
+        }
+        QMetaObject::invokeMethod(this, [this, pending]() {
+            for (int appid : pending) {
+                vlog::line("SteamInstall", "Following an install already under way: appid " +
+                                               std::to_string(appid));
+                trackSteamInstall(appid, QStringLiteral("steam"));
+            }
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4064,6 +4223,9 @@ void VortexBridge::loadGames() {
                 syncPlayedLedger();
                 emit gameListChanged();
                 emit favoritesChanged();
+                // The installed set is known from here on, so the cached owned
+                // list can be narrowed against it without waiting out pass 2.
+                rebuildOwnedSteamGames();
             }, Qt::QueuedConnection);
         }
 
@@ -4346,6 +4508,10 @@ void VortexBridge::loadGames() {
             // changes the playtime key) and renames local games, and pass 3 fills
             // in the artwork the ledger keeps its own copy of.
             syncPlayedLedger();
+
+            // The installed set has changed, so has what is NOT installed.
+            rebuildOwnedSteamGames();
+            requestOwnedSteamRefresh(false);
 
             if (m_rescanQueued) {
                 m_rescanQueued = false;
@@ -4987,6 +5153,766 @@ void VortexBridge::watchSteamUninstall(int appid) {
     timer->start();
 }
 
+bool VortexBridge::reduceMotion() const
+{
+#ifdef _WIN32
+    BOOL animations = TRUE;
+    if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0))
+        return !animations;
+#endif
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Steam installs: the launcher's drive picker, and the sweep on the card.
+//
+// installSteamGameTo() hands the chosen library to the running Steam client
+// (steam_client_internal.h), so no Steam window opens. installSteamGame() is
+// the old route through Steam's own dialog, kept as the fallback. Either way
+// the install is then followed once a second until Steam reports it fully
+// installed, and only then rescanned -- a first install's manifest exists from
+// the moment it is queued, and read_installed_steam_games() leaves it out of
+// the library until it is done.
+//
+// Every step goes to vortex.log under [SteamInstall]: the route and why,
+// Steam's answer, first bytes, every 10%, and how it ended.
+// ─────────────────────────────────────────────────────────────────────────────
+QString VortexBridge::ownedSteamName(int appid) const {
+    for (const QVariant &entry : m_ownedSteamAll) {
+        const QVariantMap owned = entry.toMap();
+        if (owned.value("appid").toInt() == appid)
+            return owned.value("name").toString();
+    }
+    return QStringLiteral("appid %1").arg(appid);
+}
+
+void VortexBridge::installSteamGame(int appid) {
+    if (appid <= 0)
+        return;
+    if (m_cancellingInstalls.contains(appid)) {
+        vlog::item("SteamInstall", "install appid " + std::to_string(appid), vlog::Status::Skipped,
+                   "a cancel is still clearing its files");
+        return;
+    }
+    vlog::line("SteamInstall", "Install " + ownedSteamName(appid).toStdString() + " (appid " +
+                                   std::to_string(appid) + ") -- route: dialog (steam://install)");
+    if (install_steam_game_by_appid(appid))
+        trackSteamInstall(appid, QStringLiteral("dialog"));
+    else
+        vlog::item("SteamInstall", "steam://install", vlog::Status::Fail, "could not open Steam");
+}
+
+void VortexBridge::requestSteamLibraries() {
+    QThread *thread = QThread::create([this]() {
+        const bool clientRoute = steam_internal_available();
+        QVariantList rows;
+        for (const SteamLibrary &lib : steam_libraries()) {
+            QVariantMap row;
+            row["folderIndex"] = lib.folderIndex;
+            row["path"]        = QString::fromStdString(lib.root.string());
+            row["drive"]       = QString::fromStdString(lib.drive);
+            row["label"]       = QString::fromStdString(lib.label);
+            row["freeBytes"]   = static_cast<qulonglong>(lib.freeBytes);
+            row["totalBytes"]  = static_cast<qulonglong>(lib.totalBytes);
+            row["isDefault"]   = lib.isDefault;
+            rows << row;
+        }
+        QMetaObject::invokeMethod(this, [this, rows, clientRoute]() {
+            emit steamLibrariesReady(rows, clientRoute);
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::installSteamGameTo(int appid, int folderIndex) {
+    if (appid <= 0 || m_installWatches.contains(appid))
+        return;
+    if (m_cancellingInstalls.contains(appid)) {
+        vlog::item("SteamInstall", "install appid " + std::to_string(appid), vlog::Status::Skipped,
+                   "a cancel is still clearing its files");
+        return;
+    }
+    const QString name = ownedSteamName(appid);
+    vlog::line("SteamInstall", "Install " + name.toStdString() + " (appid " + std::to_string(appid) +
+                                   ") into library folder " + std::to_string(folderIndex));
+
+    // Shown at once, before Steam has answered, so the click has a visible
+    // effect even when the client takes a moment.
+    trackSteamInstall(appid, QStringLiteral("client"));
+
+    QThread *thread = QThread::create([this, appid, folderIndex, name]() {
+        const SteamInstallRequest req = install_steam_game_to(appid, folderIndex);
+        QMetaObject::invokeMethod(this, [this, appid, req, name]() {
+            vlog::item("SteamInstall", name.toStdString(),
+                       req.started ? vlog::Status::Ok : vlog::Status::Fail, req.detail);
+            auto it = m_installWatches.find(appid);
+            if (it == m_installWatches.end())
+                return;
+            if (!req.started) {
+                finishSteamInstall(appid, QStringLiteral("could not be started"), false);
+                emit steamInstallFailed(appid, QStringLiteral("Steam could not start the install."));
+                return;
+            }
+            if (!req.viaClient)
+                it->route = QStringLiteral("dialog");
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+// One click, no confirm. The card drops its overlay at once and the cancel
+// carries on in the background: Steam's UninstallApp, then the sweep of what
+// it leaves (see cancel_steam_install()). A re-install of the same game waits
+// for that to finish, so it cannot race the deletion.
+void VortexBridge::cancelSteamInstall(int appid) {
+    if (appid <= 0 || m_cancellingInstalls.contains(appid))
+        return;
+    const QString name = m_installWatches.contains(appid) ? m_installWatches.value(appid).name
+                                                          : ownedSteamName(appid);
+    vlog::line("SteamInstall", "Cancel requested for " + name.toStdString() + " (appid " +
+                                   std::to_string(appid) + ")");
+    m_cancellingInstalls.insert(appid);
+    finishSteamInstall(appid, QStringLiteral("cancelled by player"), false);
+
+    QThread *thread = QThread::create([this, appid, name]() {
+        const SteamCancelResult res = cancel_steam_install(appid);
+        QMetaObject::invokeMethod(this, [this, appid, name, res]() {
+            m_cancellingInstalls.remove(appid);
+            if (res.cancelled) {
+                vlog::item("SteamInstall", name.toStdString(), vlog::Status::Ok,
+                           "download cancelled, removed " + std::to_string(res.filesRemoved) +
+                               " files (" + std::to_string(res.bytesRemoved / (1024 * 1024)) + " MB)");
+                return;
+            }
+            vlog::item("SteamInstall", name.toStdString(), vlog::Status::Fail,
+                       "cancel did not complete: " + res.detail);
+            emit steamInstallFailed(appid, QStringLiteral("Steam could not cancel the download."));
+            // Still downloading after all: put the overlay back.
+            if (!res.detail.empty() && res.detail.rfind("refused", 0) != 0
+                && res.detail.find("nothing downloading") == std::string::npos)
+                trackSteamInstall(appid, QStringLiteral("steam"));
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::pauseSteamInstall(int appid)  { setSteamInstallPaused(appid, true); }
+void VortexBridge::resumeSteamInstall(int appid) { setSteamInstallPaused(appid, false); }
+
+void VortexBridge::setSteamInstallState(int appid, const QString &state) {
+    const QString key = QString::number(appid);
+    if (!m_steamInstalls.contains(key))
+        return;
+    QVariantMap entry = m_steamInstalls.value(key).toMap();
+    entry["state"] = state;
+    m_steamInstalls.insert(key, entry);
+    emit steamInstallsChanged();
+}
+
+// The button flips at once and Steam is told in the background; the poll is
+// held off for a few seconds (applySteamInstallStatus) so it does not flip the
+// button back before Steam has acted. A refusal puts it back as it was.
+void VortexBridge::setSteamInstallPaused(int appid, bool paused) {
+    auto it = m_installWatches.find(appid);
+    if (it == m_installWatches.end() || m_cancellingInstalls.contains(appid))
+        return;
+    const QString before = m_steamInstalls.value(QString::number(appid)).toMap()
+                               .value("state").toString();
+    if ((before == QLatin1String("paused")) == paused || before == QLatin1String("done"))
+        return;
+    vlog::line("SteamInstall", std::string(paused ? "Pause" : "Resume") + " requested for " +
+                                   it->name.toStdString() + " (appid " + std::to_string(appid) + ")");
+
+    it->pendingPaused = paused;
+    it->pendingSince.start();
+    setSteamInstallState(appid, paused ? QStringLiteral("paused")
+                                : it->percent > 0 ? QStringLiteral("downloading")
+                                                  : QStringLiteral("starting"));
+
+    QThread *thread = QThread::create([this, appid, paused, before]() {
+        const bool ok = set_steam_install_paused(appid, paused);
+        QMetaObject::invokeMethod(this, [this, appid, paused, before, ok]() {
+            if (ok)
+                return;
+            auto w = m_installWatches.find(appid);
+            if (w == m_installWatches.end())
+                return;
+            w->pendingSince.invalidate();
+            setSteamInstallState(appid, before);
+            emit steamInstallFailed(appid, paused ? QStringLiteral("Steam could not pause the download.")
+                                                  : QStringLiteral("Steam could not resume the download."));
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::trackSteamInstall(int appid, const QString &route) {
+    if (m_installWatches.contains(appid))
+        return;
+    InstallWatch watch;
+    watch.name = ownedSteamName(appid);
+    watch.route = route;
+    watch.clock.start();
+    m_installWatches.insert(appid, watch);
+
+    QVariantMap entry;
+    entry["state"] = QStringLiteral("starting");
+    entry["percent"] = 0;
+    m_steamInstalls.insert(QString::number(appid), entry);
+    emit steamInstallsChanged();
+
+    if (!m_installPoll) {
+        m_installPoll = new QTimer(this);
+        m_installPoll->setInterval(1000);
+        connect(m_installPoll, &QTimer::timeout, this, &VortexBridge::pollSteamInstalls);
+    }
+    if (!m_installPoll->isActive())
+        m_installPoll->start();
+}
+
+void VortexBridge::pollSteamInstalls() {
+    if (m_installWatches.isEmpty()) {
+        m_installPoll->stop();
+        return;
+    }
+    // One round at a time: a slow answer from Steam must not pile up threads.
+    if (m_installPollBusy)
+        return;
+    m_installPollBusy = true;
+
+    const QList<int> appids = m_installWatches.keys();
+    QThread *thread = QThread::create([this, appids]() {
+        for (int appid : appids) {
+            const SteamInstallStatus st = steam_install_progress(appid);
+            const QString source = QString::fromStdString(st.source);
+            QMetaObject::invokeMethod(this, [this, appid, st, source]() {
+                applySteamInstallStatus(appid, static_cast<int>(st.phase), st.done, st.total,
+                                        st.downloaded, st.secondsLeft, source);
+            }, Qt::QueuedConnection);
+        }
+        QMetaObject::invokeMethod(this, [this]() { m_installPollBusy = false; },
+                                  Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::applySteamInstallStatus(int appid, int phaseValue, qulonglong done,
+                                           qulonglong total, qulonglong downloaded,
+                                           uint secondsLeft, const QString &source) {
+    auto it = m_installWatches.find(appid);
+    if (it == m_installWatches.end())
+        return;
+    InstallWatch &w = *it;
+    using Phase = SteamInstallStatus::Phase;
+    const auto phase = static_cast<Phase>(phaseValue);
+    const std::string tag = w.name.toStdString() + " (appid " + std::to_string(appid) + ")";
+    const qint64 elapsedMs = w.clock.elapsed();
+
+    if (phase == Phase::Installed) {
+        if (!w.seenActive && w.route == QLatin1String("client") && elapsedMs < 3000)
+            return;   // Steam has not registered the request yet
+        finishSteamInstall(appid, QStringLiteral("completed"), true);
+        return;
+    }
+    if (phase == Phase::NotInstalled || phase == Phase::Unknown) {
+        // Before Steam has picked the request up, "not installed" is simply
+        // what it was a moment ago -- or, on the dialog route, a player who
+        // has not clicked Install yet. After, it means the download was
+        // cancelled or removed in Steam.
+        if (w.seenActive) {
+            finishSteamInstall(appid, QStringLiteral("cancelled or removed in Steam"), false);
+        } else if (elapsedMs > 30LL * 60 * 1000) {
+            finishSteamInstall(appid, QStringLiteral("gave up: Steam never started it (30 min)"), false);
+        }
+        return;
+    }
+
+    w.seenActive = true;
+    int percent = total > 0 ? static_cast<int>(done * 100 / total) : 0;
+    percent = std::clamp(percent, 0, 99);   // 100 only once Steam says installed
+    w.percent = std::max(w.percent, percent);
+
+    // Network rate: the download counter's change over the last ~5 s of
+    // polls. Steam's own rate is of disk writes, which runs ahead of the
+    // network by however much the game compresses.
+    uint bytesPerSecond = 0;
+    if (downloaded > 0) {
+        auto &samples = w.downloadSamples;
+        if (!samples.isEmpty() && downloaded < samples.last().second)
+            samples.clear();   // counter restarted
+        samples.append({elapsedMs, downloaded});
+        while (samples.size() > 2 && elapsedMs - samples.first().first > 5000)
+            samples.removeFirst();
+        const qint64 spanMs = elapsedMs - samples.first().first;
+        if (spanMs >= 900)
+            bytesPerSecond = static_cast<uint>((downloaded - samples.first().second) * 1000 / spanMs);
+    } else {
+        w.downloadSamples.clear();
+    }
+
+    // Steam takes a moment to act on a pause or resume. Until it does, a poll
+    // still showing the old phase must not flip the button back.
+    if (w.pendingSince.isValid()) {
+        if (w.pendingSince.elapsed() < 3000 && (phase == Phase::Paused) != w.pendingPaused)
+            return;
+        w.pendingSince.invalidate();
+    }
+
+    QString state;
+    if (phase == Phase::Paused)
+        state = QStringLiteral("paused");
+    else if (phase == Phase::Downloading && done > 0)
+        state = QStringLiteral("downloading");
+    else
+        state = QStringLiteral("starting");
+
+    if (state != w.phase) {
+        vlog::line("SteamInstall", tag + ": " + state.toStdString() + " (source " +
+                                       source.toStdString() + ")");
+        w.phase = state;
+    }
+    if (done > 0 && !w.bytesLogged) {
+        w.bytesLogged = true;
+        vlog::line("SteamInstall", tag + ": first bytes after " +
+                                       vlog::duration(elapsedMs / 1000) + ", total " +
+                                       std::to_string(total / (1024 * 1024)) + " MB");
+    }
+    if (w.percent / 10 != w.lastDecile && done > 0) {
+        w.lastDecile = w.percent / 10;
+        vlog::line("SteamInstall", tag + ": " + std::to_string(w.percent) + "% -- " +
+                                       std::to_string(done / (1024 * 1024)) + "/" +
+                                       std::to_string(total / (1024 * 1024)) + " MB, " +
+                                       std::to_string(bytesPerSecond / (1024 * 1024)) + " MB/s (" +
+                                       source.toStdString() + ")");
+    }
+
+    QVariantMap entry;
+    entry["state"]          = state;
+    entry["percent"]        = w.percent;
+    entry["done"]           = done;
+    entry["total"]          = total;
+    entry["bytesPerSecond"] = bytesPerSecond;
+    entry["secondsLeft"]    = secondsLeft;
+    m_steamInstalls.insert(QString::number(appid), entry);
+    emit steamInstallsChanged();
+}
+
+void VortexBridge::finishSteamInstall(int appid, const QString &outcome, bool rescan) {
+    auto it = m_installWatches.find(appid);
+    if (it == m_installWatches.end())
+        return;
+    const InstallWatch w = *it;
+    m_installWatches.erase(it);
+    vlog::item("SteamInstall", w.name.toStdString() + " (appid " + std::to_string(appid) + ")",
+               rescan ? vlog::Status::Ok
+                      : m_cancellingInstalls.contains(appid) ? vlog::Status::Skipped
+                                                             : vlog::Status::Fail,
+               outcome.toStdString() + " after " + vlog::duration(w.clock.elapsed() / 1000) +
+                   ", route " + w.route.toStdString());
+
+    if (!rescan) {
+        m_steamInstalls.remove(QString::number(appid));
+        emit steamInstallsChanged();
+        return;
+    }
+
+    // A moment at 100% before the card turns into an installed one.
+    QVariantMap entry;
+    entry["state"] = QStringLiteral("done");
+    entry["percent"] = 100;
+    m_steamInstalls.insert(QString::number(appid), entry);
+    emit steamInstallsChanged();
+    vlog::line("SteamInstall", "Rescanning the library for " + w.name.toStdString());
+    loadGames();
+    QTimer::singleShot(2500, this, [this, appid]() {
+        if (m_installWatches.contains(appid))
+            return;   // installing again already
+        m_steamInstalls.remove(QString::number(appid));
+        emit steamInstallsChanged();
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Owned Steam games that are not installed — the Library's NOT INSTALLED toggle.
+//
+// The list comes from IPlayerService/GetOwnedGames, authorised by the Web API
+// token of the Steam store session the user signed in to in SteamLogin.qml.
+// That session lives in its own WebEngine profile; only the token crosses into
+// C++, only for the one request, and it is never written to disk or the log.
+// What is cached is the answer: appids, names and playtime.
+// ─────────────────────────────────────────────────────────────────────────────
+fs::path VortexBridge::ownedSteamCachePath() const {
+    return m_baseDir / "steam_owned_cache.json";
+}
+
+void VortexBridge::loadOwnedSteamCache() {
+    loadOwnedArtCache();
+    QFile file(pathToQString(ownedSteamCachePath()));
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    if (doc.isArray())
+        m_ownedSteamAll = doc.array().toVariantList();
+}
+
+void VortexBridge::saveOwnedSteamCache() const {
+    QFile file(pathToQString(ownedSteamCachePath()));
+    if (m_ownedSteamAll.isEmpty()) {
+        file.remove();
+        return;
+    }
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QJsonDocument(QJsonArray::fromVariantList(m_ownedSteamAll))
+                       .toJson(QJsonDocument::Compact));
+}
+
+QString VortexBridge::steamOwnedStatus() const {
+    // Signing out clears the cached list, so a list without a session means
+    // the session ran out under it.
+    if (!m_steamSignedIn)
+        return m_ownedSteamAll.isEmpty()
+            ? QStringLiteral("Sign in to Steam to see the games you own but haven't installed.")
+            : QStringLiteral("Your Steam session has ended. Sign in again to refresh this list.");
+    if (!m_ownedFetchError.isEmpty())
+        return QStringLiteral("Couldn't refresh your Steam library (%1).").arg(m_ownedFetchError);
+    return {};
+}
+
+// Narrows the cached owned list to what is not installed, as library-shaped
+// rows. Runs again after every scan, so a game installed since drops out.
+void VortexBridge::rebuildOwnedSteamGames() {
+    QSet<int> installed;
+    for (const BridgeGame &bg : m_internalGames) {
+        if (bg.source == "Steam" && bg.appid > 0)
+            installed.insert(bg.appid);
+    }
+
+    const fs::path imageRoot = m_baseDir / "Images";
+    QVariantList rows;
+    for (const QVariant &entry : m_ownedSteamAll) {
+        const QVariantMap owned = entry.toMap();
+        const int appid = owned.value("appid").toInt();
+        const QString name = owned.value("name").toString();
+        // A game taken out of the launcher stays out, installed or not.
+        if (appid <= 0 || name.isEmpty() || installed.contains(appid) || isRemovedName(name))
+            continue;
+
+        // Art left behind by an earlier install first; Steam's CDN otherwise,
+        // which carries library art for most apps on the store. Not all: old
+        // and delisted ones 404 on library_600x900.jpg, and the cover that
+        // replaced it last time (ownedSteamCoverFailed()) stands in for it.
+        const fs::path gameDir = imageRoot / steamgriddb_image_folder_name(name.toStdString());
+        std::error_code ec;
+        const bool hasLocalArt = fs::exists(gameDir, ec);
+        const auto art = [&](const char *type, const char *file) {
+            const QString local = hasLocalArt ? findImagePath(gameDir, type) : QString();
+            return local.isEmpty() ? steamArtUrl(appid, QString::fromLatin1(file)) : local;
+        };
+        QString cover = hasLocalArt ? findImagePath(gameDir, "grid") : QString();
+        if (cover.isEmpty()) {
+            cover = m_ownedArtCache.value(appid).value("cover").toString();
+            // A header.jpg stand-in a week old: SteamGridDB may have a grid now.
+            if (!cover.isEmpty() && !ownedArtCacheIsFresh(appid)
+                && !m_ownedArtAsked.contains(appid)) {
+                m_ownedArtAsked.insert(appid);
+                m_ownedArtQueue.append(appid);
+            }
+            if (cover.isEmpty())
+                cover = steamArtUrl(appid, QStringLiteral("library_600x900.jpg"));
+        }
+
+        const qlonglong seconds = owned.value("playtimeMinutes").toLongLong() * 60;
+
+        QVariantMap row;
+        row["name"]         = name;
+        row["source"]       = QStringLiteral("Steam");
+        row["appid"]        = appid;
+        row["steamAppId"]   = appid;
+        row["installDir"]   = QString();
+        row["gamePath"]     = QString();
+        row["installed"]    = false;
+        // Nothing to launch or uninstall: launchGameFrom() and uninstallGame()
+        // only look in m_internalGames. The details page reads this.
+        row["matched"]      = false;
+        row["notInstalled"] = true;
+        row["coverPath"]    = cover;
+        row["heroPath"]     = art("hero", "library_hero.jpg");
+        row["logoPath"]     = art("logo", "logo.png");
+        row["playtime"]        = formatPlaytimeLabel(seconds);
+        row["playtimeSeconds"] = seconds;
+        row["lastPlayedAt"]    = owned.value("lastPlayed").toLongLong();
+        row["status"]       = get_game_preference(name.toStdString());
+        rows << row;
+    }
+
+    m_ownedSteamGames = rows;
+    emit ownedSteamGamesChanged();
+    pumpOwnedArtLookups();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Covers for owned games Steam's CDN has no library_600x900.jpg for.
+//
+// Driven by the card itself: QML reports a cover that failed to load, and the
+// game moves one step down the chain. Asking up front would be a HEAD per owned
+// game on every rebuild -- hundreds, for the handful that need it.
+// ─────────────────────────────────────────────────────────────────────────────
+fs::path VortexBridge::ownedArtCachePath() const {
+    return m_baseDir / "owned_steam_art.json";
+}
+
+void VortexBridge::loadOwnedArtCache() {
+    m_ownedArtCache.clear();
+    QFile file(pathToQString(ownedArtCachePath()));
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    for (auto it = root.constBegin(); it != root.constEnd(); ++it) {
+        const int appId = it.key().toInt();
+        if (appId > 0 && it.value().isObject())
+            m_ownedArtCache.insert(appId, it.value().toObject().toVariantMap());
+    }
+}
+
+void VortexBridge::saveOwnedArtCache() const {
+    QJsonObject root;
+    for (auto it = m_ownedArtCache.constBegin(); it != m_ownedArtCache.constEnd(); ++it)
+        root.insert(QString::number(it.key()), QJsonObject::fromVariantMap(it.value()));
+    QFile file(pathToQString(ownedArtCachePath()));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}
+
+// SteamGridDB's grid is final. Steam's header.jpg is what was left when
+// SteamGridDB had nothing, and is asked about again once it ages out, on the
+// same clock as live art.
+bool VortexBridge::ownedArtCacheIsFresh(int appId) const {
+    const auto it = m_ownedArtCache.constFind(appId);
+    if (it == m_ownedArtCache.constEnd())
+        return false;
+    if (it.value().value("fromSgdb").toBool())
+        return true;
+    const qint64 at = it.value().value("at").toLongLong();
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    return at > 0 && now >= at && now - at < kLiveArtEmptyRetrySeconds;
+}
+
+QString VortexBridge::ownedSteamCover(int appId) const {
+    return m_ownedCoverOverride.value(appId);
+}
+
+void VortexBridge::ownedSteamCoverFailed(int appId, QString url) {
+    if (appId <= 0 || url.isEmpty())
+        return;
+    const QString header = steamArtUrl(appId, QStringLiteral("header.jpg"));
+    if (url == header)
+        return;   // the end of the chain: the card says NO ART
+
+    // Anything but Steam's own library cover -- SteamGridDB's grid, or a file
+    // under Images/ -- would not load: Steam's header is all that is left.
+    // Not cached, so it is tried again next launch.
+    const QString primary = steamArtUrl(appId, QStringLiteral("library_600x900.jpg"));
+    if (url != primary) {
+        setOwnedSteamCover(appId, header, false, false);
+        return;
+    }
+
+    if (m_ownedArtAsked.contains(appId))
+        return;
+    m_ownedArtAsked.insert(appId);
+
+    // An image that would not load says nothing about why. Only Steam saying
+    // the file is not there sends the game to SteamGridDB; offline, the card
+    // stays as it is and the next failure asks again.
+    if (!m_network)
+        m_network = new QNetworkAccessManager(this);
+    QNetworkRequest request { QUrl(primary) };
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                         QNetworkRequest::NoLessSafeRedirectPolicy);
+    QNetworkReply *reply = m_network->head(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, appId]() {
+        reply->deleteLater();
+        const QNetworkReply::NetworkError error = reply->error();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (error == QNetworkReply::NoError && status == 200)
+            return;   // it is there: a decode hiccup, not a missing cover
+        if (!isDefinitiveMiss(error)) {
+            m_ownedArtAsked.remove(appId);
+            return;
+        }
+        m_ownedArtQueue.append(appId);
+        pumpOwnedArtLookups();
+    });
+}
+
+// Same cap as live art: a library of old games can fail a dozen covers at once.
+void VortexBridge::pumpOwnedArtLookups() {
+    while (m_ownedArtRunning < kMaxLiveArtWorkers && !m_ownedArtQueue.isEmpty()) {
+        ++m_ownedArtRunning;
+        const int appId = m_ownedArtQueue.takeFirst();
+
+        // Blocking WinHTTP, so off the UI thread like pumpLiveArtwork().
+        QThread *thread = QThread::create([this, appId]() {
+            const SgdbArtUrls sgdb = steamgriddb_grid_url_for_steam_app(appId);
+            const QString grid = QString::fromStdString(sgdb.grid);
+            const bool reachable = sgdb.reachable;
+            QMetaObject::invokeMethod(this, [this, appId, grid, reachable]() {
+                --m_ownedArtRunning;
+                if (!grid.isEmpty())
+                    setOwnedSteamCover(appId, grid, true, true);
+                else
+                    // SteamGridDB unreachable: header.jpg for now, uncached,
+                    // so the next launch asks it again.
+                    setOwnedSteamCover(appId,
+                                       steamArtUrl(appId, QStringLiteral("header.jpg")),
+                                       reachable, false);
+                pumpOwnedArtLookups();
+            }, Qt::QueuedConnection);
+        });
+        connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+        thread->start();
+    }
+}
+
+// In place and through artRevision, like updateGameRow(): ownedSteamGamesChanged
+// would hand the grid a new array and throw away the scroll position.
+void VortexBridge::setOwnedSteamCover(int appId, const QString &url, bool definitive,
+                                      bool fromSgdb) {
+    m_ownedCoverOverride.insert(appId, url);
+    if (definitive) {
+        QVariantMap entry;
+        entry["cover"]    = url;
+        entry["fromSgdb"] = fromSgdb;
+        entry["at"]       = QDateTime::currentSecsSinceEpoch();
+        m_ownedArtCache.insert(appId, entry);
+        saveOwnedArtCache();
+    }
+    vlog::line("Artwork", "Steam app " + std::to_string(appId) +
+                          ": no library_600x900.jpg, using " +
+                          (fromSgdb ? "SteamGridDB's grid" : "Steam's header.jpg"));
+
+    for (QVariant &entry : m_ownedSteamGames) {
+        QVariantMap row = entry.toMap();
+        if (row.value("appid").toInt() != appId)
+            continue;
+        row["coverPath"] = url;
+        entry = row;
+    }
+    scheduleArtNotify();
+}
+
+// Asks SteamLogin.qml for a token when there is a session to ask and a reason
+// to: the toggle is on, or the caller insists (a fresh sign-in). A library
+// rarely changes, so between scans it is asked at most every ten minutes.
+void VortexBridge::requestOwnedSteamRefresh(bool force) {
+    if (!m_steamSignedIn || m_ownedFetchInFlight)
+        return;
+    if (!force && !m_showUninstalled)
+        return;
+    constexpr qint64 kMinIntervalMs = 10 * 60 * 1000;
+    if (!force && m_ownedFetchClock.isValid() && m_ownedFetchClock.elapsed() < kMinIntervalMs)
+        return;
+    emit steamTokenWanted();
+}
+
+void VortexBridge::setShowUninstalled(bool enabled) {
+    if (enabled == m_showUninstalled)
+        return;
+    m_showUninstalled = enabled;
+    saveSettings();
+    emit showUninstalledChanged();
+    if (enabled)
+        requestOwnedSteamRefresh(false);
+}
+
+void VortexBridge::setSteamWebToken(QString token) {
+    token = token.trimmed();
+    if (token.isEmpty()) {
+        if (m_steamSignedIn) {
+            m_steamSignedIn = false;
+            saveSettings();
+            vlog::line("Steam", "Store session has no web token -- signed out or expired");
+        }
+        emit steamAccountChanged();
+        return;
+    }
+
+    if (!m_steamSignedIn) {
+        m_steamSignedIn = true;
+        saveSettings();
+    }
+    emit steamAccountChanged();
+    if (m_ownedFetchInFlight)
+        return;
+    m_ownedFetchInFlight = true;
+
+    // Blocking WinHTTP, so off the UI thread like ensureMetadata().
+    const std::string tokenUtf8 = token.toStdString();
+    QThread *thread = QThread::create([this, tokenUtf8]() {
+        std::string error;
+        bool expired = false;
+        const std::vector<SteamOwnedGame> games =
+            fetch_steam_owned_games(tokenUtf8, error, expired);
+
+        QVariantList list;
+        list.reserve(static_cast<int>(games.size()));
+        for (const SteamOwnedGame &game : games) {
+            QVariantMap entry;
+            entry["appid"]           = game.appid;
+            entry["name"]            = QString::fromStdString(game.name);
+            entry["playtimeMinutes"] = static_cast<qlonglong>(game.playtimeMinutes);
+            entry["lastPlayed"]      = static_cast<qlonglong>(game.lastPlayed);
+            list << entry;
+        }
+        const QString errorText = QString::fromStdString(error);
+
+        QMetaObject::invokeMethod(this, [this, list, errorText, expired]() {
+            m_ownedFetchInFlight = false;
+            if (expired) {
+                m_steamSignedIn = false;
+                m_ownedFetchError.clear();
+                saveSettings();
+                vlog::line("Steam", "Owned games: session expired, sign-in needed");
+            } else if (!errorText.isEmpty()) {
+                // Keep showing the cached list; the status line says it is stale.
+                m_ownedFetchError = errorText;
+                vlog::line("Steam", "Owned games: " + errorText.toStdString());
+            } else {
+                m_ownedFetchError.clear();
+                m_ownedFetchClock.start();
+                m_ownedSteamAll = list;
+                saveOwnedSteamCache();
+                vlog::line("Steam", "Owned games: " + std::to_string(list.size()));
+                rebuildOwnedSteamGames();
+            }
+            emit steamAccountChanged();
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+}
+
+void VortexBridge::signOutSteam(QObject *profile) {
+    // Local sign-out: the session's cookies go, so nothing on this machine can
+    // act as the account any more.
+    if (auto *webProfile = qobject_cast<QQuickWebEngineProfile *>(profile))
+        webProfile->cookieStore()->deleteAllCookies();
+
+    m_steamSignedIn = false;
+    m_ownedFetchError.clear();
+    m_ownedFetchClock.invalidate();
+    m_ownedSteamAll.clear();
+    saveOwnedSteamCache();
+    saveSettings();
+    rebuildOwnedSteamGames();
+    emit steamAccountChanged();
+}
+
 // fromLocalFile, not a hand-built "file:///" string, so a '#' or '%' in the
 // path is escaped instead of being read as a fragment or an escape.
 bool VortexBridge::openInstallFolder(QString path) {
@@ -5157,6 +6083,84 @@ bool VortexBridge::renameGame(QString installDir, QString newName) {
                 m_rescanQueued = false;
                 loadGames();
             }
+        }, Qt::QueuedConnection);
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setPlaytime — hours the user played where Vortex could not see.
+//
+// The figure lands in the stats file's baseline, never in playtime_sessions.log:
+// the log stays a record of sessions Vortex actually watched. The recommender
+// reads the baseline through installed_games.txt and turns it into synthetic
+// sessions in the database, so the edit shapes recommendations the same way
+// Steam's imported history does.
+// ─────────────────────────────────────────────────────────────────────────────
+bool VortexBridge::setPlaytime(QString installDir, int hours, int minutes) {
+    // A scan writes stats rows (the Steam import) and a rename moves them to a
+    // new key; an edit under either could land on the wrong row or be undone.
+    if (m_isLoading || m_renamesInFlight > 0 || installDir.isEmpty()
+        || hours < 0 || minutes < 0)
+        return false;
+
+    int index = -1;
+    for (int i = 0; i < static_cast<int>(m_internalGames.size()); ++i) {
+        if (QString::compare(QString::fromStdString(m_internalGames[i].installDir.string()),
+                             installDir, Qt::CaseInsensitive) == 0) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0)
+        return false;
+
+    const BridgeGame &bg = m_internalGames[index];
+    const QString name = QString::fromStdString(bg.name);
+    // A running game records its session on exit; the edit would be computed
+    // against a total about to change.
+    if (m_launchingGames.contains(name) || m_runningGames.contains(name))
+        return false;
+    // The page is showing Steam's live figure, which nothing here can change.
+    if (use_steam_playtime() && bg.source == "Steam")
+        return false;
+
+    const long long target = static_cast<long long>(hours) * 3600
+                             + static_cast<long long>(minutes) * 60;
+    const long long result = set_manual_playtime(makePtKey(bg), bg.name, target);
+
+    if (index < m_gameList.size())
+        m_gameList[index] = buildGameMap(bg);
+    invalidateGameIndex();
+    syncPlayedLedger();
+    emit gameRowChanged(installDir);
+    vlog::line("Library", "playtime of " + bg.name + " set to "
+                          + formatPlaytimeLabel(result).toStdString()
+                          + (result > target ? " (floor: time Vortex recorded)" : ""));
+
+    // installed_games.txt carries the baseline to the database; the sync turns
+    // it into sessions, and only then can a re-rank see it.
+    const fs::path baseDir = m_baseDir;
+    const std::vector<BridgeGame> games = m_internalGames;
+    QThread *thread = QThread::create([this, baseDir, games]() {
+        writeInstalledGames(baseDir, games);
+        bool syncOk = false;
+        if (const std::optional<fs::path> syncScript =
+                existingPath(analyticsDir(baseDir) / "sync_local_data.py")) {
+            QString syncError, syncOutput;
+            syncOk = runPythonScript(*syncScript, &syncError, &syncOutput);
+            vlog::item("Playtime", "sync_local_data.py",
+                       syncOk ? vlog::Status::Ok : vlog::Status::Fail,
+                       syncOk ? syncOutput.trimmed().remove('\r').replace('\n', " | ").toStdString()
+                              : (syncError.isEmpty() ? "no output" : syncError.toStdString()));
+        }
+        QMetaObject::invokeMethod(this, [this, syncOk]() {
+            if (syncOk)
+                loadRecommendations();
+            else
+                setRecommendationStatus("Could not sync play data; recommendations may be stale");
         }, Qt::QueuedConnection);
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);

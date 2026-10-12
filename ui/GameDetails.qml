@@ -54,6 +54,15 @@ Popup {
         && !detailsRoot.gameLaunching && !detailsRoot.gameRunning
         && !!detailsRoot.gameData && !!detailsRoot.gameData.installDir
 
+    // Playtime edit: hours, Tab, minutes. Not for a Steam game showing Steam's
+    // own figure (idleDeducted false), which nothing here can change.
+    property bool editingPlaytime: false
+    readonly property bool editingAny: detailsRoot.editingTitle || detailsRoot.editingPlaytime
+    readonly property bool canEditPlaytime:
+        detailsRoot.canRename && !!detailsRoot.gameData.idleDeducted
+    // Set when an edit clamped up to the time Vortex recorded; cleared by a timer.
+    property string playtimeNote: ""
+
     // Windows' own icon font. Win11 ships Segoe Fluent Icons, Win10 only MDL2;
     // the codepoints are shared.
     readonly property string iconFont:
@@ -143,7 +152,7 @@ Popup {
     }
 
     function beginRename() {
-        if (!detailsRoot.canRename || detailsRoot.editingTitle) return
+        if (!detailsRoot.canRename || detailsRoot.editingAny) return
         detailsRoot.cancelUninstall()
         titleEdit.text = detailsRoot.gameData.name
         detailsRoot.editingTitle = true
@@ -180,11 +189,68 @@ Popup {
             detailsRoot.followRename(installDir)
     }
 
+    function beginPlaytimeEdit() {
+        if (!detailsRoot.canEditPlaytime || detailsRoot.editingAny) return
+        detailsRoot.cancelUninstall()
+        const mins = Math.floor((detailsRoot.gameData.playtimeSeconds || 0) / 60)
+        hoursEdit.text = Math.floor(mins / 60)
+        minutesEdit.text = mins % 60
+        detailsRoot.playtimeNote = ""
+        detailsRoot.editingPlaytime = true
+        hoursEdit.forceActiveFocus()
+        hoursEdit.selectAll()
+    }
+
+    function cancelPlaytime() {
+        detailsRoot.editingPlaytime = false
+    }
+
+    // Focus moving from hours to minutes is not the edit ending, so a lost
+    // focus only commits once neither field has it.
+    function playtimeFocusLost() {
+        Qt.callLater(function() {
+            if (detailsRoot.editingPlaytime && !hoursEdit.activeFocus && !minutesEdit.activeFocus)
+                detailsRoot.commitPlaytime()
+        })
+    }
+
+    function commitPlaytime() {
+        if (!detailsRoot.editingPlaytime) return
+        detailsRoot.editingPlaytime = false
+        if (!detailsRoot.gameData || !detailsRoot.api) return
+        const hours = parseInt(hoursEdit.text, 10) || 0
+        const minutes = Math.min(59, parseInt(minutesEdit.text, 10) || 0)
+        const asked = (hours * 60 + minutes) * 60
+        if (Math.floor(asked / 60) === Math.floor((detailsRoot.gameData.playtimeSeconds || 0) / 60))
+            return
+        const installDir = detailsRoot.gameData.installDir
+        if (!detailsRoot.api.setPlaytime(installDir, hours, minutes)) return
+        const live = detailsRoot.api.gameDetailsForInstallDir(installDir)
+        if (!live || !live.name) return
+        detailsRoot.gameData = live
+        // Never below what Vortex recorded: say so rather than silently
+        // showing a different number than the one typed.
+        if (Math.floor(live.playtimeSeconds / 60) > Math.floor(asked / 60)) {
+            detailsRoot.playtimeNote = "Can't go below the " + live.playtime + " Vortex recorded"
+            playtimeNoteTimer.restart()
+        }
+    }
+
+    Timer {
+        id: playtimeNoteTimer
+        interval: 4000
+        onTriggered: detailsRoot.playtimeNote = ""
+    }
+
     // Back while armed drops the confirm row instead of the whole page; the
     // caller keeps the page open when this returns true.
     function handleBack() {
         if (detailsRoot.editingTitle) {
             detailsRoot.cancelRename()
+            return true
+        }
+        if (detailsRoot.editingPlaytime) {
+            detailsRoot.cancelPlaytime()
             return true
         }
         if (!detailsRoot.uninstallArmed)
@@ -194,7 +260,7 @@ Popup {
     }
 
     function navigate(direction) {
-        if (detailsRoot.editingTitle)
+        if (detailsRoot.editingAny)
             return
         if (detailsRoot.uninstallArmed) {
             // Armed, the pad only picks between DELETE and CANCEL.
@@ -226,7 +292,7 @@ Popup {
     }
 
     function activateFocusedAction() {
-        if (!detailsRoot.gameData || !detailsRoot.api || detailsRoot.editingTitle)
+        if (!detailsRoot.gameData || !detailsRoot.api || detailsRoot.editingAny)
             return
         if (detailsRoot.uninstallArmed) {
             if (detailsRoot.armedChoice === detailsRoot.armedDelete)
@@ -403,10 +469,13 @@ Popup {
     width: parent.width * 0.9; height: parent.height * 0.9
     x: (parent.width - width) / 2; y: (parent.height - height) / 2
     modal: true; focus: true
+    // The launcher shades itself behind the page (ImpactStage.qml); the
+    // popup's own dim snapped on at the click, ahead of that.
+    dim: false
     padding: 0
-    // While the title is being edited, Escape belongs to the input (cancel)
-    // and a click outside only ends the edit.
-    closePolicy: detailsRoot.editingTitle
+    // While the title or playtime is being edited, Escape belongs to the
+    // input (cancel) and a click outside only ends the edit.
+    closePolicy: detailsRoot.editingAny
                  ? Popup.NoAutoClose
                  : Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
@@ -415,6 +484,32 @@ Popup {
         radius: 20
         border.color: Theme.borderQuiet
         border.width: 1
+    }
+
+    // How long the page waits, unseen, before it lands: main.qml sets it to
+    // the moment the launcher behind it has gone black (ImpactStage.qml).
+    property int enterDelay: 0
+
+    // Lands from a touch larger than its resting size on the black, so
+    // it arrives with some weight rather than simply fading up. The fade is
+    // kept fairly short so the backdrop does not show through the text.
+    enter: Transition {
+        SequentialAnimation {
+            PropertyAction { property: "opacity"; value: 0.0 }
+            PropertyAction { property: "scale"; value: 1.06 }
+            PauseAnimation { duration: detailsRoot.enterDelay }
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; to: 1.0; duration: 260; easing.type: Easing.OutCubic }
+                NumberAnimation { property: "scale"; to: 1.0; duration: 420; easing.type: Easing.OutQuint }
+            }
+        }
+    }
+
+    exit: Transition {
+        ParallelAnimation {
+            NumberAnimation { property: "opacity"; to: 0.0; duration: 180; easing.type: Easing.InCubic }
+            NumberAnimation { property: "scale"; to: 0.97; duration: 180; easing.type: Easing.InCubic }
+        }
     }
 
     // ── Reusable bits ───────────────────────────────────────────────────────
@@ -720,11 +815,96 @@ Popup {
                                             color: Theme.textMuted
                                             font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
                                         }
+                                        // Double-click to enter hours played
+                                        // elsewhere: hours, Tab, minutes, Enter.
                                         Text {
+                                            visible: !detailsRoot.editingPlaytime
                                             text: detailsRoot.gameData && detailsRoot.gameData.playtime
                                                   ? detailsRoot.gameData.playtime : "0m"
                                             color: Theme.textSecondary
                                             font.pixelSize: 14
+
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                enabled: detailsRoot.canEditPlaytime
+                                                cursorShape: Qt.IBeamCursor
+                                                onDoubleClicked: detailsRoot.beginPlaytimeEdit()
+                                            }
+                                        }
+
+                                        Row {
+                                            visible: detailsRoot.editingPlaytime
+                                            spacing: 2
+
+                                            TextInput {
+                                                id: hoursEdit
+                                                width: Math.max(16, contentWidth + 2)
+                                                color: Theme.textPrimary
+                                                selectionColor: Theme.accent
+                                                selectedTextColor: Theme.textInverse
+                                                font.pixelSize: 14
+                                                selectByMouse: true
+                                                validator: IntValidator { bottom: 0; top: 99999 }
+                                                KeyNavigation.tab: minutesEdit
+                                                onAccepted: detailsRoot.commitPlaytime()
+                                                onActiveFocusChanged: {
+                                                    if (activeFocus) selectAll()
+                                                    else detailsRoot.playtimeFocusLost()
+                                                }
+                                                Keys.onEscapePressed: function(event) {
+                                                    detailsRoot.cancelPlaytime()
+                                                    event.accepted = true
+                                                }
+                                                Rectangle {
+                                                    anchors { left: parent.left; right: parent.right; top: parent.bottom; topMargin: 1 }
+                                                    height: 2
+                                                    color: Theme.accent
+                                                }
+                                            }
+                                            Text {
+                                                text: "h "
+                                                color: Theme.textSecondary
+                                                font.pixelSize: 14
+                                            }
+                                            TextInput {
+                                                id: minutesEdit
+                                                width: Math.max(16, contentWidth + 2)
+                                                color: Theme.textPrimary
+                                                selectionColor: Theme.accent
+                                                selectedTextColor: Theme.textInverse
+                                                font.pixelSize: 14
+                                                selectByMouse: true
+                                                maximumLength: 2
+                                                validator: IntValidator { bottom: 0; top: 59 }
+                                                KeyNavigation.backtab: hoursEdit
+                                                KeyNavigation.tab: hoursEdit
+                                                onAccepted: detailsRoot.commitPlaytime()
+                                                onActiveFocusChanged: {
+                                                    if (activeFocus) selectAll()
+                                                    else detailsRoot.playtimeFocusLost()
+                                                }
+                                                Keys.onEscapePressed: function(event) {
+                                                    detailsRoot.cancelPlaytime()
+                                                    event.accepted = true
+                                                }
+                                                Rectangle {
+                                                    anchors { left: parent.left; right: parent.right; top: parent.bottom; topMargin: 1 }
+                                                    height: 2
+                                                    color: Theme.accent
+                                                }
+                                            }
+                                            Text {
+                                                text: "m"
+                                                color: Theme.textSecondary
+                                                font.pixelSize: 14
+                                            }
+                                        }
+
+                                        Text {
+                                            visible: detailsRoot.playtimeNote !== ""
+                                            text: detailsRoot.playtimeNote
+                                            color: Theme.textMuted
+                                            font.pixelSize: 12
                                         }
                                     }
                                 }

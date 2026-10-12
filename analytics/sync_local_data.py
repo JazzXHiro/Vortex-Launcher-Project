@@ -59,13 +59,18 @@ def session_uuid(game_key, start, end, duration):
     return str(uuid.uuid5(_NS, f"{game_key}|{start}|{end}|{duration}"))
 
 
-# --- Steam playtime -> derived sessions -------------------------------------
+# --- Unwatched playtime -> derived sessions ---------------------------------
 #
 # Vortex only records sessions it launched itself, so a library played through
 # Steam produced no history at all and the recommender had nothing to learn
 # from. Steam knows the lifetime total and when the game was last played; both
 # are needed, because interest decays with recency and a lifetime figure alone
 # cannot be weighted.
+#
+# The same goes for any play the session log lacks: a launcher's unlogged
+# remainder, or hours the user entered by hand for a console or another PC.
+# The launcher exports exactly that part -- never what the log already holds --
+# with the best date it has, and it is derived here the same way.
 #
 # These rows are INFERRED, not observed. They are marked synthetic=1 in the
 # database and are never written to playtime_sessions.log, which is a record of
@@ -295,8 +300,8 @@ def parse_installed_games():
        resolves to "Neverness to Everness: Dreamwalk Corridor", and no amount
        of canonicalisation bridges that.
 
-    Returns (by_canonical, by_igdb_id), or (None, None) when the file is
-    absent, so callers can tell "nothing installed" apart from "we don't know".
+    Returns (by_canonical, by_igdb_id, playtime), or (None, None, {}) when
+    the file is absent, so callers can tell "nothing installed" apart from "we don't know".
 
     by_igdb_id is what actually closes the gap described above: the launcher
     writes NAME|SOURCE|IGDB_ID and igdb_cache.txt stores the same id against
@@ -306,7 +311,7 @@ def parse_installed_games():
     """
     path = get_file_path("installed_games.txt")
     if not os.path.exists(path):
-        return None, None
+        return None, None, {}
 
     by_canonical = {}
     by_igdb_id = {}
@@ -690,8 +695,8 @@ def sync_data():
         if removed:
             print(f"  removed {removed} duplicate row(s) left by earlier syncs")
 
-    # Games Vortex actually watched. Observed play always wins: once there is
-    # real history for a game, derived rows must not compete with it.
+    # Games Vortex actually watched. A hand mark gives way to them: once there
+    # is real history for a game, an invented row must not compete with it.
     observed_game_ids = {s["game_id"] for s in sessions}
 
     derived = []
@@ -701,8 +706,9 @@ def sync_data():
         if not row:
             continue
         game_id = row[0]
-        if game_id in observed_game_ids:
-            continue
+        # No skip for games Vortex also watched: the launcher exports only the
+        # history its session log does not have, so the two add up rather
+        # than overlap.
         derived.extend(synthesize_steam_sessions(
             game_id, canonical, total_seconds, last_played))
 
@@ -717,21 +723,26 @@ def sync_data():
         manual, game_id_for,
         observed_game_ids | {d["game_id"] for d in derived})
 
-    # Retract marks that were taken back off. Only synthetic rows are looked
-    # at, and only one whose id is exactly the manual id for its own game is
-    # deleted, so Steam-derived sessions can never be caught by this.
-    # A mark on a game Vortex has since watched being played goes too: observed
-    # play always wins, the same rule the Steam-derived rows follow.
-    wanted_manual = {make_canonical(name) for name, _, _ in manual}
+    # Synthetic rows this run did not produce. Two kinds go:
+    #   * a hand mark taken back off, or on a game that now has real or derived
+    #     history -- found by its id, which depends on the game alone;
+    #   * derived rows for a game the launcher still lists, whose exported
+    #     total has since changed. A derived id includes its duration, so a
+    #     re-entered or re-imported total left the old set beside the new one
+    #     and the profile counted both.
+    # Derived rows of an uninstalled game are kept: the launcher no longer
+    # exports its total, and the history did happen.
+    wanted_synthetic = {s["session_id"] for s in derived + manual_rows}
     retracted = 0
-    for session_id, game_id, canonical in cur.execute("""
-            SELECT s.session_id, s.game_id, g.canonical_name
+    for session_id, canonical in cur.execute("""
+            SELECT s.session_id, g.canonical_name
               FROM sessions s JOIN games g ON g.game_id = s.game_id
              WHERE s.synthetic = 1 AND s.user_id = ?
         """, (user_id,)).fetchall():
-        if canonical in wanted_manual and game_id not in observed_game_ids:
+        if session_id in wanted_synthetic:
             continue
-        if session_id == manual_session_uuid(canonical):
+        if (session_id == manual_session_uuid(canonical)
+                or (installed is not None and canonical in installed_canonicals)):
             cur.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
             retracted += 1
 
@@ -765,12 +776,12 @@ def sync_data():
             added.append(s)
 
     if derived:
-        print(f"  derived {len(derived)} sessions from Steam playtime "
+        print(f"  derived {len(derived)} sessions from imported or entered playtime "
               f"for {len({d['game_id'] for d in derived})} games")
 
     if manual_rows or retracted:
         print(f"  {len(manual_rows)} game(s) marked played by hand"
-              + (f", {retracted} unmarked" if retracted else ""))
+              + (f", {retracted} synthetic row(s) retracted" if retracted else ""))
 
     # A retraction removes an engaged session, which always moves the profile;
     # is_material() only ever sees additions.

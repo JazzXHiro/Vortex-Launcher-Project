@@ -36,6 +36,12 @@ struct SteamHeroRequest {
 void ensure_steam_hero_fallback(const std::vector<SteamHeroRequest>& games,
                                 const std::string& images_root);
 
+// Blocking HTTPS GET over WinHTTP. Throws std::runtime_error on a transport
+// failure and "HTTP Error <status>" for anything but a 200. headers is a raw
+// CRLF-separated block, or empty.
+std::string https_get(const std::wstring& host, const std::wstring& path,
+                      const std::wstring& headers);
+
 // Folder name (without the images_root prefix) that holds a game's artwork:
 // "<sanitized game name>_img". Callers that need to find or delete artwork
 // should use this rather than re-deriving the name.
@@ -63,6 +69,11 @@ struct SgdbArtUrls {
   bool reachable = true;
 };
 SgdbArtUrls steamgriddb_art_urls(const std::string& game_name);
+
+// SteamGridDB's portrait grid for one Steam app, looked up by appid -- for an
+// owned game that is not installed and whose library_600x900.jpg Steam's CDN
+// does not have. Only `grid` is filled; `reachable` as above. Blocking.
+SgdbArtUrls steamgriddb_grid_url_for_steam_app(int app_id);
 
 // Deletes the artwork folders of `game_names`, skipping any name that also
 // appears in `keep_names` (compared case-insensitively). Artwork is keyed by

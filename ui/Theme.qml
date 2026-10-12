@@ -128,6 +128,17 @@ QtObject {
     readonly property color steamBg:         "#1b2838"
     readonly property color steamBgPressed:  "#132b45"
     readonly property color steamAccent:     "#66c0f4"
+    // The drive picker's selected row and install button -- Steam's own
+    // install blue.
+    readonly property color installWave:     "#1a9fff"
+    readonly property color installWaveDeep: "#0b5fb0"
+    // The light sweep across a card while Steam downloads it
+    // (InstallSweep.qml): one blue, tinted towards the line and shaded away
+    // from it.
+    readonly property color sweepBlueTint:   "#d4e3ff"
+    readonly property color sweepBlueLight:  "#6ea0ff"
+    readonly property color sweepBlue:       "#1f6bff"
+    readonly property color sweepBlueDeep:   "#0d3a9c"
 
     // ─────────────────────────────────────────────────────────────────────────
     // The wash across the bottom of a card's artwork

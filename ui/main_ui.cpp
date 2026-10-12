@@ -1,3 +1,4 @@
+#include "steam_client_internal.h"
 #include "vortex_bridge.h"
 #include "vortex_log.h"
 #include <QCoreApplication>
@@ -75,5 +76,9 @@ int main(int argc, char *argv[]) {
 
   engine.load(url);
 
-  return app.exec();
+  const int code = app.exec();
+  // Hands the Steam client its pipe back while everything it needs is still
+  // loaded, rather than from a static destructor during process teardown.
+  steam_internal_shutdown();
+  return code;
 }

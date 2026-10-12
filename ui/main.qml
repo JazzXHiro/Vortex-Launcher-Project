@@ -233,6 +233,11 @@ Window {
             }
             return
         }
+        // Modal over everything it can be opened from.
+        if (installPicker.visibleNow) {
+            installPicker.navigate(direction)
+            return
+        }
         // Above the grid, below the details page: the menu only ever opens
         // over the cards, never on top of a page that is already open.
         if (tileMenu.visible) {
@@ -261,6 +266,10 @@ Window {
                 moodOverlay.chooseMood(root.focusedMood)
             return
         }
+        if (installPicker.visibleNow) {
+            installPicker.accept()
+            return
+        }
         if (tileMenu.visible) {
             tileMenu.activateFocused()
             return
@@ -285,6 +294,9 @@ Window {
         if (!game)
             return
 
+        // Whichever page opens, it opens from this card.
+        launcherStage.aimAt(grid.currentItem)
+
         // Browse results open their own page: they are IGDB rows, not games
         // any of the lists GameDetails resolves from would know about.
         if (root.activeTab === "Browse") {
@@ -301,8 +313,9 @@ Window {
 
         // Every tab but Library opens the Browse-style page, by name:
         // Recommendations, Favorites, Wishlist and Played, owned or not. It
-        // shows Play or Check on Steam itself.
-        if (root.activeTab !== "Library") {
+        // shows Play or Check on Steam itself. A NOT INSTALLED library card
+        // goes there too, as the mouse does: it is what offers INSTALL.
+        if (root.activeTab !== "Library" || game.notInstalled === true) {
             browseDetails.focusedAction = 0
             browseDetails.openForGame(name, root.activeTab)
             return
@@ -328,7 +341,7 @@ Window {
     // both. Guarded like the others: whatever is open on top owns the input.
     function controllerPlay() {
         root.padActive = true
-        if (root.padBlocked || moodOverlay.visible
+        if (root.padBlocked || moodOverlay.visible || installPicker.visibleNow
             || detailPopup.visible || tileMenu.visible || browseDetails.visible)
             return
         if (root.activeTab === "Recommendations" || root.activeTab === "Wishlist"
@@ -345,7 +358,7 @@ Window {
     function controllerOptions() {
         root.padActive = true
         if (root.padBlocked || moodOverlay.visible || detailPopup.visible
-            || browseDetails.visible)
+            || browseDetails.visible || installPicker.visibleNow)
             return
         if (tileMenu.visible) {                      // pressing it again closes it
             tileMenu.close()
@@ -369,6 +382,10 @@ Window {
         }
         if (root.padBlocked || moodOverlay.visible)
             return                                   // nothing sits above the mood picker
+        if (installPicker.visibleNow) {
+            installPicker.close()
+            return
+        }
         if (tileMenu.visible) {
             // Back drops the confirm step first, exactly as it does on the
             // details page, and only closes the menu once there is none.
@@ -393,7 +410,7 @@ Window {
             root.activeTab = "Library"
     }
 
-    // LT / RT — step through ALL / STEAM / LOCAL.
+    // LT / RT — step through ALL / STEAM / OTHERS.
     function cycleFilter(step) {
         root.padActive = true
         if (root.activeTab !== "Library" || root.padBlocked
@@ -528,6 +545,12 @@ Window {
     GameDetails {
         id: detailPopup
 
+        // The launcher gives way as the page opens and comes back as it
+        // closes; the page lands on the black (ImpactStage.qml).
+        enterDelay: launcherStage.revealAt
+        onAboutToShow: launcherStage.engage()
+        onAboutToHide: launcherStage.release()
+
         // A heart toggled on this page rebuilds the grid underneath, so this
         // is the last moment the grids' scroll positions are still intact.
         // Both are captured to match browseDetails below; a grid with nothing
@@ -546,6 +569,13 @@ Window {
 
     BrowseDetails {
         id: browseDetails
+
+        onInstallRequested: (appid, name, cover) => installPicker.openFor(appid, name, cover)
+
+        // Same entrance as detailPopup above.
+        enterDelay: launcherStage.revealAt
+        onAboutToShow: launcherStage.engage()
+        onAboutToHide: launcherStage.release()
 
         // Favorites, Wishlist and Played open this page now, and a heart or
         // wishlist toggle on it rebuilds the grid underneath -- the same pin
@@ -567,6 +597,8 @@ Window {
             localFolderDialog.fromSettings = true
             localFolderDialog.open()
         }
+        onRequestSteamSignIn: steamLogin.signIn()
+        onRequestSteamSignOut: steamLogin.signOut()
     }
 
     // Shown once on a fresh install, when no API keys have been entered yet.
@@ -576,6 +608,17 @@ Window {
     // first and the wizard animates over a populated UI, not a black screen.
     FirstRunWizard {
         id: firstRunWizard
+    }
+
+    // The Steam session behind the Library's NOT INSTALLED toggle.
+    SteamLogin {
+        id: steamLogin
+    }
+
+    // INSTALL on a not-installed card, or on its details page: the drive is
+    // picked here and handed to the running Steam, which stays in the tray.
+    InstallPicker {
+        id: installPicker
     }
 
     Component.onCompleted: {
@@ -606,14 +649,6 @@ Window {
     // ─────────────────────────────────────────────────────────────────────────
     // Main content: filter bar + game grid
     // ─────────────────────────────────────────────────────────────────────────
-    // Where the cards' hover glows are drawn (see CoverGlow.qml). Behind the
-    // content and outside every grid, so a glow is never cut off by a grid's
-    // clip and sits under the neighbouring cards rather than over them.
-    Item {
-        id: glowStage
-        anchors.fill: parent
-    }
-
     // The scrolling view on the page showing, and whether it has left the top.
     // Browse's grid is typed Item over there; it is a GridView or the
     // horizontal rail, and the rail never leaves the top.
@@ -625,228 +660,260 @@ Window {
     readonly property bool contentScrolled:
         root.scrollingView !== null && !root.scrollingView.atYBeginning
 
-    // ── Header backdrop ─────────────────────────────────────────────────────
-    //
-    // Window-coloured cover over the tab bar and everything above it, between
-    // the glows and the content. Clear at the top of the page, so the top
-    // row's glow rises softly behind the tabs. Once scrolled, the lit card can
-    // be half under the view's top edge with its whole glow spilling up into
-    // the header -- too strong there -- so the bar goes opaque.
-    //
-    // Down to the bar's bottom, not the scrolling view's top: covering the gap
-    // between them as well cut the glow off well short of the tabs.
-    Rectangle {
-        anchors { left: parent.left; right: parent.right; top: parent.top }
-        height: {
-            root.width; root.height; navBar.y; navBar.height   // dependencies
-            return navBar.mapToItem(null, 0, navBar.height).y
-        }
-        color: Theme.bgWindow
-        visible: opacity > 0
-        opacity: root.contentScrolled ? 1.0 : 0.0
-        Behavior on opacity { NumberAnimation { duration: 200 } }
+    // Everything that makes up the launcher, in one item so a details page
+    // can push it in, blur it and dip it to black as it opens. The pages and
+    // the mood picker stay outside: they are what the launcher gives way to.
+    ImpactStage {
+        id: launcherStage
+        anchors.fill: parent
 
-        // A few pixels of fade below the bar, so the glow stops in a soft
-        // edge rather than a ruled line.
+        // Where the cards' hover glows are drawn (see CoverGlow.qml). Behind the
+        // content and outside every grid, so a glow is never cut off by a grid's
+        // clip and sits under the neighbouring cards rather than over them.
+        Item {
+            id: glowStage
+            anchors.fill: parent
+        }
+
+        // ── Header backdrop ─────────────────────────────────────────────────────
+        //
+        // Window-coloured cover over the tab bar and everything above it, between
+        // the glows and the content. Clear at the top of the page, so the top
+        // row's glow rises softly behind the tabs. Once scrolled, the lit card can
+        // be half under the view's top edge with its whole glow spilling up into
+        // the header -- too strong there -- so the bar goes opaque.
+        //
+        // Down to the bar's bottom, not the scrolling view's top: covering the gap
+        // between them as well cut the glow off well short of the tabs.
         Rectangle {
-            anchors { left: parent.left; right: parent.right; top: parent.bottom }
-            height: 8
-            gradient: Gradient {
-                GradientStop { position: 0.0; color: Theme.bgWindow }
-                GradientStop { position: 1.0; color: "transparent" }
+            anchors { left: parent.left; right: parent.right; top: parent.top }
+            height: {
+                root.width; root.height; navBar.y; navBar.height   // dependencies
+                return navBar.mapToItem(null, 0, navBar.height).y
+            }
+            color: Theme.bgWindow
+            visible: opacity > 0
+            opacity: root.contentScrolled ? 1.0 : 0.0
+            Behavior on opacity { NumberAnimation { duration: 200 } }
+
+            // A few pixels of fade below the bar, so the glow stops in a soft
+            // edge rather than a ruled line.
+            Rectangle {
+                anchors { left: parent.left; right: parent.right; top: parent.bottom }
+                height: 8
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Theme.bgWindow }
+                    GradientStop { position: 1.0; color: "transparent" }
+                }
             }
         }
-    }
 
-    ColumnLayout {
-        id: pageContent
-        anchors.fill: parent
-        anchors.margins: 40
-        spacing: 30
+        ColumnLayout {
+            id: pageContent
+            anchors.fill: parent
+            anchors.margins: 40
+            spacing: 30
 
-        // Top navigation + library filters
-        Rectangle {
-            id: navBar
-            Layout.fillWidth: true
-            Layout.preferredHeight: 35
-            // Clear, so a top-row card's glow shows through behind the tabs
-            // instead of stopping at a hard line along the bar.
-            color: "transparent"
-            z: 10
+            // Top navigation + library filters
+            Rectangle {
+                id: navBar
+                Layout.fillWidth: true
+                Layout.preferredHeight: 35
+                // Clear, so a top-row card's glow shows through behind the tabs
+                // instead of stopping at a hard line along the bar.
+                color: "transparent"
+                z: 10
 
-            RowLayout {
-                anchors.fill: parent
-                spacing: 15
+                RowLayout {
+                    anchors.fill: parent
+                    spacing: 15
 
-            Row {
-                spacing: 10
-                Layout.alignment: Qt.AlignLeft
+                Row {
+                    spacing: 10
+                    Layout.alignment: Qt.AlignLeft
 
-                Repeater {
-                    model: ["Library", "Recommendations", "Browse", "Favorites", "Wishlist", "Played"]
-                    delegate: Rectangle {
-                        id: tabButton
-                        required property string modelData
+                    Repeater {
+                        model: ["Library", "Recommendations", "Browse", "Favorites", "Wishlist", "Played"]
+                        delegate: Rectangle {
+                            id: tabButton
+                            required property string modelData
 
-                        readonly property bool active: root.activeTab === tabButton.modelData
-                        // Hover stops short of the active look, so the two stay
-                        // tellable apart when the mouse is sitting on a tab.
-                        readonly property bool hovered:
-                            tabArea.containsMouse && root.mouseInControl && !tabButton.active
+                            readonly property bool active: root.activeTab === tabButton.modelData
+                            // Hover stops short of the active look, so the two stay
+                            // tellable apart when the mouse is sitting on a tab.
+                            readonly property bool hovered:
+                                tabArea.containsMouse && root.mouseInControl && !tabButton.active
 
-                        // Derived from the label rather than a per-tab special
-                        // case, so adding a tab needs no width bookkeeping.
-                        width: tabLabel.implicitWidth + 44
-                        height: 35
-                        radius: 17
-                        color: tabButton.active ? Theme.accent : (tabButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
-                        border.color: tabButton.hovered ? Theme.borderStrong : Theme.borderControl
+                            // Derived from the label rather than a per-tab special
+                            // case, so adding a tab needs no width bookkeeping.
+                            width: tabLabel.implicitWidth + 44
+                            height: 35
+                            radius: 17
+                            color: tabButton.active ? Theme.accent : (tabButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
+                            border.color: tabButton.hovered ? Theme.borderStrong : Theme.borderControl
 
-                        Behavior on color { ColorAnimation { duration: 150 } }
+                            Behavior on color { ColorAnimation { duration: 150 } }
 
-                        Text {
-                            id: tabLabel
-                            anchors.centerIn: parent
-                            text: tabButton.modelData.toUpperCase()
-                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                            color: tabButton.active ? Theme.textInverse : (tabButton.hovered ? Theme.textBody : Theme.textMuted)
-                        }
+                            Text {
+                                id: tabLabel
+                                anchors.centerIn: parent
+                                text: tabButton.modelData.toUpperCase()
+                                font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                color: tabButton.active ? Theme.textInverse : (tabButton.hovered ? Theme.textBody : Theme.textMuted)
+                            }
 
-                        MouseArea {
-                            id: tabArea
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                root.activeTab = tabButton.modelData
-                                // No reload here — see toggleRecommendations().
-                                if (tabButton.modelData === "Recommendations")
-                                    root.recFocus = "library"
+                            MouseArea {
+                                id: tabArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    root.activeTab = tabButton.modelData
+                                    // No reload here — see toggleRecommendations().
+                                    if (tabButton.modelData === "Recommendations")
+                                        root.recFocus = "library"
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            Item {
-                Layout.fillWidth: true
-            }
-
-            // ─────────────────────────────────────────────────────────────
-            // Scan progress
-            //
-            // This replaced a full-screen 90%-opaque modal overlay. On a
-            // machine with cold caches that overlay sat there for as long as
-            // it took to resolve every title and download every cover, with an
-            // indeterminate spinner and no way to touch anything — the app
-            // looked hung. The scan now publishes titles before it starts
-            // fetching, so the only thing still needed is a quiet indication
-            // that work is ongoing.
-            //
-            // Deliberately small and in the bar rather than over the content:
-            // it reports, it does not interrupt. It disappears the instant
-            // scanActive goes false.
-            // ─────────────────────────────────────────────────────────────
-            Row {
-                id: scanStrip
-                spacing: 10
-                visible: root.api ? root.api.scanActive : false
-                Layout.alignment: Qt.AlignVCenter
-
-                readonly property int done:  root.api ? root.api.scanDone  : 0
-                readonly property int total: root.api ? root.api.scanTotal : 0
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.api ? root.api.scanPhase : ""
-                    color: Theme.textMuted
-                    font.pixelSize: 11
-                    font.bold: true
-                    font.letterSpacing: 1
+                Item {
+                    Layout.fillWidth: true
                 }
 
-                // The count beside it carries the progress; the bar only says
-                // "still working".
-                LoadingBar {
-                    anchors.verticalCenter: parent.verticalCenter
-                    running: scanStrip.visible
+                // ─────────────────────────────────────────────────────────────
+                // Scan progress
+                //
+                // This replaced a full-screen 90%-opaque modal overlay. On a
+                // machine with cold caches that overlay sat there for as long as
+                // it took to resolve every title and download every cover, with an
+                // indeterminate spinner and no way to touch anything — the app
+                // looked hung. The scan now publishes titles before it starts
+                // fetching, so the only thing still needed is a quiet indication
+                // that work is ongoing.
+                //
+                // Deliberately small and in the bar rather than over the content:
+                // it reports, it does not interrupt. It disappears the instant
+                // scanActive goes false.
+                // ─────────────────────────────────────────────────────────────
+                Row {
+                    id: scanStrip
+                    spacing: 10
+                    visible: root.api ? root.api.scanActive : false
+                    Layout.alignment: Qt.AlignVCenter
+
+                    readonly property int done:  root.api ? root.api.scanDone  : 0
+                    readonly property int total: root.api ? root.api.scanTotal : 0
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.api ? root.api.scanPhase : ""
+                        color: Theme.textMuted
+                        font.pixelSize: 11
+                        font.bold: true
+                        font.letterSpacing: 1
+                    }
+
+                    // The count beside it carries the progress; the bar only says
+                    // "still working".
+                    LoadingBar {
+                        anchors.verticalCenter: parent.verticalCenter
+                        running: scanStrip.visible
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: scanStrip.total > 0
+                        text: scanStrip.done + " / " + scanStrip.total
+                        color: Theme.textFaint
+                        font.pixelSize: 11
+                    }
                 }
 
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    visible: scanStrip.total > 0
-                    text: scanStrip.done + " / " + scanStrip.total
-                    color: Theme.textFaint
-                    font.pixelSize: 11
+                // Search within the tab -- not on Recommendations, which is a ranked
+                // list rather than a collection to look things up in. Bound both
+                // ways through root.searchText so a tab switch clears the box.
+                SearchField {
+                    id: librarySearch
+                    Layout.alignment: Qt.AlignVCenter
+                    visible: root.searchable
+                    placeholderText: root.activeTab === "Library"
+                                     ? "Search installed games"
+                                     : "Search " + root.activeTab.toLowerCase()
+                    text: root.searchText
+                    onTextChanged: {
+                        // Equal when the change came down the binding (a tab
+                        // switch clearing it, which stamps for itself) rather
+                        // than from the keyboard.
+                        if (librarySearch.text === root.searchText)
+                            return
+                        // Stamped first, so it is set before the grids rebuild.
+                        root.popStamp = Date.now()
+                        root.searchText = librarySearch.text
+                    }
                 }
-            }
 
-            // Search within the tab -- not on Recommendations, which is a ranked
-            // list rather than a collection to look things up in. Bound both
-            // ways through root.searchText so a tab switch clears the box.
-            SearchField {
-                id: librarySearch
-                Layout.alignment: Qt.AlignVCenter
-                visible: root.searchable
-                placeholderText: root.activeTab === "Library"
-                                 ? "Search installed games"
-                                 : "Search " + root.activeTab.toLowerCase()
-                text: root.searchText
-                onTextChanged: {
-                    // Equal when the change came down the binding (a tab
-                    // switch clearing it, which stamps for itself) rather
-                    // than from the keyboard.
-                    if (librarySearch.text === root.searchText)
-                        return
-                    // Stamped first, so it is set before the grids rebuild.
-                    root.popStamp = Date.now()
-                    root.searchText = librarySearch.text
+                Shortcut {
+                    sequence: "Ctrl+F"
+                    enabled: (root.searchable || root.activeTab === "Browse")
+                             && !detailPopup.visible && !browseDetails.visible
+                             && !moodOverlay.visible
+                    onActivated: root.activeTab === "Browse" ? browsePage.focusSearch()
+                                                             : librarySearch.focusField()
                 }
-            }
 
-            Shortcut {
-                sequence: "Ctrl+F"
-                enabled: (root.searchable || root.activeTab === "Browse")
-                         && !detailPopup.visible && !browseDetails.visible
-                         && !moodOverlay.visible
-                onActivated: root.activeTab === "Browse" ? browsePage.focusSearch()
-                                                         : librarySearch.focusField()
-            }
+                // Sits after the scan strip rather than beside the tabs.
+                // Only one of these three is ever visible at once — filters on
+                // Library, reset on Favorites, refresh on Recommendations — so
+                // they share the same slot on the right.
+                Row {
+                    spacing: 15
+                    Layout.alignment: Qt.AlignVCenter
+                    visible: root.activeTab === "Library"
 
-            // Sits after the scan strip rather than beside the tabs.
-            // Only one of these three is ever visible at once — filters on
-            // Library, reset on Favorites, refresh on Recommendations — so
-            // they share the same slot on the right.
-            Row {
-                spacing: 15
-                Layout.alignment: Qt.AlignVCenter
-                visible: root.activeTab === "Library"
-
-                Repeater {
-                    model: ["All", "Steam", "Local"]
-                    delegate: Rectangle {
+                    // ALL / STEAM / OTHERS as a dropdown: the pill names the
+                    // current filter, the menu below it picks another.
+                    Rectangle {
                         id: filterButton
-                        required property string modelData
 
-                        readonly property bool active: root.activeFilter === filterButton.modelData
+                        // The "Local" filter keeps its id (it matches game.source)
+                        // but reads as "Others" on screen.
+                        function labelFor(f) { return (f === "Local" ? "Others" : f).toUpperCase() }
+
                         readonly property bool hovered:
-                            filterArea.containsMouse && root.mouseInControl && !filterButton.active
+                            filterArea.containsMouse && root.mouseInControl
+                        readonly property bool lit: filterButton.hovered || filterMenu.shown
 
-                        // Hugs its label, like the tab pills above, rather
-                        // than padding every filter out to one fixed width.
-                        width: filterLabel.implicitWidth + 52
+                        width: filterButtonRow.implicitWidth + 40
                         height: 35; radius: 17
-                        color: filterButton.active ? Theme.accent : (filterButton.hovered ? Theme.bgEmphasis : Theme.bgRaised)
-                        border.color: filterButton.hovered ? Theme.borderStrong : Theme.borderControl
+                        color: filterButton.lit ? Theme.bgEmphasis : Theme.bgRaised
+                        border.color: filterButton.lit ? Theme.borderStrong : Theme.borderControl
 
                         Behavior on color { ColorAnimation { duration: 150 } }
 
-                        Text {
-                            id: filterLabel
+                        Row {
+                            id: filterButtonRow
                             anchors.centerIn: parent
-                            text: filterButton.modelData.toUpperCase()
-                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                            color: filterButton.active ? Theme.textInverse : (filterButton.hovered ? Theme.textBody : Theme.textMuted)
+                            spacing: 10
+
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: filterButton.labelFor(root.activeFilter)
+                                font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                color: Theme.textBody
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: String.fromCharCode(0xE70D)   // chevron down
+                                font.family: Qt.fontFamilies().indexOf("Segoe Fluent Icons") >= 0
+                                             ? "Segoe Fluent Icons" : "Segoe MDL2 Assets"
+                                font.pixelSize: 9
+                                color: filterButton.lit ? Theme.textPrimary : Theme.textMuted
+                                rotation: filterMenu.shown ? 180 : 0
+                                Behavior on color { ColorAnimation { duration: 150 } }
+                                Behavior on rotation { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                            }
                         }
 
                         MouseArea {
@@ -854,1532 +921,399 @@ Window {
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.activeFilter = filterButton.modelData
+                            onClicked: filterMenu.open()
                         }
-                    }
-                }
-            }
 
-            // Reset likes — empties the taste profile the recommender ranks
-            // from, for a clean start. Not undoable, so it arms first rather
-            // than firing on one click, the same two-step the folder removal in
-            // SettingsWindow uses. Hidden with nothing to clear.
-            Row {
-                id: resetLikesRow
-                spacing: 8
-                readonly property bool hasFavorites:
-                    root.api && root.api.favoriteGames && root.api.favoriteGames.length > 0
-
-                visible: root.activeTab === "Favorites" && resetLikesRow.hasFavorites
-                // Covers both leaving the tab and clearing the last favourite,
-                // so the confirm step is never left armed for a later visit.
-                onVisibleChanged: if (!resetLikesRow.visible) root.resetLikesArmed = false
-
-                Rectangle {
-                    id: resetLikesButton
-                    readonly property bool hovered: resetLikesArea.containsMouse && root.mouseInControl
-
-                    width: 150; height: 35; radius: 17
-                    visible: !root.resetLikesArmed
-                    color: resetLikesButton.hovered ? Theme.accent : Theme.bgRaised
-                    border.color: resetLikesButton.hovered ? Theme.focusRing : Theme.borderControl
-
-                    Behavior on color { ColorAnimation { duration: 150 } }
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: "RESET LIKES"
-                        font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                        color: resetLikesButton.hovered ? Theme.textInverse : Theme.textMuted
-                    }
-
-                    MouseArea {
-                        id: resetLikesArea
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.resetLikesArmed = true
-                    }
-                }
-
-                Rectangle {
-                    id: confirmResetButton
-                    width: 170; height: 35; radius: 17
-                    visible: root.resetLikesArmed
-                    color: confirmResetArea.containsMouse ? Theme.danger : Theme.dangerRest
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: "CLEAR ALL LIKES"
-                        color: Theme.textPrimary; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                    }
-
-                    MouseArea {
-                        id: confirmResetArea
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            root.resetLikesArmed = false
-                            if (root.api)
-                                root.api.resetPreferences()
-                        }
-                    }
-                }
-
-                Rectangle {
-                    id: cancelResetButton
-                    width: 100; height: 35; radius: 17
-                    visible: root.resetLikesArmed
-                    color: cancelResetArea.containsMouse ? Theme.bgEmphasis : "transparent"
-                    border.color: Theme.borderControl; border.width: 1
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: "CANCEL"
-                        color: Theme.textSecondary; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                    }
-
-                    MouseArea {
-                        id: cancelResetArea
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.resetLikesArmed = false
-                    }
-                }
-            }
-
-            // Settings — full directory management lives here.
-            Rectangle {
-                id: settingsButton
-                readonly property bool hovered: settingsArea.containsMouse && root.mouseInControl
-
-                implicitWidth: 35; implicitHeight: 35; radius: 17
-                // Not the accent fill on hover: the accent is white, and so is the icon.
-                color: settingsButton.hovered ? Theme.bgEmphasis : Theme.bgRaised
-                border.color: settingsButton.hovered ? Theme.focusRing : Theme.borderControl
-
-                onHoveredChanged: if (hovered && !settingsIcon.running) settingsIcon.restart()
-
-                // 180 frames at 60 fps, 56 px cells on a 15x12 sheet (2x for HiDPI).
-                // One full roll per hover; it finishes even if the pointer leaves.
-                AnimatedSprite {
-                    id: settingsIcon
-                    anchors.centerIn: parent
-                    width: 28; height: 28
-                    source: "assets/settings_roll.png"
-                    frameWidth: 56; frameHeight: 56
-                    frameCount: 180
-                    frameRate: 60
-                    loops: 1
-                    running: false
-                    interpolate: false
-                    smooth: true
-                }
-
-                MouseArea {
-                    id: settingsArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: settingsWindow.open()
-                }
-            }
-
-            Rectangle {
-                id: refreshButton
-                readonly property bool hovered: refreshRecommendationArea.containsMouse && root.mouseInControl
-
-                implicitWidth: 120; implicitHeight: 35; radius: 17
-                visible: root.activeTab === "Recommendations"
-                color: refreshButton.hovered ? Theme.accent : Theme.bgRaised
-                border.color: refreshButton.hovered ? Theme.focusRing : Theme.borderControl
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "REFRESH"
-                    font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
-                    color: refreshButton.hovered ? Theme.textInverse : Theme.textMuted
-                }
-
-                MouseArea {
-                    id: refreshRecommendationArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: if (root.api) root.api.loadRecommendations()
-                }
-            }
-            }
-        }
-
-        StackLayout {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            // Library, Favorites and Played share page 0 — same cards,
-            // different model.
-            currentIndex: root.activeTab === "Recommendations" ? 1
-                        : root.activeTab === "Wishlist" ? 2
-                        : root.activeTab === "Browse" ? 3 : 0
-
-            // Game grid
-            GridView {
-                id: gameGrid
-                clip: true
-                // Elastic gutters. A GridView fits floor(width/cellWidth)
-                // columns and abandons the remainder at the right edge -- a
-                // whole card's width of dead space at some sizes. Taking the
-                // count from a minimum and dividing the width back out spends
-                // the remainder on the gutters instead, and the card itself
-                // never changes size.
-                //
-                // 280 rather than 300: the minimum only decides how many
-                // columns fit, and 300 was one short on a 1536-wide desktop --
-                // four columns with 124px between them. 280 buys the fifth and
-                // pulls the gutters back to ~51.
-                readonly property int minCellWidth: 280
-                readonly property int columns:
-                    Math.max(1, Math.floor(gameGrid.width / gameGrid.minCellWidth))
-
-                cellWidth: gameGrid.width > 0
-                           ? Math.floor(gameGrid.width / gameGrid.columns)
-                           : gameGrid.minCellWidth
-                cellHeight: 440
-
-                // Two rows built ahead of the viewport each way, and cards that
-                // leave it are pooled and handed the next row instead of being
-                // destroyed. Without either, a fast fling built every card --
-                // forty-odd objects and a library lookup each -- in the frame
-                // its row came into view, which is the stutter. The buffer is
-                // incubated across frames; see the delegate's onPooled /
-                // onReused for what a recycled card has to reset.
-                cacheBuffer: gameGrid.cellHeight * 2
-                reuseItems: true
-
-                ScrollBar.vertical: VortexScrollBar { }
-                WheelScroller { view: gameGrid }
-
-                // No current item until the pad asks for one. A model reload
-                // (first scan, filter change) puts it back to -1 for the mouse,
-                // and back onto the first card once the pad is in use.
-                currentIndex: -1
-                Text {
-                    anchors.centerIn: parent
-                    visible: gameGrid.count === 0 && root.searchText.trim() !== ""
-                    text: "NO MATCHES FOR \u201C" + root.searchText.trim() + "\u201D"
-                    width: gameGrid.width - 80
-                    horizontalAlignment: Text.AlignHCenter
-                    elide: Text.ElideMiddle
-                    color: Theme.textGhost
-                    font.pixelSize: 16
-                    font.bold: true
-                    font.letterSpacing: 2
-                }
-
-                Text {
-                    anchors.centerIn: parent
-                    visible: gameGrid.count === 0 && root.activeTab === "Favorites"
-                             && root.searchText.trim() === ""
-                    text: "NO FAVORITES YET\nOpen a game and tap the heart"
-                    horizontalAlignment: Text.AlignHCenter
-                    color: Theme.textGhost
-                    font.pixelSize: 16
-                    font.bold: true
-                    font.letterSpacing: 2
-                }
-
-                Text {
-                    anchors.centerIn: parent
-                    visible: gameGrid.count === 0 && root.activeTab === "Played"
-                             && root.searchText.trim() === ""
-                    text: "NOTHING PLAYED YET\nLaunch a game and it lands here for good"
-                    horizontalAlignment: Text.AlignHCenter
-                    color: Theme.textGhost
-                    font.pixelSize: 16
-                    font.bold: true
-                    font.letterSpacing: 2
-                }
-
-                // Where to put the grid back after the details page changes
-                // a list it is showing.
-                //
-                // Favorites and Played are derived lists: a heart moving
-                // rebuilds them, GridView is handed a new JS array and answers
-                // by dropping the scroll position. The Library escapes this
-                // because the bridge patches gameList in place (see
-                // updatePreference), which a derived list cannot do.
-                //
-                // Captured when the details page opens rather than when the
-                // change lands -- by then the old position is already gone --
-                // and re-asserted rather than applied once, because
-                // contentHeight is not final when countChanged fires. Safe to
-                // re-assert: the page is modal, so nothing can scroll the grid
-                // while a value is pending. -1 means nothing is.
-                property real restoreY: -1
-
-                function restoreScroll() {
-                    if (gameGrid.restoreY < 0)
-                        return
-                    gameGrid.contentY = Math.max(0, Math.min(
-                        gameGrid.restoreY,
-                        gameGrid.contentHeight - gameGrid.height))
-                }
-
-                onContentHeightChanged: gameGrid.restoreScroll()
-
-                onCountChanged: {
-                    gameGrid.restoreScroll()
-
-                    if (!root.padActive || gameGrid.count === 0)
-                        gameGrid.currentIndex = -1
-                    else if (gameGrid.currentIndex < 0)
-                        gameGrid.currentIndex = 0
-                }
-
-                // Favorites is the library grid with a different model rather
-                // than a second copy of the card markup.
-                model: {
-                    if (!root.api) return [];
-                    let list;
-                    if (root.activeTab === "Favorites")
-                        list = root.api.favoriteGames || [];
-                    // Everything ever played, installed or not. Comes from the
-                    // bridge already ordered and de-duplicated -- see
-                    // VortexBridge::playedGames().
-                    else if (root.activeTab === "Played")
-                        list = root.api.playedGames || [];
-                    else if (!root.api.gameList)
-                        list = [];
-                    else if (root.activeFilter === "All")
-                        list = root.api.gameList;
-                    else
-                        list = root.api.gameList.filter(function(game) {
-                            return game.source === root.activeFilter;
-                        });
-
-                    if (root.searchText.trim() === "")
-                        return list;
-                    // The live title as well as the snapshot's: pass 2 renames
-                    // a local game in place without republishing the list, so
-                    // the card can show a name modelData never had (see
-                    // liveDetails below).
-                    return list.filter(function(game) {
-                        const live = game.installDir
-                            ? root.api.gameDetailsForInstallDir(game.installDir) : null;
-                        return root.matchesSearch([game.name, live ? live.name : ""]);
-                    });
-                }
-
-                delegate: Item {
-                    id: gameDelegate
-                    required property var modelData
-                    required property int index
-
-                    // Mouse hover and controller focus light the card the same
-                    // way, but only whichever input is currently driving.
-                    //
-                    // The overflow button and the play button both count as
-                    // being on the card. They sit above cardArea and take the
-                    // hover off it, and since both only show while the card is
-                    // lit, leaving either out made the two chase each other:
-                    // hover the button, the card unlights, the button vanishes,
-                    // the card lights again.
-                    readonly property bool highlighted:
-                        ((cardArea.containsMouse || overflowArea.containsMouse
-                          || playArea.containsMouse)
-                         && root.mouseInControl)
-                        || (gameDelegate.GridView.isCurrentItem && root.padInControl)
-
-                    // The live row for this card, re-read whenever the scan
-                    // publishes something new.
-                    //
-                    // Keyed on installDir, NOT on name. The scan publishes
-                    // titles in pass 1 and only then resolves them against
-                    // IGDB, and for a local game the canonical title replaces
-                    // the folder name the card was published under. It updates
-                    // the row in place and bumps artRevision instead of
-                    // re-emitting gameListChanged, precisely so the grid is NOT
-                    // rebuilt and the user's scroll position survives -- which
-                    // means modelData here is a stale snapshot whose name may
-                    // no longer match any live row. installDir is fixed at scan
-                    // time, so it still does.
-                    readonly property var liveDetails: {
-                        if (!root.api) return null
-                        const _ = root.api.artRevision   // dependency, deliberate
-                        const byDir = root.api.gameDetailsForInstallDir(
-                                          gameDelegate.modelData.installDir || "")
-                        if (byDir && byDir.name) return byDir
-                        // Nothing with that install directory (a favourite
-                        // built from a different source, say): the title is the
-                        // only key left.
-                        return root.api.gameDetailsFor(gameDelegate.modelData.name)
-                    }
-
-                    // Canonical title once resolved, falling back to whatever
-                    // the card was published with.
-                    readonly property string liveName:
-                        (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
-                            ? gameDelegate.liveDetails.name
-                            : (gameDelegate.modelData.name || "")
-
-                    // The three facts the caption under the title carries.
-                    // Same live-row-first rule as liveName above: a session that
-                    // just ended shows its new total without a rescan.
-                    readonly property string playtimeLabel:
-                        (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
-                            ? gameDelegate.liveDetails.playtime
-                            : (gameDelegate.modelData.playtime || "0m")
-
-                    // Live row first, like liveName and playtimeLabel above.
-                    // modelData is the snapshot the card was published with, and
-                    // during a cold scan that snapshot carries "Unknown" for
-                    // every metadata slot until IGDB resolves the title. Reading
-                    // it directly meant the caption stayed blank until something
-                    // rebuilt the grid; through liveDetails it fills itself in
-                    // as the scan lands, which is what artRevision is for.
-                    readonly property string sourceLabel:
-                        (gameDelegate.liveDetails && gameDelegate.liveDetails.source)
-                            ? gameDelegate.liveDetails.source
-                            : (gameDelegate.modelData.source || "")
-
-                    readonly property bool fromSteam:
-                        gameDelegate.sourceLabel === "Steam"
-
-                    // A Local row the EA app launches. Live row first, as
-                    // sourceLabel reads it.
-                    readonly property bool fromEa:
-                        (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
-                            ? gameDelegate.liveDetails.isEa === true
-                            : gameDelegate.modelData.isEa === true
-
-                    // A Local row the Riot Client launches, read the same way.
-                    readonly property bool fromRiot:
-                        (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
-                            ? gameDelegate.liveDetails.isRiot === true
-                            : gameDelegate.modelData.isRiot === true
-
-                    // applyGameMetadata() hands over the whole comma-separated
-                    // list ("Role-playing (RPG), Simulator, Strategy"); only the
-                    // first one fits under a 240px card.
-                    //
-                    // IGDB spells its genres out in full, and the long ones
-                    // elide mid-word into "Role-playing (RP..." at this width.
-                    // Where it carries an abbreviation in brackets that is both
-                    // shorter and what anyone actually calls the genre, so
-                    // prefer it: "Role-playing (RPG)" reads as "RPG".
-                    readonly property string genreLabel: {
-                        const live = gameDelegate.liveDetails
-                        const g = ((live && live.genres)
-                                   ? live.genres
-                                   : gameDelegate.modelData.genres) || ""
-                        if (g === "" || g === "Unknown") return ""
-                        const first = g.split(",")[0].trim()
-                        const abbreviated = first.match(/\(([^)]+)\)/)
-                        return abbreviated ? abbreviated[1] : first
-                    }
-
-                    // Launching something that is not on the disk fails with
-                    // nothing to show for it. Played holds uninstalled games,
-                    // and so does Favorites -- a hearted Discover pick, or a
-                    // played game since removed. Library rows are all installed.
-                    readonly property bool launchable:
-                        (root.activeTab !== "Played" && root.activeTab !== "Favorites")
-                        || gameDelegate.modelData.installed === true
-
-                    // 415, not the old 400: the caption line is the fourth row
-                    // of text the comment on the badges below used to rule out.
-                    // cellHeight is 440 and already had the room.
-                    //
-                    // The extra 16 each way is room for the hover scale. The
-                    // card grows 1.04x about its centre -- ~5px past each side,
-                    // ~7px past the top -- and a delegate exactly the card's
-                    // size put the first column flush with the grid's clipped
-                    // left edge and the first row with its top, so both lost a
-                    // sliver on hover. Centring the card in 256x431 keeps 8px
-                    // clear all round and still fits the 440 cell.
-                    width: 256; height: 431
-
-                    // A fresh search answer or tab: rise and fade in, a beat
-                    // after the card before it, as Browse's results do. Cards
-                    // already up when the stamp lands replay too -- going back
-                    // to Library does not rebuild its grid. Counted from the
-                    // first row in view, so a scrolled grid does not wait out
-                    // the cards above it.
-                    transform: Translate { id: gameEnterShift }
-                    function popIn() {
-                        const firstShown = Math.floor(gameGrid.contentY / gameGrid.cellHeight)
-                                           * gameGrid.columns
-                        gameEnterPause.duration =
-                            Math.max(0, Math.min(gameDelegate.index - firstShown, 12)) * 40
-                        gameEnterAnim.stop()
-                        gameDelegate.opacity = 0
-                        gameEnterShift.y = 18
-                        gameEnterAnim.start()
-                    }
-                    Component.onCompleted: {
-                        if (Date.now() - root.popStamp <= 250)
-                            gameDelegate.popIn()
-                    }
-
-                    // reuseItems: a card scrolled out is parked here and later
-                    // handed another row rather than rebuilt, so neither
-                    // Component.onCompleted nor a fresh set of property defaults
-                    // happens again. Park it at rest -- no half-played pop-in,
-                    // no glow armed for the old cover -- and on reuse do what
-                    // onCompleted would have.
-                    property bool pooled: false
-                    GridView.onPooled: {
-                        gameDelegate.pooled = true
-                        gameEnterAnim.stop()
-                        gameDelegate.opacity = 1.0
-                        gameEnterShift.y = 0
-                        gameGlow.armed = false
-                    }
-                    GridView.onReused: {
-                        gameDelegate.pooled = false
-                        if (Date.now() - root.popStamp <= 250)
-                            gameDelegate.popIn()
-                    }
-
-                    Connections {
-                        target: root
-                        enabled: !gameDelegate.pooled
-                        function onPopStampChanged() {
-                            if (root.activeTab === "Library" || root.activeTab === "Favorites"
-                                || root.activeTab === "Played")
-                                gameDelegate.popIn()
-                        }
-                    }
-                    SequentialAnimation {
-                        id: gameEnterAnim
-                        PauseAnimation { id: gameEnterPause }
-                        ParallelAnimation {
-                            NumberAnimation {
-                                target: gameDelegate; property: "opacity"
-                                to: 1.0; duration: 380; easing.type: Easing.OutCubic
-                            }
-                            NumberAnimation {
-                                target: gameEnterShift; property: "y"
-                                to: 0; duration: 380; easing.type: Easing.OutCubic
-                            }
-                        }
-                    }
-
-                    // Started by the card's own PLAY button and, for the pad,
-                    // by root.controllerPlay() reaching through currentItem --
-                    // the same shape as openTileMenu() below, and for the same
-                    // reason: the delegate is what knows whether this row can
-                    // be launched and what it is actually called.
-                    function play() {
-                        if (!gameDelegate.launchable)
-                            return
-                        root.playGame(gameDelegate.liveName)
-                    }
-
-                    // Opened by the card's own button and, for the pad, by
-                    // root.controllerOptions() reaching through currentItem.
-                    function openTileMenu() {
-                        tileMenu.openFor(overflowButton, gameDelegate.liveName,
-                                         gameDelegate.modelData.installDir || "",
-                                         gameDelegate.launchable,
-                                         gameDelegate.sourceLabel === "Local",
-                                         // Not on an uninstalled Favorites row.
-                                         !(root.activeTab === "Favorites"
-                                           && gameDelegate.modelData.installed !== true))
-                    }
-
-                    // Drawn on root's glowStage, behind the page: see
-                    // CoverGlow.qml.
-                    CoverGlow {
-                        id: gameGlow
-                        target: capsuleContainer
-                        stage: glowStage
-                        source: gameCover
-                        lit: gameDelegate.highlighted
-                    }
-
-                    Column {
-                        anchors.centerIn: parent
-                        spacing: 12
-                        // Above cardArea, so the play button drawn on the
-                        // artwork can take its own clicks. Nothing else in here
-                        // holds a MouseArea, so the card stays clickable
-                        // everywhere the button is not.
-                        z: 1
-
-                        Rectangle {
-                            id: capsuleContainer
-                            width: 240; height: 360
-                            color: Theme.bgRaised; radius: 8
-                            // No focus ring: the lift, the glow and the control
-                            // row already mark the lit card.
-                            border.color: Theme.borderControl
-                            border.width: 2; clip: true
-
-                            // See RoundedCorners.qml.
-                            layer.enabled: true
-                            layer.smooth: true
-                            layer.effect: RoundedCorners { radius: capsuleContainer.radius }
-
-                            Image {
-                                id: gameCover
-                                anchors.fill: parent
-
-                                // Read through the bridge rather than straight
-                                // off modelData, because artwork arrives after
-                                // this card already exists. Falls back to the
-                                // snapshot so an already-cached cover still
-                                // shows on the very first frame.
-                                source: (gameDelegate.liveDetails && gameDelegate.liveDetails.coverPath)
-                                        ? gameDelegate.liveDetails.coverPath
-                                        : (gameDelegate.modelData.coverPath || "")
-                                fillMode: Image.PreserveAspectCrop
-
-                                // Decoded off the UI thread, and at the card's
-                                // size. The covers are 600x900 (SteamGridDB's
-                                // grid size, larger for some local art), and a
-                                // full synchronous decode per card stalled the
-                                // frame each new row scrolled in on. With both
-                                // dimensions set, PreserveAspectCrop scales to
-                                // cover and crops, same as it draws; Qt applies
-                                // the device pixel ratio itself.
-                                asynchronous: true
-                                sourceSize.width: capsuleContainer.width
-                                sourceSize.height: capsuleContainer.height
-
-                                opacity: status === Image.Ready ? 1.0 : 0.0
-                                Behavior on opacity { NumberAnimation { duration: 250 } }
-                            }
-
-                            // Only for a card with no art at all. Not merely
-                            // "not Ready": an asynchronous cover is Loading for a
-                            // few frames, and NO ART flashed on every card that
-                            // scrolled in.
-                            Column {
-                                anchors.centerIn: parent; spacing: 10
-                                visible: gameCover.status === Image.Null
-                                         || gameCover.status === Image.Error
-                                Text { text: "NO ART"; color: Theme.textGhost; font.bold: true }
-                            }
-
-                            // ── Focus treatment ───────────────────────
-                            //
-                            // The strip and the play button arrive with the
-                            // overflow button, on the same condition, so the
-                            // whole card resolves in one step.
-                            //
-                            // The playtime pill and the INSTALLED badge used to
-                            // live down here. They are in the caption now, which
-                            // is what freed the bottom of the cover.
-                            Item {
-                                // Flush with the capsule's own edges rather
-                                // than the content box inside its border: the
-                                // strip is meant to read as the bottom of the
-                                // card, so it spans the full width and sits on
-                                // the bottom edge. It paints over the border
-                                // along the way, which its 0.5 opacity lets
-                                // through.
-                                anchors.fill: parent
-
-                                visible: opacity > 0
-                                opacity: (gameDelegate.highlighted
-                                          || overflowButton.menuOpen) ? 1.0 : 0.0
-                                Behavior on opacity { NumberAnimation { duration: 150 } }
-
-                                // The canvas blurs this strip, but a CSS filter
-                                // blurs the element's own content rather than
-                                // the backdrop, and the content is a smooth
-                                // gradient -- so the blur is very nearly a
-                                // no-op and a plain Rectangle stands in for it.
-                                // Worth the substitution: a MultiEffect here
-                                // would cost a framebuffer on every card in the
-                                // grid to soften two edges.
-                                Rectangle {
-                                    id: focusScrim
-                                    anchors {
-                                        left: parent.left
-                                        right: parent.right
-                                        bottom: parent.bottom
-                                    }
-                                    height: 140
-
-                                    // Square: the capsule's mask rounds it along
-                                    // with the art, and rounding it separately
-                                    // would leave a crescent of bare art at the
-                                    // corners.
-
-                                    // Transparent at the top so the cover reads
-                                    // straight into the wash, solid at the
-                                    // bottom so the pill has full contrast under
-                                    // it. No blanket opacity: the fade is in the
-                                    // gradient, which keeps the bottom edge
-                                    // properly opaque instead of leaving bright
-                                    // artwork showing through it.
-                                    gradient: Gradient {
-                                        GradientStop { position: 0.0; color: "transparent" }
-                                        GradientStop { position: 1.0; color: Theme.artScrim }
-                                    }
+                        Popup {
+                            id: filterMenu
+                            // True from the moment it starts opening until it starts
+                            // closing, so the chevron turns with the menu, not after.
+                            property bool shown: false
+                            onAboutToShow: filterMenu.shown = true
+                            onAboutToHide: filterMenu.shown = false
+
+                            x: 0
+                            y: filterButton.height + 6
+                            width: Math.max(filterButton.width, 160)
+                            padding: 6
+                            transformOrigin: Popup.TopLeft
+
+                            // Modal so the click that closes it is consumed -- a press
+                            // on the pill then shuts the menu instead of reopening it.
+                            modal: true
+                            dim: false
+                            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+                            enter: Transition {
+                                ParallelAnimation {
+                                    NumberAnimation { property: "opacity"; from: 0; to: 1; duration: 160; easing.type: Easing.OutCubic }
+                                    NumberAnimation { property: "scale"; from: 0.94; to: 1; duration: 160; easing.type: Easing.OutCubic }
                                 }
+                            }
+                            exit: Transition {
+                                ParallelAnimation {
+                                    NumberAnimation { property: "opacity"; to: 0; duration: 110; easing.type: Easing.InCubic }
+                                    NumberAnimation { property: "scale"; to: 0.97; duration: 110; easing.type: Easing.InCubic }
+                                }
+                            }
 
-                                // The white pill, in the bottom-left corner with
-                                // the overflow button opposite it: one control
-                                // row along the foot of the cover, sitting on
-                                // the solid end of the gradient, which is what
-                                // gives the white its contrast.
-                                Rectangle {
-                                    id: playButton
-                                    readonly property bool hovered:
-                                        playArea.containsMouse && root.mouseInControl
+                            background: Rectangle {
+                                color: Theme.bgSurface
+                                radius: 10
+                                border.color: Theme.borderControl
+                                border.width: 1
+                            }
 
-                                    anchors.left: parent.left
-                                    anchors.bottom: parent.bottom
-                                    anchors.leftMargin: 16
-                                    anchors.bottomMargin: 10
-                                    width: 96; height: 38; radius: 19
+                            contentItem: Column {
+                                Repeater {
+                                    model: root.filters
+                                    delegate: Rectangle {
+                                        id: filterRow
+                                        required property string modelData
+                                        readonly property bool active: root.activeFilter === filterRow.modelData
 
-                                    // Nothing to launch on a Played row whose
-                                    // files are gone; the strip still reads fine
-                                    // without it.
-                                    visible: gameDelegate.launchable
-
-                                    color: playButton.hovered ? Theme.playHover : Theme.accent
-                                    Behavior on color { ColorAnimation { duration: 120 } }
-
-                                    Row {
-                                        anchors.centerIn: parent
-                                        spacing: 8
-
-                                        // Same asset as the details pages' PLAY.
-                                        // Decoded at twice the drawn size so it
-                                        // stays sharp on a scaled display.
-                                        Image {
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            source: playButton.hovered ? "assets/play_hover.png" : "assets/play.png"
-                                            sourceSize.width: 20
-                                            sourceSize.height: 20
-                                            width: 10; height: 10
-                                            fillMode: Image.PreserveAspectFit
-                                            smooth: true
-                                        }
+                                        width: filterMenu.availableWidth
+                                        height: 36
+                                        radius: 6
+                                        color: filterRowArea.containsMouse ? Theme.bgActive : "transparent"
+                                        Behavior on color { ColorAnimation { duration: 120 } }
 
                                         Text {
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            text: "PLAY"
-                                            color: playButton.hovered ? Theme.textPrimary : Theme.textInverse
-                                            font.pixelSize: 12
-                                            font.bold: true
-                                            font.letterSpacing: 1.5
+                                            anchors { left: parent.left; leftMargin: 12; verticalCenter: parent.verticalCenter }
+                                            text: filterButton.labelFor(filterRow.modelData)
+                                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                            color: filterRow.active ? Theme.accent
+                                                 : (filterRowArea.containsMouse ? Theme.textPrimary : Theme.textMuted)
                                         }
-                                    }
+                                        Text {
+                                            anchors { right: parent.right; rightMargin: 12; verticalCenter: parent.verticalCenter }
+                                            visible: filterRow.active
+                                            text: String.fromCharCode(0xE73E)   // checkmark
+                                            font.family: Qt.fontFamilies().indexOf("Segoe Fluent Icons") >= 0
+                                                         ? "Segoe Fluent Icons" : "Segoe MDL2 Assets"
+                                            font.pixelSize: 12
+                                            color: Theme.accent
+                                        }
 
-                                    MouseArea {
-                                        id: playArea
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: gameDelegate.play()
-                                    }
-                                }
-
-                                // ── Overflow button ─────────────────────────
-                                //
-                                // Bottom-right, level with the play pill. Lives
-                                // on the art rather than over the delegate so it
-                                // scales with the cover and stays in line with
-                                // the pill; the Column's z keeps it above
-                                // cardArea for clicks, as it does the pill.
-                                //
-                                // Just the dots, no disc behind them.
-                                Item {
-                                    id: overflowButton
-                                    readonly property bool hovered:
-                                        overflowArea.containsMouse && root.mouseInControl
-                                    // While its own menu is open the menu's first
-                                    // cell stands in for this button, so it steps
-                                    // aside rather than being caught in the menu's
-                                    // frosted backdrop as a smeared grey disc.
-                                    readonly property bool menuOpen:
-                                        tileMenu.visible
-                                        && tileMenu.gameName === gameDelegate.liveName
-
-                                    anchors.right: parent.right
-                                    anchors.verticalCenter: playButton.verticalCenter
-                                    anchors.rightMargin: 10
-                                    width: 38; height: 38
-
-                                    opacity: overflowButton.menuOpen ? 0.0 : 1.0
-                                    Behavior on opacity { NumberAnimation { duration: 150 } }
-
-                                    // Drawn rather than typed: the ⋮ glyph renders
-                                    // at a different weight and baseline in every
-                                    // font, and the rest of this UI has no font
-                                    // family set at all.
-                                    Column {
-                                        anchors.centerIn: parent
-                                        spacing: 3
-                                        Repeater {
-                                            model: 3
-                                            Rectangle {
-                                                width: 4; height: 4; radius: 2
-                                                color: overflowButton.hovered ? Theme.accent : Theme.bgDot
+                                        MouseArea {
+                                            id: filterRowArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                root.activeFilter = filterRow.modelData
+                                                filterMenu.close()
                                             }
                                         }
                                     }
-
-                                    // Only the middle 22x26 takes the click --
-                                    // the glyph plus a little margin; the item
-                                    // stays 38px because the menu is laid over
-                                    // its box.
-                                    MouseArea {
-                                        id: overflowArea
-                                        anchors.centerIn: parent
-                                        width: 22; height: 26
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            if (root.padActive)
-                                                gameGrid.currentIndex = gameDelegate.index
-                                            gameDelegate.openTileMenu()
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Held while the card's menu is open: the button
-                            // now rides the scale, and the menu is placed over
-                            // it once, at the size it had when it opened.
-                            scale: (gameDelegate.highlighted || overflowButton.menuOpen) ? 1.04 : 1.0
-                            Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
-                        }
-
-                        Column {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            spacing: 4
-
-                            // ── Title ───────────────────────────────────────
-                            //
-                            // Source mark, then the name. The mark is Library
-                            // only, though this delegate also serves Favorites
-                            // and Played: those two are already narrowed to
-                            // games you know, and Library is the one grid you
-                            // scan whole.
-                            Row {
-                                id: titleRow
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                spacing: 6
-
-                                readonly property bool showMark: root.activeTab === "Library"
-
-                                Item {
-                                    visible: titleRow.showMark
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: 16; height: 16
-
-                                    // Steam's own colours, unfiltered: the mark
-                                    // is the contrast between the pipe glyph and
-                                    // the disc behind it, and whitening it costs
-                                    // the glyph its ground. Decoded at the drawn
-                                    // size -- the asset is 600x600, and handed
-                                    // over whole it aliases badly at 16px.
-                                    Image {
-                                        anchors.fill: parent
-                                        source: "assets/steam.png"
-                                        sourceSize.width: 16
-                                        sourceSize.height: 16
-                                        fillMode: Image.PreserveAspectFit
-                                        smooth: true
-                                        visible: gameDelegate.fromSteam
-                                    }
-
-                                    // EA's own disc, unfiltered for the same
-                                    // reason as Steam's. The asset is 1000x1000.
-                                    Image {
-                                        anchors.fill: parent
-                                        source: "assets/ea.png"
-                                        sourceSize.width: 16
-                                        sourceSize.height: 16
-                                        fillMode: Image.PreserveAspectFit
-                                        smooth: true
-                                        visible: gameDelegate.fromEa
-                                    }
-
-                                    // Riot's own disc, from the Riot Client's
-                                    // icon, unfiltered like the two above. The
-                                    // asset is 256x256.
-                                    Image {
-                                        anchors.fill: parent
-                                        source: "assets/riot.png"
-                                        sourceSize.width: 16
-                                        sourceSize.height: 16
-                                        fillMode: Image.PreserveAspectFit
-                                        smooth: true
-                                        visible: gameDelegate.fromRiot
-                                    }
-
-                                    // White on transparent, baked at build time.
-                                    Image {
-                                        anchors.fill: parent
-                                        source: "assets/local.png"
-                                        sourceSize.width: 16
-                                        sourceSize.height: 16
-                                        fillMode: Image.PreserveAspectFit
-                                        smooth: true
-                                        opacity: 0.7
-                                        visible: !gameDelegate.fromSteam && !gameDelegate.fromEa
-                                                 && !gameDelegate.fromRiot
-                                    }
-                                }
-
-                                Text {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: gameDelegate.liveName
-                                    color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
-                                    font.pixelSize: 15; font.weight: Font.DemiBold
-                                    elide: Text.ElideRight
-                                    // 220 across the whole row, as before.
-                                    width: Math.min(implicitWidth,
-                                                    titleRow.showMark ? 220 - 16 - titleRow.spacing : 220)
-                                }
-                            }
-
-                            // ── Caption ─────────────────────────────────────
-                            //
-                            // playtime · source · genre. This is where the two
-                            // badges that used to sit on the artwork went. The
-                            // covers are the point of the grid, and enough of
-                            // them are missing in a real library that the
-                            // caption often has to carry the card on its own.
-                            //
-                            // Library cards are title-only; Played and
-                            // Favorites keep the caption.
-                            Row {
-                                visible: root.activeTab !== "Library"
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                spacing: 7
-
-                                // Still the exception it always was: only the
-                                // Played tab holds games that are gone from the
-                                // disk, so only it earns the marker.
-                                Rectangle {
-                                    visible: root.activeTab === "Played"
-                                             && gameDelegate.modelData.installed === true
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: 6; height: 6; radius: 3
-                                    color: Theme.positive
-                                }
-
-                                Text {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    // "0m" is what the bridge returns for a game
-                                    // that was never launched. An em dash says
-                                    // that; a zero reads like a measurement.
-                                    text: gameDelegate.playtimeLabel === "0m"
-                                          ? "—" : gameDelegate.playtimeLabel
-                                    color: Theme.textMuted
-                                    font.pixelSize: 11
-                                }
-
-                                Text {
-                                    visible: gameDelegate.genreLabel !== ""
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: "·"
-                                    color: Theme.textGhost
-                                    font.pixelSize: 11
-                                }
-
-                                Text {
-                                    visible: gameDelegate.genreLabel !== ""
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: gameDelegate.genreLabel
-                                    color: Theme.textMuted
-                                    font.pixelSize: 11
-                                    elide: Text.ElideRight
-                                    width: Math.min(implicitWidth, 90)
                                 }
                             }
                         }
                     }
 
-                    MouseArea {
-                        id: cardArea
-                        anchors.fill: parent; anchors.margins: 8; hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            // Keep the pad's place in sync when both are in use.
-                            if (root.padActive)
-                                gameGrid.currentIndex = gameDelegate.index
-                            // Favorites and Played share this grid with the
-                            // library but open the Browse-style page.
-                            if (root.activeTab === "Favorites" || root.activeTab === "Played") {
-                                browseDetails.openForGame(gameDelegate.liveName, root.activeTab)
-                                return
-                            }
-                            detailPopup.launchOrigin = "Library"
-                            detailPopup.selectedGameName = gameDelegate.liveName
-                            detailPopup.open()
-                        }
-                    }
-                }
-            }
+                    // Adds the Steam games you own but have not installed,
+                    // after the installed ones. Not a filter -- it combines with
+                    // ALL and STEAM -- so it reads as a switch rather than a
+                    // fourth choice. Nothing it adds is an OTHERS game.
+                    Rectangle {
+                        id: notInstalledToggle
+                        readonly property bool on: !!root.api && root.api.showUninstalled
+                        readonly property bool hovered:
+                            notInstalledArea.containsMouse && root.mouseInControl
 
-            Item {
-                id: recommendationPage
+                        visible: root.activeFilter !== "Local"
+                        width: notInstalledRow.implicitWidth + 40
+                        height: 35; radius: 17
+                        color: notInstalledToggle.on ? Theme.steamBg
+                             : (notInstalledToggle.hovered ? Theme.bgEmphasis : Theme.bgRaised)
+                        border.color: notInstalledToggle.on ? Theme.steamAccent
+                                    : (notInstalledToggle.hovered ? Theme.borderStrong : Theme.borderControl)
+                        Behavior on color { ColorAnimation { duration: 150 } }
 
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 18
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 12
-
-                        Text {
-                            text: "RECOMMENDATIONS"
-                            color: Theme.textPrimary
-                            font.pixelSize: 22
-                            font.bold: true
-                            font.letterSpacing: 2
-                        }
-
-                        // The one line in this tab that is always on screen.
-                        //
-                        // The sections below scroll, and with enough library
-                        // picks the DISCOVER heading — and every explanation
-                        // attached to it — sits past the fold, so a user with
-                        // rejected credentials saw a working-looking library
-                        // and no hint that anything was wrong. Whatever is
-                        // actually blocking gets said here instead.
-                        Text {
-                            readonly property string blocker:
-                                root.api ? root.api.authBlocker : ""
-                            readonly property bool downloadingCatalog:
-                                root.api ? root.api.catalogRefreshing : false
-
-                            text: {
-                                if (!root.api) return "Recommendations not loaded"
-                                if (downloadingCatalog) {
-                                    const n = root.api.catalogFetched
-                                    // Discover already has picks: this is the
-                                    // periodic refresh, not first-time setup,
-                                    // and the current picks stay until it ends.
-                                    const list = root.api.recommendationList || []
-                                    const refreshing = list.some(function (item) {
-                                        return item.section === "discover"
-                                    })
-                                    return (refreshing ? "Updating catalog in the background"
-                                                       : root.api.catalogPhase)
-                                         + (n > 0 ? " — " + n + " games downloaded"
-                                                  : refreshing ? ""
-                                                               : " — this runs once, a few minutes")
-                                }
-                                if (blocker !== "") return blocker
-                                return root.api.recommendationStatus
-                            }
-
-                            // Amber for a real blocker, so it reads as
-                            // something to act on rather than as status noise.
-                            color: (blocker !== "" && !downloadingCatalog) ? Theme.caution : Theme.textMuted
-                            font.pixelSize: 13
-                            elide: Text.ElideRight
-                            Layout.fillWidth: true
-                        }
-                    }
-
-                    // Two independently ranked lists. Ranked together, discovery
-                    // wins every slot on numbers alone — the IGDB catalog is
-                    // ~200x larger than the unplayed library — and games the
-                    // user could actually launch right now disappear.
-                    Flickable {
-                        id: recommendationFlick
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        clip: true
-                        contentHeight: recommendationSections.height
-                        ScrollBar.vertical: VortexScrollBar { }
-                        WheelScroller { view: recommendationFlick }
-
-                        Column {
-                            id: recommendationSections
-                            width: parent.width
+                        Row {
+                            id: notInstalledRow
+                            anchors.centerIn: parent
                             spacing: 8
 
-                            Repeater {
-                                model: [
-                                    { key: "library",  title: "FROM YOUR LIBRARY", blurb: "Installed and ready to play" },
-                                    { key: "discover", title: "DISCOVER",          blurb: "Not in your library yet" }
-                                ]
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "NOT INSTALLED"
+                                font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                                color: notInstalledToggle.on ? Theme.steamAccent
+                                     : (notInstalledToggle.hovered ? Theme.textBody : Theme.textMuted)
+                            }
+                        }
 
-                                delegate: Column {
-                                    id: sectionColumn
-                                    required property var modelData
-                                    width: recommendationSections.width
-                                    spacing: 6
+                        MouseArea {
+                            id: notInstalledArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.api.setShowUninstalled(!notInstalledToggle.on)
+                        }
+                    }
+                }
 
-                                    readonly property var picks: {
-                                        if (!root.api || !root.api.recommendationList) return []
-                                        return root.api.recommendationList.filter(function (item) {
-                                            // Fallback output carries no section; treat it as library.
-                                            return (item.section || "library") === sectionColumn.modelData.key
-                                        })
+                // Reset likes — empties the taste profile the recommender ranks
+                // from, for a clean start. Not undoable, so it arms first rather
+                // than firing on one click, the same two-step the folder removal in
+                // SettingsWindow uses. Hidden with nothing to clear.
+                Row {
+                    id: resetLikesRow
+                    spacing: 8
+                    readonly property bool hasFavorites:
+                        root.api && root.api.favoriteGames && root.api.favoriteGames.length > 0
+
+                    visible: root.activeTab === "Favorites" && resetLikesRow.hasFavorites
+                    // Covers both leaving the tab and clearing the last favourite,
+                    // so the confirm step is never left armed for a later visit.
+                    onVisibleChanged: if (!resetLikesRow.visible) root.resetLikesArmed = false
+
+                    Rectangle {
+                        id: resetLikesButton
+                        readonly property bool hovered: resetLikesArea.containsMouse && root.mouseInControl
+
+                        width: 150; height: 35; radius: 17
+                        visible: !root.resetLikesArmed
+                        color: resetLikesButton.hovered ? Theme.accent : Theme.bgRaised
+                        border.color: resetLikesButton.hovered ? Theme.focusRing : Theme.borderControl
+
+                        Behavior on color { ColorAnimation { duration: 150 } }
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "RESET LIKES"
+                            font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                            color: resetLikesButton.hovered ? Theme.textInverse : Theme.textMuted
+                        }
+
+                        MouseArea {
+                            id: resetLikesArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.resetLikesArmed = true
+                        }
+                    }
+
+                    Rectangle {
+                        id: confirmResetButton
+                        width: 170; height: 35; radius: 17
+                        visible: root.resetLikesArmed
+                        color: confirmResetArea.containsMouse ? Theme.danger : Theme.dangerRest
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "CLEAR ALL LIKES"
+                            color: Theme.textPrimary; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                        }
+
+                        MouseArea {
+                            id: confirmResetArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                root.resetLikesArmed = false
+                                if (root.api)
+                                    root.api.resetPreferences()
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        id: cancelResetButton
+                        width: 100; height: 35; radius: 17
+                        visible: root.resetLikesArmed
+                        color: cancelResetArea.containsMouse ? Theme.bgEmphasis : "transparent"
+                        border.color: Theme.borderControl; border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "CANCEL"
+                            color: Theme.textSecondary; font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                        }
+
+                        MouseArea {
+                            id: cancelResetArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.resetLikesArmed = false
+                        }
+                    }
+                }
+
+                // Settings — full directory management lives here.
+                Rectangle {
+                    id: settingsButton
+                    readonly property bool hovered: settingsArea.containsMouse && root.mouseInControl
+
+                    implicitWidth: 35; implicitHeight: 35; radius: 17
+                    // Not the accent fill on hover: the accent is white, and so is the icon.
+                    color: settingsButton.hovered ? Theme.bgEmphasis : Theme.bgRaised
+                    border.color: settingsButton.hovered ? Theme.focusRing : Theme.borderControl
+
+                    onHoveredChanged: if (hovered && !settingsIcon.running) settingsIcon.restart()
+
+                    // 180 frames at 60 fps, 56 px cells on a 15x12 sheet (2x for HiDPI).
+                    // One full roll per hover; it finishes even if the pointer leaves.
+                    AnimatedSprite {
+                        id: settingsIcon
+                        anchors.centerIn: parent
+                        width: 28; height: 28
+                        source: "assets/settings_roll.png"
+                        frameWidth: 56; frameHeight: 56
+                        frameCount: 180
+                        frameRate: 60
+                        loops: 1
+                        running: false
+                        interpolate: false
+                        smooth: true
+                    }
+
+                    MouseArea {
+                        id: settingsArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: settingsWindow.open()
+                    }
+                }
+
+                Rectangle {
+                    id: refreshButton
+                    readonly property bool hovered: refreshRecommendationArea.containsMouse && root.mouseInControl
+
+                    implicitWidth: 120; implicitHeight: 35; radius: 17
+                    visible: root.activeTab === "Recommendations"
+                    color: refreshButton.hovered ? Theme.accent : Theme.bgRaised
+                    border.color: refreshButton.hovered ? Theme.focusRing : Theme.borderControl
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "REFRESH"
+                        font.pixelSize: 12; font.bold: true; font.letterSpacing: 1
+                        color: refreshButton.hovered ? Theme.textInverse : Theme.textMuted
+                    }
+
+                    MouseArea {
+                        id: refreshRecommendationArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: if (root.api) root.api.loadRecommendations()
+                    }
+                }
+                }
+            }
+
+            StackLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                // Library, Favorites and Played share page 0 — same cards,
+                // different model.
+                currentIndex: root.activeTab === "Recommendations" ? 1
+                            : root.activeTab === "Wishlist" ? 2
+                            : root.activeTab === "Browse" ? 3 : 0
+
+                // Game grid
+                GridView {
+                    id: gameGrid
+                    clip: true
+                    // Elastic gutters. A GridView fits floor(width/cellWidth)
+                    // columns and abandons the remainder at the right edge -- a
+                    // whole card's width of dead space at some sizes. Taking the
+                    // count from a minimum and dividing the width back out spends
+                    // the remainder on the gutters instead, and the card itself
+                    // never changes size.
+                    //
+                    // 280 rather than 300: the minimum only decides how many
+                    // columns fit, and 300 was one short on a 1536-wide desktop --
+                    // four columns with 124px between them. 280 buys the fifth and
+                    // pulls the gutters back to ~51.
+                    readonly property int minCellWidth: 280
+                    readonly property int columns:
+                        Math.max(1, Math.floor(gameGrid.width / gameGrid.minCellWidth))
+
+                    cellWidth: gameGrid.width > 0
+                               ? Math.floor(gameGrid.width / gameGrid.columns)
+                               : gameGrid.minCellWidth
+                    cellHeight: 440
+
+                    // Two rows built ahead of the viewport each way, and cards that
+                    // leave it are pooled and handed the next row instead of being
+                    // destroyed. Without either, a fast fling built every card --
+                    // forty-odd objects and a library lookup each -- in the frame
+                    // its row came into view, which is the stutter. The buffer is
+                    // incubated across frames; see the delegate's onPooled /
+                    // onReused for what a recycled card has to reset.
+                    cacheBuffer: gameGrid.cellHeight * 2
+                    reuseItems: true
+
+                    ScrollBar.vertical: VortexScrollBar { }
+                    WheelScroller { view: gameGrid }
+
+                    // No current item until the pad asks for one. A model reload
+                    // (first scan, filter change) puts it back to -1 for the mouse,
+                    // and back onto the first card once the pad is in use.
+                    currentIndex: -1
+
+                    // Why the NOT INSTALLED games are missing or stale, with the
+                    // sign-in that fixes it. Library only, and only while the
+                    // toggle is on -- the bridge has a status line otherwise too.
+                    header: Item {
+                        id: steamNote
+                        readonly property string status:
+                            (root.api && root.api.showUninstalled && root.activeTab === "Library"
+                             && root.activeFilter !== "Local")
+                                ? (root.api.steamOwnedStatus || "") : ""
+                        width: gameGrid.width
+                        height: status !== "" ? 64 : 0
+                        visible: status !== ""
+
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: Math.min(parent.width - 32, steamNoteRow.implicitWidth + 40)
+                            height: 46; radius: 10
+                            color: Theme.steamBg
+                            border.color: Theme.steamBgPressed
+
+                            Row {
+                                id: steamNoteRow
+                                anchors.centerIn: parent
+                                spacing: 16
+
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: steamNote.status
+                                    color: Theme.textBody
+                                    font.pixelSize: 13
+                                }
+
+                                Rectangle {
+                                    id: steamSignInButton
+                                    visible: !!root.api && !root.api.steamSignedIn
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: steamSignInLabel.implicitWidth + 28
+                                    height: 30; radius: 15
+                                    color: steamSignInArea.containsMouse ? Theme.steamAccent : Theme.steamBgPressed
+                                    border.color: Theme.steamAccent
+                                    Behavior on color { ColorAnimation { duration: 120 } }
+
+                                    Text {
+                                        id: steamSignInLabel
+                                        anchors.centerIn: parent
+                                        text: "SIGN IN TO STEAM"
+                                        color: steamSignInArea.containsMouse ? Theme.steamBg : Theme.steamAccent
+                                        font.pixelSize: 11; font.bold: true; font.letterSpacing: 1
                                     }
-
-                                    // Discover keeps its heading when empty and
-                                    // explains itself instead. Hiding it made
-                                    // "the catalog was never downloaded" look
-                                    // identical to "this feature does not
-                                    // exist", which is how it went unnoticed.
-                                    readonly property bool isDiscover:
-                                        sectionColumn.modelData.key === "discover"
-                                    readonly property bool igdbUsable: root.igdbWorking
-
-                                    visible: sectionColumn.picks.length > 0
-                                             || (sectionColumn.isDiscover
-                                                 && root.api
-                                                 && !root.api.isRecommendationLoading)
-
-                                    Row {
-                                        spacing: 10
-                                        Text {
-                                            text: sectionColumn.modelData.title
-                                            color: Theme.textSecondary
-                                            font.pixelSize: 14
-                                            font.bold: true
-                                            font.letterSpacing: 2
-                                        }
-                                        Text {
-                                            text: sectionColumn.modelData.blurb
-                                            color: Theme.textFaint
-                                            font.pixelSize: 12
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-                                    }
-
-                                    // ── Discover empty / downloading state ──
-                                    Item {
-                                        id: discoverEmptyState
-                                        width: parent.width
-                                        height: visible ? 92 : 0
-                                        visible: sectionColumn.isDiscover
-                                                 && sectionColumn.picks.length === 0
-
-                                        readonly property bool downloading:
-                                            root.api ? root.api.catalogRefreshing : false
-
-                                        Column {
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            spacing: 8
-
-                                            Row {
-                                                spacing: 12
-                                                visible: discoverEmptyState.downloading
-
-                                                BusyIndicator {
-                                                    anchors.verticalCenter: parent.verticalCenter
-                                                    running: parent.visible
-                                                    implicitWidth: 22
-                                                    implicitHeight: 22
-                                                }
-
-                                                Column {
-                                                    spacing: 3
-                                                    Text {
-                                                        text: root.api ? root.api.catalogPhase : ""
-                                                        color: Theme.textSecondary
-                                                        font.pixelSize: 13
-                                                    }
-                                                    Text {
-                                                        // A running count, not a
-                                                        // percentage: IGDB is paged
-                                                        // by keyset until the pages
-                                                        // run out, so the total is
-                                                        // genuinely unknown until
-                                                        // the end.
-                                                        text: (root.api && root.api.catalogFetched > 0)
-                                                              ? (root.api.catalogFetched
-                                                                 + " games downloaded so far")
-                                                              : "This runs once and takes a few minutes."
-                                                        color: Theme.textFaint
-                                                        font.pixelSize: 11
-                                                    }
-                                                }
-                                            }
-
-                                            Text {
-                                                visible: !discoverEmptyState.downloading
-                                                         && !sectionColumn.igdbUsable
-                                                width: 620
-                                                wrapMode: Text.WordWrap
-                                                color: Theme.textFaint
-                                                font.pixelSize: 12
-                                                // Says which of the two it is
-                                                // rather than guessing: keys
-                                                // absent and keys refused need
-                                                // different actions.
-                                                text: root.api && root.api.authBlocker !== ""
-                                                      ? root.api.authBlocker
-                                                      : ("Discover suggests games you don't own yet. "
-                                                         + "It needs free IGDB credentials — add them in "
-                                                         + "Settings and the catalogue downloads itself.")
-                                            }
-
-                                            Text {
-                                                visible: !discoverEmptyState.downloading
-                                                         && sectionColumn.igdbUsable
-                                                width: 620
-                                                wrapMode: Text.WordWrap
-                                                color: Theme.textFaint
-                                                font.pixelSize: 12
-                                                text: "Nothing to suggest yet. Play a few games so Vortex "
-                                                    + "learns what you like, or refresh the catalogue "
-                                                    + "from Settings."
-                                            }
-                                        }
-                                    }
-
-                                    GridView {
-                                        id: sectionGrid
-                                        objectName: sectionColumn.modelData.key
-                                        width: parent.width
-                                        // Sized to content: the outer Flickable
-                                        // scrolls, so an inner scroll area would
-                                        // fight it.
-                                        height: Math.ceil(sectionColumn.picks.length
-                                                          / sectionGrid.columns) * sectionGrid.cellHeight
-                                        interactive: false
-                                        // Same art size and column pitch as the
-                                        // library grid -- including its elastic
-                                        // gutters, so the two tabs line up at
-                                        // any width. The card is 448 tall (360
-                                        // art + 88 caption) inside a 488 cell,
-                                        // which is the library's 400-in-440 with
-                                        // the two extra caption lines added to
-                                        // both numbers.
-                                        readonly property int minCellWidth: 280
-                                        readonly property int columns:
-                                            Math.max(1, Math.floor(sectionGrid.width
-                                                                   / sectionGrid.minCellWidth))
-
-                                        cellWidth: sectionGrid.width > 0
-                                                   ? Math.floor(sectionGrid.width / sectionGrid.columns)
-                                                   : sectionGrid.minCellWidth
-                                        cellHeight: 488
-                                        model: sectionColumn.picks
-
-                                        Component.onCompleted: {
-                                            if (sectionColumn.modelData.key === "library")
-                                                root.libraryPickGridRef = sectionGrid
-                                            else
-                                                root.discoverGridRef = sectionGrid
-                                        }
-
-                                        currentIndex: -1
-                                        onCountChanged: {
-                                            if (!root.padActive || sectionGrid.count === 0)
-                                                sectionGrid.currentIndex = -1
-                                            else if (sectionGrid.currentIndex < 0)
-                                                sectionGrid.currentIndex = 0
-                                        }
-
-                                        delegate: Item {
-                                            id: recommendationDelegate
-                                            required property var modelData
-                                            required property int index
-
-                                            readonly property bool isFocusedSection:
-                                                root.recFocus === sectionColumn.modelData.key
-                                            readonly property bool highlighted:
-                                                (recommendationArea.containsMouse && root.mouseInControl)
-                                                || (recommendationDelegate.GridView.isCurrentItem
-                                                    && recommendationDelegate.isFocusedSection
-                                                    && root.padInControl)
-
-                                            // 256 for the hover scale's
-                                            // overhang, as in the library grid
-                                            // -- which also keeps the two tabs'
-                                            // columns lined up.
-                                            width: 256
-                                            height: 448
-
-                                            // The tab pop-in, as on the library
-                                            // grid. Both sections sit in one
-                                            // Flickable and their grids never
-                                            // scroll, so the beat is counted
-                                            // from where the card is on screen
-                                            // rather than from its index.
-                                            transform: Translate { id: recommendationEnterShift }
-                                            function popIn() {
-                                                const shownY = sectionColumn.y + sectionGrid.y
-                                                               + recommendationDelegate.y
-                                                               - recommendationFlick.contentY
-                                                const slot = Math.floor(shownY / sectionGrid.cellHeight)
-                                                             * sectionGrid.columns
-                                                             + recommendationDelegate.index % sectionGrid.columns
-                                                recommendationEnterPause.duration =
-                                                    Math.max(0, Math.min(slot, 12)) * 40
-                                                recommendationEnterAnim.stop()
-                                                recommendationDelegate.opacity = 0
-                                                recommendationEnterShift.y = 18
-                                                recommendationEnterAnim.start()
-                                            }
-                                            Component.onCompleted: {
-                                                if (Date.now() - root.popStamp <= 250)
-                                                    recommendationDelegate.popIn()
-                                            }
-                                            Connections {
-                                                target: root
-                                                function onPopStampChanged() {
-                                                    if (root.activeTab === "Recommendations")
-                                                        recommendationDelegate.popIn()
-                                                }
-                                            }
-                                            SequentialAnimation {
-                                                id: recommendationEnterAnim
-                                                PauseAnimation { id: recommendationEnterPause }
-                                                ParallelAnimation {
-                                                    NumberAnimation {
-                                                        target: recommendationDelegate; property: "opacity"
-                                                        to: 1.0; duration: 380; easing.type: Easing.OutCubic
-                                                    }
-                                                    NumberAnimation {
-                                                        target: recommendationEnterShift; property: "y"
-                                                        to: 0; duration: 380; easing.type: Easing.OutCubic
-                                                    }
-                                                }
-                                            }
-
-                                            // Top-anchored, not centred: the
-                                            // reason line is one or two lines
-                                            // depending on the title, and
-                                            // centring pushed the art of the
-                                            // two-line cards up out of line
-                                            // with its neighbours.
-                                            CoverGlow {
-                                                target: recommendationCard
-                                                stage: glowStage
-                                                source: recommendationCover
-                                                lit: recommendationDelegate.highlighted
-                                            }
-
-                                            Column {
-                                                anchors.top: parent.top
-                                                anchors.horizontalCenter: parent.horizontalCenter
-                                                spacing: 0
-
-                                                Rectangle {
-                                                    id: recommendationCard
-                                                    width: 240
-                                                    height: 360
-                                                    radius: 8
-                                                    color: Theme.bgSurface
-                                                    border.width: 2
-                                                    border.color: Theme.borderMuted
-                                                    clip: true
-                                                    // See RoundedCorners.qml.
-                                                    layer.enabled: true
-                                                    layer.smooth: true
-                                                    layer.effect: RoundedCorners { radius: recommendationCard.radius }
-
-                                                    Image {
-                                                        id: recommendationCover
-                                                        anchors.fill: parent
-                                                        source: recommendationDelegate.modelData.coverPath || ""
-                                                        fillMode: Image.PreserveAspectCrop
-                                                        // At the card's size, as the library
-                                                        // grid does -- but through the bridge,
-                                                        // which leaves IGDB's 264x374 remote
-                                                        // covers alone rather than upscaling
-                                                        // them, and shrinks local 600x900 art.
-                                                        sourceSize: root.api
-                                                            ? root.api.decodeSize(recommendationCover.source.toString(),
-                                                                                  recommendationCard.width, recommendationCard.height,
-                                                                                  true, Screen.devicePixelRatio)
-                                                            : Qt.size(-1, -1)
-                                                        opacity: status === Image.Ready ? 1.0 : 0.0
-                                                        Behavior on opacity { NumberAnimation { duration: 250 } }
-                                                    }
-
-                                                    // Already-saved marker. The wishlist never affects
-                                                    // ranking, so a saved game keeps appearing here —
-                                                    // this just shows you already have it.
-                                                    Rectangle {
-                                                        visible: root.api
-                                                                 && !recommendationDelegate.modelData.matched
-                                                                 && root.api.isWishlisted(recommendationDelegate.modelData.name)
-                                                        anchors.right: parent.right
-                                                        anchors.top: parent.top
-                                                        anchors.margins: 10
-                                                        width: 30; height: 30; radius: 15
-                                                        color: Theme.overlayStrong
-                                                        border.color: Theme.borderControl
-                                                        Text {
-                                                            anchors.centerIn: parent
-                                                            text: "\u{1F6D2}"
-                                                            font.pixelSize: 14
-                                                        }
-                                                    }
-
-                                                    Column {
-                                                        anchors.centerIn: parent
-                                                        spacing: 8
-                                                        visible: recommendationCover.status !== Image.Ready
-
-                                                        Text {
-                                                            anchors.horizontalCenter: parent.horizontalCenter
-                                                            text: "ML PICK"
-                                                            color: Theme.textGhost
-                                                            font.pixelSize: 18
-                                                            font.bold: true
-                                                            font.letterSpacing: 2
-                                                        }
-
-                                                        Text {
-                                                            anchors.horizontalCenter: parent.horizontalCenter
-                                                            width: 200
-                                                            text: recommendationDelegate.modelData.matched ? "NO ART" : "NOT IN LIBRARY"
-                                                            color: Theme.textFaint
-                                                            font.pixelSize: 12
-                                                            horizontalAlignment: Text.AlignHCenter
-                                                        }
-                                                    }
-
-                                                    scale: recommendationDelegate.highlighted ? 1.04 : 1.0
-                                                    Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
-                                                }
-
-                                                // ── Caption ──
-                                                //
-                                                // One fixed-height block with a
-                                                // reserved slot per line, so a
-                                                // card's geometry never depends
-                                                // on how long its title is or
-                                                // whether it has a match figure.
-                                                // Letting the text size itself
-                                                // is what made the grid ragged:
-                                                // a two-line reason pushed the
-                                                // lines below it down, and a
-                                                // missing match line collapsed
-                                                // the slot altogether, so no two
-                                                // captions shared a baseline.
-                                                Item {
-                                                    width: 240
-                                                    height: 88
-
-                                                    Text {
-                                                        id: recommendationTitle
-                                                        anchors.top: parent.top
-                                                        anchors.topMargin: 12
-                                                        anchors.horizontalCenter: parent.horizontalCenter
-                                                        width: 220
-                                                        height: 20
-                                                        text: recommendationDelegate.modelData.name
-                                                        color: recommendationDelegate.highlighted ? Theme.textPrimary : Theme.textBody
-                                                        font.pixelSize: 15
-                                                        font.weight: Font.DemiBold
-                                                        horizontalAlignment: Text.AlignHCenter
-                                                        verticalAlignment: Text.AlignVCenter
-                                                        elide: Text.ElideRight
-                                                    }
-
-                                                    // Replaces the score badge. MMR reorders picks for
-                                                    // variety, so the numbers were not monotonically
-                                                    // descending and read as a bug; the reason is what
-                                                    // the player can actually act on.
-                                                    //
-                                                    // Two lines are always reserved, at a fixed line
-                                                    // height so the box is exactly 2 × 15 whatever the
-                                                    // font metrics do, and the text is centred inside
-                                                    // them — a one-line reason then sits optically
-                                                    // centred instead of hugging the top of a visibly
-                                                    // empty box.
-                                                    Text {
-                                                        id: recommendationReason
-                                                        anchors.top: recommendationTitle.bottom
-                                                        anchors.topMargin: 6
-                                                        anchors.horizontalCenter: parent.horizontalCenter
-                                                        width: 220
-                                                        height: 30
-                                                        text: recommendationDelegate.modelData.reason || ""
-                                                        color: Theme.textFaint
-                                                        font.pixelSize: 11
-                                                        lineHeight: 15
-                                                        lineHeightMode: Text.FixedHeight
-                                                        horizontalAlignment: Text.AlignHCenter
-                                                        verticalAlignment: Text.AlignVCenter
-                                                        wrapMode: Text.WordWrap
-                                                        maximumLineCount: 2
-                                                        elide: Text.ElideRight
-                                                    }
-
-                                                    // How strong the link above
-                                                    // actually is.
-                                                    //
-                                                    // The reason line names one of
-                                                    // your games; on its own that
-                                                    // is an assertion. recommend.py
-                                                    // already computes the cosine
-                                                    // behind it (inspiredBy, from
-                                                    // scoring.inspiration_sources)
-                                                    // and used to throw it away, so
-                                                    // showing the top match costs
-                                                    // nothing and turns the claim
-                                                    // into something checkable.
-                                                    // Click the card for the full
-                                                    // per-mood breakdown in the
-                                                    // console.
-                                                    //
-                                                    // Fades out rather than hiding:
-                                                    // visible:false would give the
-                                                    // cards without one a shorter
-                                                    // caption than their neighbours.
-                                                    Text {
-                                                        readonly property var topMatch: {
-                                                            const list = recommendationDelegate.modelData.inspiredBy
-                                                            return (list && list.length > 0) ? list[0] : null
-                                                        }
-
-                                                        anchors.top: recommendationReason.bottom
-                                                        anchors.topMargin: 6
-                                                        anchors.horizontalCenter: parent.horizontalCenter
-                                                        height: 14
-                                                        opacity: (topMatch !== null
-                                                                  && recommendationDelegate.modelData.reason
-                                                                  && String(recommendationDelegate.modelData.reason).indexOf("Because you") === 0)
-                                                                 ? 1.0 : 0.0
-                                                        text: topMatch
-                                                              ? (Math.round(topMatch.similarity * 100) + "% match")
-                                                              : ""
-                                                        color: Theme.textGhost
-                                                        font.pixelSize: 10
-                                                        font.letterSpacing: 0.5
-                                                        verticalAlignment: Text.AlignVCenter
-                                                    }
-                                                }
-                                            }
-
-                                            MouseArea {
-                                                id: recommendationArea
-                                                anchors.fill: parent
-                                                anchors.leftMargin: 8; anchors.rightMargin: 8
-                                                hoverEnabled: true
-                                                cursorShape: Qt.PointingHandCursor
-                                                // Opens the Browse-style page, owned or
-                                                // not: it resolves the pick by name.
-                                                onClicked: {
-                                                    if (root.padActive) {
-                                                        root.recFocus = sectionColumn.modelData.key
-                                                        sectionGrid.currentIndex = recommendationDelegate.index
-                                                    }
-                                                    if (root.api)
-                                                        root.api.logRecommendationClick(
-                                                            recommendationDelegate.modelData.name,
-                                                            recommendationDelegate.index + 1)
-                                                    browseDetails.openForGame(
-                                                        recommendationDelegate.modelData.name,
-                                                        "Recommendations")
-                                                }
-                                            }
-                                        }
+                                    MouseArea {
+                                        id: steamSignInArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: steamLogin.signIn()
                                     }
                                 }
                             }
@@ -2387,80 +1321,10 @@ Window {
                     }
 
                     Text {
-                        Layout.alignment: Qt.AlignHCenter
-                        visible: root.api && !root.api.isRecommendationLoading
-                                 && root.api.recommendationList
-                                 && root.api.recommendationList.length === 0
-                        text: "NO RECOMMENDATIONS YET"
-                        color: Theme.textGhost
-                        font.pixelSize: 18
-                        font.bold: true
-                        font.letterSpacing: 2
-                    }
-                }
-            }
-
-            // ── Wishlist ────────────────────────────────────────────────────
-            // Renders entirely from wishlist.json, which stores a metadata
-            // snapshot per entry. Wishlisted games are unowned, so there is no
-            // library row to read — and this way the tab still works with
-            // Postgres stopped and no network.
-            Item {
-                GridView {
-                    id: wishlistGrid
-                    anchors.fill: parent
-                    clip: true
-                    // Elastic gutters, as on the library grid above.
-                    readonly property int minCellWidth: 280
-                    readonly property int columns:
-                        Math.max(1, Math.floor(wishlistGrid.width / wishlistGrid.minCellWidth))
-
-                    cellWidth: wishlistGrid.width > 0
-                               ? Math.floor(wishlistGrid.width / wishlistGrid.columns)
-                               : wishlistGrid.minCellWidth
-                    cellHeight: 440
-                    model: {
-                        const list = root.api && root.api.wishlistGames ? root.api.wishlistGames : []
-                        if (root.searchText.trim() === "")
-                            return list
-                        return list.filter(function(game) {
-                            return root.matchesSearch([game.name])
-                        })
-                    }
-
-                    ScrollBar.vertical: VortexScrollBar { }
-                    WheelScroller { view: wishlistGrid }
-
-                    currentIndex: -1
-
-                    // Same as gameGrid.restoreY, for the same reason: removing
-                    // a game from the wishlist rebuilds wishlistGames.
-                    property real restoreY: -1
-
-                    function restoreScroll() {
-                        if (wishlistGrid.restoreY < 0)
-                            return
-                        wishlistGrid.contentY = Math.max(0, Math.min(
-                            wishlistGrid.restoreY,
-                            wishlistGrid.contentHeight - wishlistGrid.height))
-                    }
-
-                    onContentHeightChanged: wishlistGrid.restoreScroll()
-
-                    onCountChanged: {
-                        wishlistGrid.restoreScroll()
-
-                        if (!root.padActive || wishlistGrid.count === 0)
-                            wishlistGrid.currentIndex = -1
-                        else if (wishlistGrid.currentIndex < 0)
-                            wishlistGrid.currentIndex = 0
-                    }
-
-                    Text {
                         anchors.centerIn: parent
-                        visible: wishlistGrid.count === 0 && root.searchText.trim() !== ""
+                        visible: gameGrid.count === 0 && root.searchText.trim() !== ""
                         text: "NO MATCHES FOR \u201C" + root.searchText.trim() + "\u201D"
-                        width: wishlistGrid.width - 80
+                        width: gameGrid.width - 80
                         horizontalAlignment: Text.AlignHCenter
                         elide: Text.ElideMiddle
                         color: Theme.textGhost
@@ -2471,8 +1335,9 @@ Window {
 
                     Text {
                         anchors.centerIn: parent
-                        visible: wishlistGrid.count === 0 && root.searchText.trim() === ""
-                        text: "NOTHING WISHLISTED YET\nOpen a Discover pick and tap Add to Wishlist"
+                        visible: gameGrid.count === 0 && root.activeTab === "Favorites"
+                                 && root.searchText.trim() === ""
+                        text: "NO FAVORITES YET\nOpen a game and tap the heart"
                         horizontalAlignment: Text.AlignHCenter
                         color: Theme.textGhost
                         font.pixelSize: 16
@@ -2480,108 +1345,851 @@ Window {
                         font.letterSpacing: 2
                     }
 
+                    Text {
+                        anchors.centerIn: parent
+                        visible: gameGrid.count === 0 && root.activeTab === "Played"
+                                 && root.searchText.trim() === ""
+                        text: "NOTHING PLAYED YET\nLaunch a game and it lands here for good"
+                        horizontalAlignment: Text.AlignHCenter
+                        color: Theme.textGhost
+                        font.pixelSize: 16
+                        font.bold: true
+                        font.letterSpacing: 2
+                    }
+
+                    // Where to put the grid back after the details page changes
+                    // a list it is showing.
+                    //
+                    // Favorites and Played are derived lists: a heart moving
+                    // rebuilds them, GridView is handed a new JS array and answers
+                    // by dropping the scroll position. The Library escapes this
+                    // because the bridge patches gameList in place (see
+                    // updatePreference), which a derived list cannot do.
+                    //
+                    // Captured when the details page opens rather than when the
+                    // change lands -- by then the old position is already gone --
+                    // and re-asserted rather than applied once, because
+                    // contentHeight is not final when countChanged fires. Safe to
+                    // re-assert: the page is modal, so nothing can scroll the grid
+                    // while a value is pending. -1 means nothing is.
+                    property real restoreY: -1
+
+                    function restoreScroll() {
+                        if (gameGrid.restoreY < 0)
+                            return
+                        gameGrid.contentY = Math.max(0, Math.min(
+                            gameGrid.restoreY,
+                            gameGrid.contentHeight - gameGrid.height))
+                    }
+
+                    onContentHeightChanged: gameGrid.restoreScroll()
+
+                    onCountChanged: {
+                        gameGrid.restoreScroll()
+
+                        if (!root.padActive || gameGrid.count === 0)
+                            gameGrid.currentIndex = -1
+                        else if (gameGrid.currentIndex < 0)
+                            gameGrid.currentIndex = 0
+                    }
+
+                    // Favorites is the library grid with a different model rather
+                    // than a second copy of the card markup.
+                    model: {
+                        if (!root.api) return [];
+                        let list;
+                        if (root.activeTab === "Favorites")
+                            list = root.api.favoriteGames || [];
+                        // Everything ever played, installed or not. Comes from the
+                        // bridge already ordered and de-duplicated -- see
+                        // VortexBridge::playedGames().
+                        else if (root.activeTab === "Played")
+                            list = root.api.playedGames || [];
+                        else if (!root.api.gameList)
+                            list = [];
+                        else {
+                            // NOT INSTALLED appends the owned Steam games that are
+                            // not on the disk. Never on OTHERS: all of them are
+                            // Steam games.
+                            const all = (root.api.showUninstalled && root.activeFilter !== "Local")
+                                ? root.api.gameList.concat(root.api.ownedSteamGames || [])
+                                : root.api.gameList;
+                            list = root.activeFilter === "All" ? all
+                                : all.filter(function(game) {
+                                    return game.source === root.activeFilter;
+                                });
+                        }
+
+                        if (root.searchText.trim() === "")
+                            return list;
+                        // The live title as well as the snapshot's: pass 2 renames
+                        // a local game in place without republishing the list, so
+                        // the card can show a name modelData never had (see
+                        // liveDetails below).
+                        return list.filter(function(game) {
+                            const live = game.installDir
+                                ? root.api.gameDetailsForInstallDir(game.installDir) : null;
+                            return root.matchesSearch([game.name, live ? live.name : ""]);
+                        });
+                    }
+
                     delegate: Item {
-                        id: wishlistDelegate
+                        id: gameDelegate
                         required property var modelData
                         required property int index
 
+                        // Mouse hover and controller focus light the card the same
+                        // way, but only whichever input is currently driving.
+                        //
+                        // The overflow button and the play button both count as
+                        // being on the card. They sit above cardArea and take the
+                        // hover off it, and since both only show while the card is
+                        // lit, leaving either out made the two chase each other:
+                        // hover the button, the card unlights, the button vanishes,
+                        // the card lights again.
                         readonly property bool highlighted:
-                            (wishlistArea.containsMouse && root.mouseInControl)
-                            || (wishlistDelegate.GridView.isCurrentItem && root.padInControl)
+                            ((cardArea.containsMouse || overflowArea.containsMouse
+                              || playArea.containsMouse || installArea.containsMouse
+                              || cancelArea.containsMouse || pauseArea.containsMouse)
+                             && root.mouseInControl)
+                            || (gameDelegate.GridView.isCurrentItem && root.padInControl)
 
-                        // Same card as the library grid: 240x360 art in a
-                        // 240x415 cell, so switching tabs doesn't resize them.
-                        // Padded to 256x431 for the hover scale, as there.
-                        width: 256
-                        height: 431
+                        // The live row for this card, re-read whenever the scan
+                        // publishes something new.
+                        //
+                        // Keyed on installDir, NOT on name. The scan publishes
+                        // titles in pass 1 and only then resolves them against
+                        // IGDB, and for a local game the canonical title replaces
+                        // the folder name the card was published under. It updates
+                        // the row in place and bumps artRevision instead of
+                        // re-emitting gameListChanged, precisely so the grid is NOT
+                        // rebuilt and the user's scroll position survives -- which
+                        // means modelData here is a stale snapshot whose name may
+                        // no longer match any live row. installDir is fixed at scan
+                        // time, so it still does.
+                        readonly property var liveDetails: {
+                            if (!root.api) return null
+                            // Owned on Steam, not installed: there is no live row,
+                            // and a title lookup could land on some other copy of
+                            // the game (an EA install of it, say).
+                            if (gameDelegate.notInstalled) return null
+                            const _ = root.api.artRevision   // dependency, deliberate
+                            const byDir = root.api.gameDetailsForInstallDir(
+                                              gameDelegate.modelData.installDir || "")
+                            if (byDir && byDir.name) return byDir
+                            // Nothing with that install directory (a favourite
+                            // built from a different source, say): the title is the
+                            // only key left.
+                            return root.api.gameDetailsFor(gameDelegate.modelData.name)
+                        }
 
-                        // The search and tab pop-in, as on the library grid above.
-                        transform: Translate { id: wishlistEnterShift }
+                        // Canonical title once resolved, falling back to whatever
+                        // the card was published with.
+                        readonly property string liveName:
+                            (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
+                                ? gameDelegate.liveDetails.name
+                                : (gameDelegate.modelData.name || "")
+
+                        // The three facts the caption under the title carries.
+                        // Same live-row-first rule as liveName above: a session that
+                        // just ended shows its new total without a rescan.
+                        readonly property string playtimeLabel:
+                            (gameDelegate.liveDetails && gameDelegate.liveDetails.playtime)
+                                ? gameDelegate.liveDetails.playtime
+                                : (gameDelegate.modelData.playtime || "0m")
+
+                        // Live row first, like liveName and playtimeLabel above.
+                        // modelData is the snapshot the card was published with, and
+                        // during a cold scan that snapshot carries "Unknown" for
+                        // every metadata slot until IGDB resolves the title. Reading
+                        // it directly meant the caption stayed blank until something
+                        // rebuilt the grid; through liveDetails it fills itself in
+                        // as the scan lands, which is what artRevision is for.
+                        readonly property string sourceLabel:
+                            (gameDelegate.liveDetails && gameDelegate.liveDetails.source)
+                                ? gameDelegate.liveDetails.source
+                                : (gameDelegate.modelData.source || "")
+
+                        readonly property bool fromSteam:
+                            gameDelegate.sourceLabel === "Steam"
+
+                        // A Local row the EA app launches. Live row first, as
+                        // sourceLabel reads it.
+                        readonly property bool fromEa:
+                            (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
+                                ? gameDelegate.liveDetails.isEa === true
+                                : gameDelegate.modelData.isEa === true
+
+                        // A Local row the Riot Client launches, read the same way.
+                        readonly property bool fromRiot:
+                            (gameDelegate.liveDetails && gameDelegate.liveDetails.name)
+                                ? gameDelegate.liveDetails.isRiot === true
+                                : gameDelegate.modelData.isRiot === true
+
+                        // applyGameMetadata() hands over the whole comma-separated
+                        // list ("Role-playing (RPG), Simulator, Strategy"); only the
+                        // first one fits under a 240px card.
+                        //
+                        // IGDB spells its genres out in full, and the long ones
+                        // elide mid-word into "Role-playing (RP..." at this width.
+                        // Where it carries an abbreviation in brackets that is both
+                        // shorter and what anyone actually calls the genre, so
+                        // prefer it: "Role-playing (RPG)" reads as "RPG".
+                        readonly property string genreLabel: {
+                            const live = gameDelegate.liveDetails
+                            const g = ((live && live.genres)
+                                       ? live.genres
+                                       : gameDelegate.modelData.genres) || ""
+                            if (g === "" || g === "Unknown") return ""
+                            const first = g.split(",")[0].trim()
+                            const abbreviated = first.match(/\(([^)]+)\)/)
+                            return abbreviated ? abbreviated[1] : first
+                        }
+
+                        // Launching something that is not on the disk fails with
+                        // nothing to show for it. Played holds uninstalled games,
+                        // and so does Favorites -- a hearted Discover pick, or a
+                        // played game since removed. Library rows are all installed.
+                        readonly property bool launchable:
+                            !gameDelegate.notInstalled
+                            && ((root.activeTab !== "Played" && root.activeTab !== "Favorites")
+                                || gameDelegate.modelData.installed === true)
+
+                        // A Library row from the NOT INSTALLED toggle: owned on
+                        // Steam, not on the disk. Dimmed, and INSTALL stands in
+                        // for PLAY.
+                        readonly property bool notInstalled:
+                            gameDelegate.modelData.notInstalled === true
+
+                        // This game's entry in the bridge's steamInstalls while
+                        // Steam is downloading it, null otherwise. Keyed by appid
+                        // as a string, which is how QML sees a QVariantMap's keys.
+                        readonly property var installStatus: {
+                            if (!root.api) return null
+                            const id = gameDelegate.modelData.appid || 0
+                            if (id <= 0) return null
+                            return root.api.steamInstalls[String(id)] || null
+                        }
+                        readonly property bool installing: gameDelegate.installStatus !== null
+                        // Still downloading -- once it reads "done" there is
+                        // nothing left to cancel.
+                        readonly property bool canCancel:
+                            gameDelegate.installing && gameDelegate.installStatus.state !== "done"
+
+                        function cancelInstall() {
+                            if (gameDelegate.canCancel && root.api)
+                                root.api.cancelSteamInstall(gameDelegate.modelData.appid)
+                        }
+
+                        readonly property bool isPaused:
+                            gameDelegate.installing && gameDelegate.installStatus.state === "paused"
+
+                        // The pause button's click, and X on the pad.
+                        function togglePause() {
+                            if (!gameDelegate.canCancel || !root.api)
+                                return
+                            if (gameDelegate.isPaused)
+                                root.api.resumeSteamInstall(gameDelegate.modelData.appid)
+                            else
+                                root.api.pauseSteamInstall(gameDelegate.modelData.appid)
+                        }
+
+                        // The launcher's drive picker rather than Steam's dialog.
+                        function install() {
+                            if (!gameDelegate.notInstalled || gameDelegate.installing || !root.api)
+                                return
+                            installPicker.openFor(gameDelegate.modelData.appid,
+                                                  gameDelegate.liveName, String(gameCover.source))
+                        }
+
+                        // 415, not the old 400: the caption line is the fourth row
+                        // of text the comment on the badges below used to rule out.
+                        // cellHeight is 440 and already had the room.
+                        //
+                        // The extra 16 each way is room for the hover scale. The
+                        // card grows 1.04x about its centre -- ~5px past each side,
+                        // ~7px past the top -- and a delegate exactly the card's
+                        // size put the first column flush with the grid's clipped
+                        // left edge and the first row with its top, so both lost a
+                        // sliver on hover. Centring the card in 256x431 keeps 8px
+                        // clear all round and still fits the 440 cell.
+                        width: 256; height: 431
+
+                        // A fresh search answer or tab: rise and fade in, a beat
+                        // after the card before it, as Browse's results do. Cards
+                        // already up when the stamp lands replay too -- going back
+                        // to Library does not rebuild its grid. Counted from the
+                        // first row in view, so a scrolled grid does not wait out
+                        // the cards above it.
+                        transform: Translate { id: gameEnterShift }
                         function popIn() {
-                            const firstShown = Math.floor(wishlistGrid.contentY / wishlistGrid.cellHeight)
-                                               * wishlistGrid.columns
-                            wishlistEnterPause.duration =
-                                Math.max(0, Math.min(wishlistDelegate.index - firstShown, 12)) * 40
-                            wishlistEnterAnim.stop()
-                            wishlistDelegate.opacity = 0
-                            wishlistEnterShift.y = 18
-                            wishlistEnterAnim.start()
+                            const firstShown = Math.floor(gameGrid.contentY / gameGrid.cellHeight)
+                                               * gameGrid.columns
+                            gameEnterPause.duration =
+                                Math.max(0, Math.min(gameDelegate.index - firstShown, 12)) * 40
+                            gameEnterAnim.stop()
+                            gameDelegate.opacity = 0
+                            gameEnterShift.y = 18
+                            gameEnterAnim.start()
                         }
                         Component.onCompleted: {
                             if (Date.now() - root.popStamp <= 250)
-                                wishlistDelegate.popIn()
+                                gameDelegate.popIn()
                         }
+
+                        // reuseItems: a card scrolled out is parked here and later
+                        // handed another row rather than rebuilt, so neither
+                        // Component.onCompleted nor a fresh set of property defaults
+                        // happens again. Park it at rest -- no half-played pop-in,
+                        // no glow armed for the old cover -- and on reuse do what
+                        // onCompleted would have.
+                        property bool pooled: false
+                        GridView.onPooled: {
+                            gameDelegate.pooled = true
+                            gameEnterAnim.stop()
+                            gameDelegate.opacity = 1.0
+                            gameEnterShift.y = 0
+                            gameGlow.armed = false
+                        }
+                        GridView.onReused: {
+                            gameDelegate.pooled = false
+                            if (Date.now() - root.popStamp <= 250)
+                                gameDelegate.popIn()
+                        }
+
                         Connections {
                             target: root
+                            enabled: !gameDelegate.pooled
                             function onPopStampChanged() {
-                                if (root.activeTab === "Wishlist")
-                                    wishlistDelegate.popIn()
+                                if (root.activeTab === "Library" || root.activeTab === "Favorites"
+                                    || root.activeTab === "Played")
+                                    gameDelegate.popIn()
                             }
                         }
                         SequentialAnimation {
-                            id: wishlistEnterAnim
-                            PauseAnimation { id: wishlistEnterPause }
+                            id: gameEnterAnim
+                            PauseAnimation { id: gameEnterPause }
                             ParallelAnimation {
                                 NumberAnimation {
-                                    target: wishlistDelegate; property: "opacity"
+                                    target: gameDelegate; property: "opacity"
                                     to: 1.0; duration: 380; easing.type: Easing.OutCubic
                                 }
                                 NumberAnimation {
-                                    target: wishlistEnterShift; property: "y"
+                                    target: gameEnterShift; property: "y"
                                     to: 0; duration: 380; easing.type: Easing.OutCubic
                                 }
                             }
                         }
 
+                        // Started by the card's own PLAY button and, for the pad,
+                        // by root.controllerPlay() reaching through currentItem --
+                        // the same shape as openTileMenu() below, and for the same
+                        // reason: the delegate is what knows whether this row can
+                        // be launched and what it is actually called.
+                        function play() {
+                            // X on a downloading card pauses or resumes it, the
+                            // pad's counterpart of the pause button; R3 cancels
+                            // (openTileMenu below).
+                            if (gameDelegate.canCancel) {
+                                gameDelegate.togglePause()
+                                return
+                            }
+                            if (gameDelegate.notInstalled) {
+                                gameDelegate.install()
+                                return
+                            }
+                            if (!gameDelegate.launchable)
+                                return
+                            root.playGame(gameDelegate.liveName)
+                        }
+
+                        // Opened by the card's own button and, for the pad, by
+                        // root.controllerOptions() reaching through currentItem.
+                        function openTileMenu() {
+                            // R3 on a downloading card is the close button over it.
+                            if (gameDelegate.canCancel) {
+                                gameDelegate.cancelInstall()
+                                return
+                            }
+                            // Its actions all act on files that are not there.
+                            if (gameDelegate.notInstalled)
+                                return
+                            tileMenu.openFor(overflowButton, gameDelegate.liveName,
+                                             gameDelegate.modelData.installDir || "",
+                                             gameDelegate.launchable,
+                                             gameDelegate.sourceLabel === "Local",
+                                             // Not on an uninstalled Favorites row.
+                                             !(root.activeTab === "Favorites"
+                                               && gameDelegate.modelData.installed !== true))
+                        }
+
+                        // Drawn on root's glowStage, behind the page: see
+                        // CoverGlow.qml.
                         CoverGlow {
-                            target: wishlistCard
+                            id: gameGlow
+                            target: capsuleContainer
                             stage: glowStage
-                            source: wishlistCover
-                            lit: wishlistDelegate.highlighted
+                            source: gameCover
+                            lit: gameDelegate.highlighted
                         }
 
                         Column {
                             anchors.centerIn: parent
                             spacing: 12
+                            // Above cardArea, so the play button drawn on the
+                            // artwork can take its own clicks. Nothing else in here
+                            // holds a MouseArea, so the card stays clickable
+                            // everywhere the button is not.
+                            z: 1
 
                             Rectangle {
-                                id: wishlistCard
-                                width: 240
-                                height: 360
-                                radius: 8
-                                color: Theme.bgSurface
-                                border.width: 2
-                                border.color: Theme.borderMuted
-                                clip: true
+                                id: capsuleContainer
+                                width: 240; height: 360
+                                opacity: gameDelegate.notInstalled && !gameDelegate.installing
+                                         && !gameDelegate.highlighted ? 0.5 : 1.0
+                                Behavior on opacity { NumberAnimation { duration: 150 } }
+                                color: Theme.bgRaised; radius: 8
+                                // No focus ring: the lift, the glow and the control
+                                // row already mark the lit card.
+                                border.color: Theme.borderControl
+                                border.width: 2; clip: true
+
                                 // See RoundedCorners.qml.
                                 layer.enabled: true
                                 layer.smooth: true
-                                layer.effect: RoundedCorners { radius: wishlistCard.radius }
+                                layer.effect: RoundedCorners { radius: capsuleContainer.radius }
 
                                 Image {
-                                    id: wishlistCover
+                                    id: gameCover
                                     anchors.fill: parent
-                                    source: wishlistDelegate.modelData.coverPath || ""
-                                    fillMode: Image.PreserveAspectCrop
-                                    // Same as the recommendation cards.
-                                    sourceSize: root.api
-                                        ? root.api.decodeSize(wishlistCover.source.toString(),
-                                                              wishlistCard.width, wishlistCard.height,
-                                                              true, Screen.devicePixelRatio)
-                                        : Qt.size(-1, -1)
+
+                                    // Read through the bridge rather than straight
+                                    // off modelData, because artwork arrives after
+                                    // this card already exists. Falls back to the
+                                    // snapshot so an already-cached cover still
+                                    // shows on the very first frame.
+                                    //
+                                    // A not-installed card has no live row; its
+                                    // replacement for a cover Steam does not have
+                                    // comes from ownedSteamCover() instead.
+                                    source: {
+                                        if (gameDelegate.notInstalled && root.api) {
+                                            const _ = root.api.artRevision   // dependency, deliberate
+                                            const swapped = root.api.ownedSteamCover(
+                                                                gameDelegate.modelData.appid || 0)
+                                            if (swapped) return swapped
+                                        }
+                                        return (gameDelegate.liveDetails && gameDelegate.liveDetails.coverPath)
+                                               ? gameDelegate.liveDetails.coverPath
+                                               : (gameDelegate.modelData.coverPath || "")
+                                    }
+                                    // Steam's header.jpg, the last stand-in, is a
+                                    // wide banner: cropped to the card it loses
+                                    // the title, so it is shown whole instead.
+                                    fillMode: String(source).endsWith("/header.jpg")
+                                              ? Image.PreserveAspectFit : Image.PreserveAspectCrop
+
+                                    // Steps a not-installed card down to the next
+                                    // source (see ownedSteamCoverFailed()).
+                                    onStatusChanged: {
+                                        if (status === Image.Error && gameDelegate.notInstalled && root.api)
+                                            root.api.ownedSteamCoverFailed(
+                                                gameDelegate.modelData.appid || 0, String(source))
+                                    }
+
+                                    // Decoded off the UI thread, and at the card's
+                                    // size. The covers are 600x900 (SteamGridDB's
+                                    // grid size, larger for some local art), and a
+                                    // full synchronous decode per card stalled the
+                                    // frame each new row scrolled in on. With both
+                                    // dimensions set, PreserveAspectCrop scales to
+                                    // cover and crops, same as it draws; Qt applies
+                                    // the device pixel ratio itself.
+                                    asynchronous: true
+                                    sourceSize.width: capsuleContainer.width
+                                    sourceSize.height: capsuleContainer.height
+
                                     opacity: status === Image.Ready ? 1.0 : 0.0
                                     Behavior on opacity { NumberAnimation { duration: 250 } }
                                 }
 
-                                Text {
-                                    anchors.centerIn: parent
-                                    visible: wishlistCover.status !== Image.Ready
-                                    text: "NOT IN LIBRARY"
-                                    color: Theme.textFaint
-                                    font.pixelSize: 12
+                                // Only for a card with no art at all. Not merely
+                                // "not Ready": an asynchronous cover is Loading for a
+                                // few frames, and NO ART flashed on every card that
+                                // scrolled in.
+                                Column {
+                                    anchors.centerIn: parent; spacing: 10
+                                    visible: gameCover.status === Image.Null
+                                             || gameCover.status === Image.Error
+                                    Text { text: "NO ART"; color: Theme.textGhost; font.bold: true }
                                 }
 
-                                scale: wishlistDelegate.highlighted ? 1.04 : 1.0
+                                // Steam is downloading this game: a light sweeps
+                                // across the cover with the progress on it. Under
+                                // the focus strip, so the strip still lights the card.
+                                InstallSweep {
+                                    anchors.fill: parent
+                                    visible: gameDelegate.installing
+                                    reducedMotion: root.api ? root.api.reduceMotion : false
+                                    percent: gameDelegate.installStatus ? gameDelegate.installStatus.percent : 0
+                                    phase: gameDelegate.installStatus ? gameDelegate.installStatus.state : "starting"
+                                    detail: {
+                                        const s = gameDelegate.installStatus
+                                        if (!s || s.state !== "downloading" || !s.bytesPerSecond) return ""
+                                        return (s.bytesPerSecond / (1024 * 1024)).toFixed(1) + " MB/s"
+                                    }
+                                }
+
+                                // ── Focus treatment ───────────────────────
+                                //
+                                // The strip and the play button arrive with the
+                                // overflow button, on the same condition, so the
+                                // whole card resolves in one step.
+                                //
+                                // The playtime pill and the INSTALLED badge used to
+                                // live down here. They are in the caption now, which
+                                // is what freed the bottom of the cover.
+                                Item {
+                                    // Flush with the capsule's own edges rather
+                                    // than the content box inside its border: the
+                                    // strip is meant to read as the bottom of the
+                                    // card, so it spans the full width and sits on
+                                    // the bottom edge. It paints over the border
+                                    // along the way, which its 0.5 opacity lets
+                                    // through.
+                                    anchors.fill: parent
+
+                                    visible: opacity > 0
+                                    opacity: (gameDelegate.highlighted
+                                              || overflowButton.menuOpen) ? 1.0 : 0.0
+                                    Behavior on opacity { NumberAnimation { duration: 150 } }
+
+                                    // The canvas blurs this strip, but a CSS filter
+                                    // blurs the element's own content rather than
+                                    // the backdrop, and the content is a smooth
+                                    // gradient -- so the blur is very nearly a
+                                    // no-op and a plain Rectangle stands in for it.
+                                    // Worth the substitution: a MultiEffect here
+                                    // would cost a framebuffer on every card in the
+                                    // grid to soften two edges.
+                                    Rectangle {
+                                        id: focusScrim
+                                        anchors {
+                                            left: parent.left
+                                            right: parent.right
+                                            bottom: parent.bottom
+                                        }
+                                        height: 140
+
+                                        // Square: the capsule's mask rounds it along
+                                        // with the art, and rounding it separately
+                                        // would leave a crescent of bare art at the
+                                        // corners.
+
+                                        // Transparent at the top so the cover reads
+                                        // straight into the wash, solid at the
+                                        // bottom so the pill has full contrast under
+                                        // it. No blanket opacity: the fade is in the
+                                        // gradient, which keeps the bottom edge
+                                        // properly opaque instead of leaving bright
+                                        // artwork showing through it.
+                                        gradient: Gradient {
+                                            GradientStop { position: 0.0; color: "transparent" }
+                                            GradientStop { position: 1.0; color: Theme.artScrim }
+                                        }
+                                    }
+
+                                    // The white pill, in the bottom-left corner with
+                                    // the overflow button opposite it: one control
+                                    // row along the foot of the cover, sitting on
+                                    // the solid end of the gradient, which is what
+                                    // gives the white its contrast.
+                                    Rectangle {
+                                        id: playButton
+                                        readonly property bool hovered:
+                                            playArea.containsMouse && root.mouseInControl
+                                        // PLAY, then LAUNCHING on white until the game
+                                        // is up, then QUIT on red -- the same states
+                                        // the details pages' button walks through.
+                                        readonly property bool launching:
+                                            !!root.api && root.api.launchingGames.indexOf(gameDelegate.liveName) >= 0
+                                        readonly property bool running:
+                                            !!root.api && root.api.runningGames.indexOf(gameDelegate.liveName) >= 0
+
+                                        anchors.left: parent.left
+                                        anchors.bottom: parent.bottom
+                                        anchors.leftMargin: 16
+                                        anchors.bottomMargin: 10
+                                        // Grows to fit LAUNCHING, which is wider than
+                                        // the pill PLAY and QUIT sit in.
+                                        width: Math.max(96, playRow.implicitWidth + 32)
+                                        height: 38; radius: 19
+                                        Behavior on width { NumberAnimation { duration: 120 } }
+
+                                        // Nothing to launch on a Played row whose
+                                        // files are gone; the strip still reads fine
+                                        // without it.
+                                        visible: gameDelegate.launchable
+
+                                        color: playButton.launching ? Theme.accent
+                                             : playButton.running ? (playButton.hovered ? Theme.danger : Theme.dangerRest)
+                                             : playButton.hovered ? Theme.playHover : Theme.accent
+                                        Behavior on color { ColorAnimation { duration: 120 } }
+
+                                        Row {
+                                            id: playRow
+                                            anchors.centerIn: parent
+                                            spacing: 8
+
+                                            // Same assets as the details pages' button.
+                                            // Decoded at twice the drawn size so they
+                                            // stay sharp on a scaled display. None
+                                            // while launching: the label says it all.
+                                            Image {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                visible: !playButton.launching
+                                                source: playButton.running ? "assets/quit_hover.png"
+                                                      : playButton.hovered ? "assets/play_hover.png" : "assets/play.png"
+                                                sourceSize.width: 20
+                                                sourceSize.height: 20
+                                                width: 10; height: 10
+                                                fillMode: Image.PreserveAspectFit
+                                                smooth: true
+                                            }
+
+                                            Text {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                text: playButton.launching ? "LAUNCHING"
+                                                    : playButton.running ? "QUIT" : "PLAY"
+                                                color: !playButton.launching && (playButton.running || playButton.hovered)
+                                                       ? Theme.textPrimary : Theme.textInverse
+                                                font.pixelSize: 12
+                                                font.bold: true
+                                                font.letterSpacing: 1.5
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            id: playArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: playButton.launching ? Qt.BusyCursor : Qt.PointingHandCursor
+                                            // Nothing while a launch is under way;
+                                            // quits once the game is up.
+                                            onClicked: {
+                                                if (playButton.running)
+                                                    root.api.quitGame(gameDelegate.liveName)
+                                                else if (!playButton.launching)
+                                                    gameDelegate.play()
+                                            }
+                                        }
+                                    }
+
+                                    // INSTALL, where PLAY is on an installed card.
+                                    // Opens the launcher's drive picker; the card
+                                    // shows the download until Steam finishes it,
+                                    // then becomes an installed one.
+                                    Rectangle {
+                                        id: installButton
+                                        readonly property bool hovered:
+                                            installArea.containsMouse && root.mouseInControl
+
+                                        anchors.left: parent.left
+                                        anchors.bottom: parent.bottom
+                                        anchors.leftMargin: 16
+                                        anchors.bottomMargin: 10
+                                        width: installLabel.implicitWidth + 40
+                                        height: 38; radius: 19
+                                        visible: gameDelegate.notInstalled && !gameDelegate.installing
+
+                                        color: installButton.hovered ? Theme.steamAccent : Theme.steamBg
+                                        border.color: Theme.steamAccent
+                                        Behavior on color { ColorAnimation { duration: 120 } }
+
+                                        Text {
+                                            id: installLabel
+                                            anchors.centerIn: parent
+                                            text: "INSTALL"
+                                            color: installButton.hovered ? Theme.steamBg : Theme.steamAccent
+                                            font.pixelSize: 12
+                                            font.bold: true
+                                            font.letterSpacing: 1.5
+                                        }
+
+                                        MouseArea {
+                                            id: installArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: gameDelegate.install()
+                                        }
+                                    }
+
+                                    // ── Overflow button ─────────────────────────
+                                    //
+                                    // Bottom-right, level with the play pill. Lives
+                                    // on the art rather than over the delegate so it
+                                    // scales with the cover and stays in line with
+                                    // the pill; the Column's z keeps it above
+                                    // cardArea for clicks, as it does the pill.
+                                    //
+                                    // Just the dots, no disc behind them.
+                                    Item {
+                                        id: overflowButton
+                                        readonly property bool hovered:
+                                            overflowArea.containsMouse && root.mouseInControl
+                                        // While its own menu is open the menu's first
+                                        // cell stands in for this button, so it steps
+                                        // aside rather than being caught in the menu's
+                                        // frosted backdrop as a smeared grey disc.
+                                        readonly property bool menuOpen:
+                                            tileMenu.visible
+                                            && tileMenu.gameName === gameDelegate.liveName
+
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: playButton.verticalCenter
+                                        anchors.rightMargin: 10
+                                        width: 38; height: 38
+                                        // No menu for a game that is not installed.
+                                        visible: !gameDelegate.notInstalled
+
+                                        opacity: overflowButton.menuOpen ? 0.0 : 1.0
+                                        Behavior on opacity { NumberAnimation { duration: 150 } }
+
+                                        // Drawn rather than typed: the ⋮ glyph renders
+                                        // at a different weight and baseline in every
+                                        // font, and the rest of this UI has no font
+                                        // family set at all.
+                                        Column {
+                                            anchors.centerIn: parent
+                                            spacing: 3
+                                            Repeater {
+                                                model: 3
+                                                Rectangle {
+                                                    width: 4; height: 4; radius: 2
+                                                    color: overflowButton.hovered ? Theme.accent : Theme.bgDot
+                                                }
+                                            }
+                                        }
+
+                                        // Only the middle 22x26 takes the click --
+                                        // the glyph plus a little margin; the item
+                                        // stays 38px because the menu is laid over
+                                        // its box.
+                                        MouseArea {
+                                            id: overflowArea
+                                            anchors.centerIn: parent
+                                            width: 22; height: 26
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                if (root.padActive)
+                                                    gameGrid.currentIndex = gameDelegate.index
+                                                gameDelegate.openTileMenu()
+                                            }
+                                        }
+                                    }
+
+                                    // Pauses the download, then resumes it: the
+                                    // close button's twin, left of it. Two bars
+                                    // while it runs, the play triangle while it
+                                    // is paused. X does the same from the pad.
+                                    Rectangle {
+                                        id: pauseButton
+                                        readonly property bool emphasized:
+                                            pauseArea.containsMouse && root.mouseInControl
+
+                                        anchors.right: cancelButton.left
+                                        anchors.rightMargin: 10
+                                        anchors.verticalCenter: cancelButton.verticalCenter
+                                        width: 44; height: 44; radius: 10
+                                        visible: gameDelegate.canCancel
+                                        color: pauseButton.emphasized ? "#B32A2A2A" : "#80000000"
+                                        border.width: pauseButton.emphasized ? 2 : 1
+                                        border.color: pauseButton.emphasized ? Theme.focusRing : Theme.borderControl
+                                        scale: pauseButton.emphasized ? 1.1 : 1.0
+
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
+
+                                        // Pause: two white bars in close.png's 20x20 box.
+                                        Row {
+                                            anchors.centerIn: parent
+                                            spacing: 6
+                                            visible: !gameDelegate.isPaused
+                                            Rectangle { width: 6; height: 18; radius: 1.5; color: "white" }
+                                            Rectangle { width: 6; height: 18; radius: 1.5; color: "white" }
+                                        }
+                                        // Play: the white triangle, nudged right so
+                                        // its weight sits in the middle.
+                                        Image {
+                                            anchors.centerIn: parent
+                                            anchors.horizontalCenterOffset: 1
+                                            visible: gameDelegate.isPaused
+                                            width: 20; height: 20
+                                            source: "assets/play_hover.png"
+                                            sourceSize.width: 40
+                                            sourceSize.height: 40
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                        }
+                                        MouseArea {
+                                            id: pauseArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: gameDelegate.togglePause()
+                                        }
+                                    }
+
+                                    // Cancels the download under way: the same
+                                    // close button as the details page, in the
+                                    // overflow button's corner, which a card that
+                                    // is not installed leaves free. One click
+                                    // stops Steam and deletes what it had
+                                    // fetched; R3 does the same from the pad.
+                                    Rectangle {
+                                        id: cancelButton
+                                        readonly property bool emphasized:
+                                            cancelArea.containsMouse && root.mouseInControl
+
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 10
+                                        anchors.verticalCenter: installButton.verticalCenter
+                                        width: 44; height: 44; radius: 10
+                                        visible: gameDelegate.canCancel
+                                        color: cancelButton.emphasized ? "#B32A2A2A" : "#80000000"
+                                        border.width: cancelButton.emphasized ? 2 : 1
+                                        border.color: cancelButton.emphasized ? Theme.focusRing : Theme.borderControl
+                                        scale: cancelButton.emphasized ? 1.1 : 1.0
+
+                                        Behavior on color { ColorAnimation { duration: 150 } }
+                                        Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
+
+                                        // White X, decoded at twice the drawn size.
+                                        Image {
+                                            anchors.centerIn: parent
+                                            width: 20; height: 20
+                                            source: "assets/close.png"
+                                            sourceSize.width: 40
+                                            sourceSize.height: 40
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                        }
+                                        MouseArea {
+                                            id: cancelArea
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: gameDelegate.cancelInstall()
+                                        }
+                                    }
+                                }
+
+                                // Held while the card's menu is open: the button
+                                // now rides the scale, and the menu is placed over
+                                // it once, at the size it had when it opened.
+                                scale: (gameDelegate.highlighted || overflowButton.menuOpen) ? 1.04 : 1.0
                                 Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
                             }
 
@@ -2589,56 +2197,996 @@ Window {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 spacing: 4
 
-                                Text {
+                                // ── Title ───────────────────────────────────────
+                                //
+                                // Source mark, then the name. The mark is Library
+                                // only, though this delegate also serves Favorites
+                                // and Played: those two are already narrowed to
+                                // games you know, and Library is the one grid you
+                                // scan whole.
+                                Row {
+                                    id: titleRow
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    width: 220
-                                    text: wishlistDelegate.modelData.name
-                                    color: wishlistDelegate.highlighted ? Theme.textPrimary : Theme.textBody
-                                    font.pixelSize: 15
-                                    font.weight: Font.DemiBold
-                                    horizontalAlignment: Text.AlignHCenter
-                                    elide: Text.ElideRight
+                                    spacing: 6
+
+                                    readonly property bool showMark: root.activeTab === "Library"
+
+                                    Item {
+                                        visible: titleRow.showMark
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 16; height: 16
+
+                                        // Steam's own colours, unfiltered: the mark
+                                        // is the contrast between the pipe glyph and
+                                        // the disc behind it, and whitening it costs
+                                        // the glyph its ground. Decoded at the drawn
+                                        // size -- the asset is 600x600, and handed
+                                        // over whole it aliases badly at 16px.
+                                        Image {
+                                            anchors.fill: parent
+                                            source: "assets/steam.png"
+                                            sourceSize.width: 16
+                                            sourceSize.height: 16
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                            visible: gameDelegate.fromSteam
+                                        }
+
+                                        // EA's own disc, unfiltered for the same
+                                        // reason as Steam's. The asset is 1000x1000.
+                                        Image {
+                                            anchors.fill: parent
+                                            source: "assets/ea.png"
+                                            sourceSize.width: 16
+                                            sourceSize.height: 16
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                            visible: gameDelegate.fromEa
+                                        }
+
+                                        // Riot's own disc, from the Riot Client's
+                                        // icon, unfiltered like the two above. The
+                                        // asset is 256x256.
+                                        Image {
+                                            anchors.fill: parent
+                                            source: "assets/riot.png"
+                                            sourceSize.width: 16
+                                            sourceSize.height: 16
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                            visible: gameDelegate.fromRiot
+                                        }
+
+                                        // White on transparent, baked at build time.
+                                        Image {
+                                            anchors.fill: parent
+                                            source: "assets/local.png"
+                                            sourceSize.width: 16
+                                            sourceSize.height: 16
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                            opacity: 0.7
+                                            visible: !gameDelegate.fromSteam && !gameDelegate.fromEa
+                                                     && !gameDelegate.fromRiot
+                                        }
+                                    }
+
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: gameDelegate.liveName
+                                        color: gameDelegate.highlighted ? Theme.textPrimary : Theme.textBody
+                                        font.pixelSize: 15; font.weight: Font.DemiBold
+                                        elide: Text.ElideRight
+                                        // 220 across the whole row, as before.
+                                        width: Math.min(implicitWidth,
+                                                        titleRow.showMark ? 220 - 16 - titleRow.spacing : 220)
+                                    }
                                 }
 
-                                Text {
+                                // ── Caption ─────────────────────────────────────
+                                //
+                                // playtime · source · genre. This is where the two
+                                // badges that used to sit on the artwork went. The
+                                // covers are the point of the grid, and enough of
+                                // them are missing in a real library that the
+                                // caption often has to carry the card on its own.
+                                //
+                                // Library cards are title-only; Played and
+                                // Favorites keep the caption.
+                                Row {
+                                    visible: root.activeTab !== "Library"
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    width: 220
-                                    text: wishlistDelegate.modelData.developer || ""
-                                    color: Theme.textFaint
-                                    font.pixelSize: 11
-                                    horizontalAlignment: Text.AlignHCenter
-                                    elide: Text.ElideRight
+                                    spacing: 7
+
+                                    // Still the exception it always was: only the
+                                    // Played tab holds games that are gone from the
+                                    // disk, so only it earns the marker.
+                                    Rectangle {
+                                        visible: root.activeTab === "Played"
+                                                 && gameDelegate.modelData.installed === true
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 6; height: 6; radius: 3
+                                        color: Theme.positive
+                                    }
+
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        // "0m" is what the bridge returns for a game
+                                        // that was never launched. An em dash says
+                                        // that; a zero reads like a measurement.
+                                        text: gameDelegate.playtimeLabel === "0m"
+                                              ? "—" : gameDelegate.playtimeLabel
+                                        color: Theme.textMuted
+                                        font.pixelSize: 11
+                                    }
+
+                                    Text {
+                                        visible: gameDelegate.genreLabel !== ""
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: "·"
+                                        color: Theme.textGhost
+                                        font.pixelSize: 11
+                                    }
+
+                                    Text {
+                                        visible: gameDelegate.genreLabel !== ""
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: gameDelegate.genreLabel
+                                        color: Theme.textMuted
+                                        font.pixelSize: 11
+                                        elide: Text.ElideRight
+                                        width: Math.min(implicitWidth, 90)
+                                    }
                                 }
                             }
                         }
 
                         MouseArea {
-                            id: wishlistArea
-                            anchors.fill: parent
-                            anchors.margins: 8
-                            hoverEnabled: true
+                            id: cardArea
+                            anchors.fill: parent; anchors.margins: 8; hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
+                                // Keep the pad's place in sync when both are in use.
                                 if (root.padActive)
-                                    wishlistGrid.currentIndex = wishlistDelegate.index
-                                browseDetails.openForGame(wishlistDelegate.modelData.name, "Wishlist")
+                                    gameGrid.currentIndex = gameDelegate.index
+                                launcherStage.aimAt(gameDelegate)
+                                // Favorites and Played share this grid with the
+                                // library but open the Browse-style page.
+                                if (root.activeTab === "Favorites" || root.activeTab === "Played"
+                                    || gameDelegate.notInstalled) {
+                                    browseDetails.openForGame(gameDelegate.liveName, root.activeTab)
+                                    return
+                                }
+                                detailPopup.launchOrigin = "Library"
+                                detailPopup.selectedGameName = gameDelegate.liveName
+                                detailPopup.open()
                             }
                         }
                     }
                 }
-            }
 
-            // ── Browse ──────────────────────────────────────────────────────
-            // The whole IGDB catalog rather than the user's own lists. See
-            // BrowsePage.qml; results open BrowseDetails, not GameDetails.
-            BrowsePage {
-                id: browsePage
-                igdbConfigured: root.igdbConfigured
-                padActive: root.padActive
-                padInControl: root.padInControl
-                glowStage: glowStage
-                onOpenRequested: (item) => browseDetails.openFor(item)
-                onSettingsRequested: settingsWindow.open()
+                Item {
+                    id: recommendationPage
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 18
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+
+                            Text {
+                                text: "RECOMMENDATIONS"
+                                color: Theme.textPrimary
+                                font.pixelSize: 22
+                                font.bold: true
+                                font.letterSpacing: 2
+                            }
+
+                            // The one line in this tab that is always on screen.
+                            //
+                            // The sections below scroll, and with enough library
+                            // picks the DISCOVER heading — and every explanation
+                            // attached to it — sits past the fold, so a user with
+                            // rejected credentials saw a working-looking library
+                            // and no hint that anything was wrong. Whatever is
+                            // actually blocking gets said here instead.
+                            Text {
+                                readonly property string blocker:
+                                    root.api ? root.api.authBlocker : ""
+                                readonly property bool downloadingCatalog:
+                                    root.api ? root.api.catalogRefreshing : false
+
+                                text: {
+                                    if (!root.api) return "Recommendations not loaded"
+                                    if (downloadingCatalog) {
+                                        const n = root.api.catalogFetched
+                                        // Discover already has picks: this is the
+                                        // periodic refresh, not first-time setup,
+                                        // and the current picks stay until it ends.
+                                        const list = root.api.recommendationList || []
+                                        const refreshing = list.some(function (item) {
+                                            return item.section === "discover"
+                                        })
+                                        return (refreshing ? "Updating catalog in the background"
+                                                           : root.api.catalogPhase)
+                                             + (n > 0 ? " — " + n + " games downloaded"
+                                                      : refreshing ? ""
+                                                                   : " — this runs once, a few minutes")
+                                    }
+                                    if (blocker !== "") return blocker
+                                    return root.api.recommendationStatus
+                                }
+
+                                // Amber for a real blocker, so it reads as
+                                // something to act on rather than as status noise.
+                                color: (blocker !== "" && !downloadingCatalog) ? Theme.caution : Theme.textMuted
+                                font.pixelSize: 13
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                        }
+
+                        // Two independently ranked lists. Ranked together, discovery
+                        // wins every slot on numbers alone — the IGDB catalog is
+                        // ~200x larger than the unplayed library — and games the
+                        // user could actually launch right now disappear.
+                        Flickable {
+                            id: recommendationFlick
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            contentHeight: recommendationSections.height
+                            ScrollBar.vertical: VortexScrollBar { }
+                            WheelScroller { view: recommendationFlick }
+
+                            Column {
+                                id: recommendationSections
+                                width: parent.width
+                                spacing: 8
+
+                                Repeater {
+                                    model: [
+                                        { key: "library",  title: "FROM YOUR LIBRARY", blurb: "Installed and ready to play" },
+                                        { key: "discover", title: "DISCOVER",          blurb: "Not in your library yet" }
+                                    ]
+
+                                    delegate: Column {
+                                        id: sectionColumn
+                                        required property var modelData
+                                        width: recommendationSections.width
+                                        spacing: 6
+
+                                        readonly property var picks: {
+                                            if (!root.api || !root.api.recommendationList) return []
+                                            return root.api.recommendationList.filter(function (item) {
+                                                // Fallback output carries no section; treat it as library.
+                                                return (item.section || "library") === sectionColumn.modelData.key
+                                            })
+                                        }
+
+                                        // Discover keeps its heading when empty and
+                                        // explains itself instead. Hiding it made
+                                        // "the catalog was never downloaded" look
+                                        // identical to "this feature does not
+                                        // exist", which is how it went unnoticed.
+                                        readonly property bool isDiscover:
+                                            sectionColumn.modelData.key === "discover"
+                                        readonly property bool igdbUsable: root.igdbWorking
+
+                                        visible: sectionColumn.picks.length > 0
+                                                 || (sectionColumn.isDiscover
+                                                     && root.api
+                                                     && !root.api.isRecommendationLoading)
+
+                                        Row {
+                                            spacing: 10
+                                            Text {
+                                                text: sectionColumn.modelData.title
+                                                color: Theme.textSecondary
+                                                font.pixelSize: 14
+                                                font.bold: true
+                                                font.letterSpacing: 2
+                                            }
+                                            Text {
+                                                text: sectionColumn.modelData.blurb
+                                                color: Theme.textFaint
+                                                font.pixelSize: 12
+                                                anchors.verticalCenter: parent.verticalCenter
+                                            }
+                                        }
+
+                                        // ── Discover empty / downloading state ──
+                                        Item {
+                                            id: discoverEmptyState
+                                            width: parent.width
+                                            height: visible ? 92 : 0
+                                            visible: sectionColumn.isDiscover
+                                                     && sectionColumn.picks.length === 0
+
+                                            readonly property bool downloading:
+                                                root.api ? root.api.catalogRefreshing : false
+
+                                            Column {
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                spacing: 8
+
+                                                Row {
+                                                    spacing: 12
+                                                    visible: discoverEmptyState.downloading
+
+                                                    BusyIndicator {
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        running: parent.visible
+                                                        implicitWidth: 22
+                                                        implicitHeight: 22
+                                                    }
+
+                                                    Column {
+                                                        spacing: 3
+                                                        Text {
+                                                            text: root.api ? root.api.catalogPhase : ""
+                                                            color: Theme.textSecondary
+                                                            font.pixelSize: 13
+                                                        }
+                                                        Text {
+                                                            // A running count, not a
+                                                            // percentage: IGDB is paged
+                                                            // by keyset until the pages
+                                                            // run out, so the total is
+                                                            // genuinely unknown until
+                                                            // the end.
+                                                            text: (root.api && root.api.catalogFetched > 0)
+                                                                  ? (root.api.catalogFetched
+                                                                     + " games downloaded so far")
+                                                                  : "This runs once and takes a few minutes."
+                                                            color: Theme.textFaint
+                                                            font.pixelSize: 11
+                                                        }
+                                                    }
+                                                }
+
+                                                Text {
+                                                    visible: !discoverEmptyState.downloading
+                                                             && !sectionColumn.igdbUsable
+                                                    width: 620
+                                                    wrapMode: Text.WordWrap
+                                                    color: Theme.textFaint
+                                                    font.pixelSize: 12
+                                                    // Says which of the two it is
+                                                    // rather than guessing: keys
+                                                    // absent and keys refused need
+                                                    // different actions.
+                                                    text: root.api && root.api.authBlocker !== ""
+                                                          ? root.api.authBlocker
+                                                          : ("Discover suggests games you don't own yet. "
+                                                             + "It needs free IGDB credentials — add them in "
+                                                             + "Settings and the catalogue downloads itself.")
+                                                }
+
+                                                Text {
+                                                    visible: !discoverEmptyState.downloading
+                                                             && sectionColumn.igdbUsable
+                                                    width: 620
+                                                    wrapMode: Text.WordWrap
+                                                    color: Theme.textFaint
+                                                    font.pixelSize: 12
+                                                    text: "Nothing to suggest yet. Play a few games so Vortex "
+                                                        + "learns what you like, or refresh the catalogue "
+                                                        + "from Settings."
+                                                }
+                                            }
+                                        }
+
+                                        GridView {
+                                            id: sectionGrid
+                                            objectName: sectionColumn.modelData.key
+                                            width: parent.width
+                                            // Sized to content: the outer Flickable
+                                            // scrolls, so an inner scroll area would
+                                            // fight it.
+                                            height: Math.ceil(sectionColumn.picks.length
+                                                              / sectionGrid.columns) * sectionGrid.cellHeight
+                                            interactive: false
+                                            // Same art size and column pitch as the
+                                            // library grid -- including its elastic
+                                            // gutters, so the two tabs line up at
+                                            // any width. The card is 448 tall (360
+                                            // art + 88 caption) inside a 488 cell,
+                                            // which is the library's 400-in-440 with
+                                            // the two extra caption lines added to
+                                            // both numbers.
+                                            readonly property int minCellWidth: 280
+                                            readonly property int columns:
+                                                Math.max(1, Math.floor(sectionGrid.width
+                                                                       / sectionGrid.minCellWidth))
+
+                                            cellWidth: sectionGrid.width > 0
+                                                       ? Math.floor(sectionGrid.width / sectionGrid.columns)
+                                                       : sectionGrid.minCellWidth
+                                            cellHeight: 488
+                                            model: sectionColumn.picks
+
+                                            Component.onCompleted: {
+                                                if (sectionColumn.modelData.key === "library")
+                                                    root.libraryPickGridRef = sectionGrid
+                                                else
+                                                    root.discoverGridRef = sectionGrid
+                                            }
+
+                                            currentIndex: -1
+                                            onCountChanged: {
+                                                if (!root.padActive || sectionGrid.count === 0)
+                                                    sectionGrid.currentIndex = -1
+                                                else if (sectionGrid.currentIndex < 0)
+                                                    sectionGrid.currentIndex = 0
+                                            }
+
+                                            delegate: Item {
+                                                id: recommendationDelegate
+                                                required property var modelData
+                                                required property int index
+
+                                                readonly property bool isFocusedSection:
+                                                    root.recFocus === sectionColumn.modelData.key
+                                                readonly property bool highlighted:
+                                                    (recommendationArea.containsMouse && root.mouseInControl)
+                                                    || (recommendationDelegate.GridView.isCurrentItem
+                                                        && recommendationDelegate.isFocusedSection
+                                                        && root.padInControl)
+
+                                                // 256 for the hover scale's
+                                                // overhang, as in the library grid
+                                                // -- which also keeps the two tabs'
+                                                // columns lined up.
+                                                width: 256
+                                                height: 448
+
+                                                // The tab pop-in, as on the library
+                                                // grid. Both sections sit in one
+                                                // Flickable and their grids never
+                                                // scroll, so the beat is counted
+                                                // from where the card is on screen
+                                                // rather than from its index.
+                                                transform: Translate { id: recommendationEnterShift }
+                                                function popIn() {
+                                                    const shownY = sectionColumn.y + sectionGrid.y
+                                                                   + recommendationDelegate.y
+                                                                   - recommendationFlick.contentY
+                                                    const slot = Math.floor(shownY / sectionGrid.cellHeight)
+                                                                 * sectionGrid.columns
+                                                                 + recommendationDelegate.index % sectionGrid.columns
+                                                    recommendationEnterPause.duration =
+                                                        Math.max(0, Math.min(slot, 12)) * 40
+                                                    recommendationEnterAnim.stop()
+                                                    recommendationDelegate.opacity = 0
+                                                    recommendationEnterShift.y = 18
+                                                    recommendationEnterAnim.start()
+                                                }
+                                                Component.onCompleted: {
+                                                    if (Date.now() - root.popStamp <= 250)
+                                                        recommendationDelegate.popIn()
+                                                }
+                                                Connections {
+                                                    target: root
+                                                    function onPopStampChanged() {
+                                                        if (root.activeTab === "Recommendations")
+                                                            recommendationDelegate.popIn()
+                                                    }
+                                                }
+                                                SequentialAnimation {
+                                                    id: recommendationEnterAnim
+                                                    PauseAnimation { id: recommendationEnterPause }
+                                                    ParallelAnimation {
+                                                        NumberAnimation {
+                                                            target: recommendationDelegate; property: "opacity"
+                                                            to: 1.0; duration: 380; easing.type: Easing.OutCubic
+                                                        }
+                                                        NumberAnimation {
+                                                            target: recommendationEnterShift; property: "y"
+                                                            to: 0; duration: 380; easing.type: Easing.OutCubic
+                                                        }
+                                                    }
+                                                }
+
+                                                // Top-anchored, not centred: the
+                                                // reason line is one or two lines
+                                                // depending on the title, and
+                                                // centring pushed the art of the
+                                                // two-line cards up out of line
+                                                // with its neighbours.
+                                                CoverGlow {
+                                                    target: recommendationCard
+                                                    stage: glowStage
+                                                    source: recommendationCover
+                                                    lit: recommendationDelegate.highlighted
+                                                }
+
+                                                Column {
+                                                    anchors.top: parent.top
+                                                    anchors.horizontalCenter: parent.horizontalCenter
+                                                    spacing: 0
+
+                                                    Rectangle {
+                                                        id: recommendationCard
+                                                        width: 240
+                                                        height: 360
+                                                        radius: 8
+                                                        color: Theme.bgSurface
+                                                        border.width: 2
+                                                        border.color: Theme.borderMuted
+                                                        clip: true
+                                                        // See RoundedCorners.qml.
+                                                        layer.enabled: true
+                                                        layer.smooth: true
+                                                        layer.effect: RoundedCorners { radius: recommendationCard.radius }
+
+                                                        Image {
+                                                            id: recommendationCover
+                                                            anchors.fill: parent
+                                                            source: recommendationDelegate.modelData.coverPath || ""
+                                                            fillMode: Image.PreserveAspectCrop
+                                                            // At the card's size, as the library
+                                                            // grid does -- but through the bridge,
+                                                            // which leaves IGDB's 264x374 remote
+                                                            // covers alone rather than upscaling
+                                                            // them, and shrinks local 600x900 art.
+                                                            sourceSize: root.api
+                                                                ? root.api.decodeSize(recommendationCover.source.toString(),
+                                                                                      recommendationCard.width, recommendationCard.height,
+                                                                                      true, Screen.devicePixelRatio)
+                                                                : Qt.size(-1, -1)
+                                                            opacity: status === Image.Ready ? 1.0 : 0.0
+                                                            Behavior on opacity { NumberAnimation { duration: 250 } }
+                                                        }
+
+                                                        // Already-saved marker. The wishlist never affects
+                                                        // ranking, so a saved game keeps appearing here —
+                                                        // this just shows you already have it.
+                                                        Rectangle {
+                                                            visible: root.api
+                                                                     && !recommendationDelegate.modelData.matched
+                                                                     && root.api.isWishlisted(recommendationDelegate.modelData.name)
+                                                            anchors.right: parent.right
+                                                            anchors.top: parent.top
+                                                            anchors.margins: 10
+                                                            width: 30; height: 30; radius: 15
+                                                            color: Theme.overlayStrong
+                                                            border.color: Theme.borderControl
+                                                            Text {
+                                                                anchors.centerIn: parent
+                                                                text: "\u{1F6D2}"
+                                                                font.pixelSize: 14
+                                                            }
+                                                        }
+
+                                                        Column {
+                                                            anchors.centerIn: parent
+                                                            spacing: 8
+                                                            visible: recommendationCover.status !== Image.Ready
+
+                                                            Text {
+                                                                anchors.horizontalCenter: parent.horizontalCenter
+                                                                text: "ML PICK"
+                                                                color: Theme.textGhost
+                                                                font.pixelSize: 18
+                                                                font.bold: true
+                                                                font.letterSpacing: 2
+                                                            }
+
+                                                            Text {
+                                                                anchors.horizontalCenter: parent.horizontalCenter
+                                                                width: 200
+                                                                text: recommendationDelegate.modelData.matched ? "NO ART" : "NOT IN LIBRARY"
+                                                                color: Theme.textFaint
+                                                                font.pixelSize: 12
+                                                                horizontalAlignment: Text.AlignHCenter
+                                                            }
+                                                        }
+
+                                                        scale: recommendationDelegate.highlighted ? 1.04 : 1.0
+                                                        Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
+                                                    }
+
+                                                    // ── Caption ──
+                                                    //
+                                                    // One fixed-height block with a
+                                                    // reserved slot per line, so a
+                                                    // card's geometry never depends
+                                                    // on how long its title is or
+                                                    // whether it has a match figure.
+                                                    // Letting the text size itself
+                                                    // is what made the grid ragged:
+                                                    // a two-line reason pushed the
+                                                    // lines below it down, and a
+                                                    // missing match line collapsed
+                                                    // the slot altogether, so no two
+                                                    // captions shared a baseline.
+                                                    Item {
+                                                        width: 240
+                                                        height: 88
+
+                                                        Text {
+                                                            id: recommendationTitle
+                                                            anchors.top: parent.top
+                                                            anchors.topMargin: 12
+                                                            anchors.horizontalCenter: parent.horizontalCenter
+                                                            width: 220
+                                                            height: 20
+                                                            text: recommendationDelegate.modelData.name
+                                                            color: recommendationDelegate.highlighted ? Theme.textPrimary : Theme.textBody
+                                                            font.pixelSize: 15
+                                                            font.weight: Font.DemiBold
+                                                            horizontalAlignment: Text.AlignHCenter
+                                                            verticalAlignment: Text.AlignVCenter
+                                                            elide: Text.ElideRight
+                                                        }
+
+                                                        // Replaces the score badge. MMR reorders picks for
+                                                        // variety, so the numbers were not monotonically
+                                                        // descending and read as a bug; the reason is what
+                                                        // the player can actually act on.
+                                                        //
+                                                        // Two lines are always reserved, at a fixed line
+                                                        // height so the box is exactly 2 × 15 whatever the
+                                                        // font metrics do, and the text is centred inside
+                                                        // them — a one-line reason then sits optically
+                                                        // centred instead of hugging the top of a visibly
+                                                        // empty box.
+                                                        Text {
+                                                            id: recommendationReason
+                                                            anchors.top: recommendationTitle.bottom
+                                                            anchors.topMargin: 6
+                                                            anchors.horizontalCenter: parent.horizontalCenter
+                                                            width: 220
+                                                            height: 30
+                                                            text: recommendationDelegate.modelData.reason || ""
+                                                            color: Theme.textFaint
+                                                            font.pixelSize: 11
+                                                            lineHeight: 15
+                                                            lineHeightMode: Text.FixedHeight
+                                                            horizontalAlignment: Text.AlignHCenter
+                                                            verticalAlignment: Text.AlignVCenter
+                                                            wrapMode: Text.WordWrap
+                                                            maximumLineCount: 2
+                                                            elide: Text.ElideRight
+                                                        }
+
+                                                        // How strong the link above
+                                                        // actually is.
+                                                        //
+                                                        // The reason line names one of
+                                                        // your games; on its own that
+                                                        // is an assertion. recommend.py
+                                                        // already computes the cosine
+                                                        // behind it (inspiredBy, from
+                                                        // scoring.inspiration_sources)
+                                                        // and used to throw it away, so
+                                                        // showing the top match costs
+                                                        // nothing and turns the claim
+                                                        // into something checkable.
+                                                        // Click the card for the full
+                                                        // per-mood breakdown in the
+                                                        // console.
+                                                        //
+                                                        // Fades out rather than hiding:
+                                                        // visible:false would give the
+                                                        // cards without one a shorter
+                                                        // caption than their neighbours.
+                                                        Text {
+                                                            readonly property var topMatch: {
+                                                                const list = recommendationDelegate.modelData.inspiredBy
+                                                                return (list && list.length > 0) ? list[0] : null
+                                                            }
+
+                                                            anchors.top: recommendationReason.bottom
+                                                            anchors.topMargin: 6
+                                                            anchors.horizontalCenter: parent.horizontalCenter
+                                                            height: 14
+                                                            opacity: (topMatch !== null
+                                                                      && recommendationDelegate.modelData.reason
+                                                                      && String(recommendationDelegate.modelData.reason).indexOf("Because you") === 0)
+                                                                     ? 1.0 : 0.0
+                                                            text: topMatch
+                                                                  ? (Math.round(topMatch.similarity * 100) + "% match")
+                                                                  : ""
+                                                            color: Theme.textGhost
+                                                            font.pixelSize: 10
+                                                            font.letterSpacing: 0.5
+                                                            verticalAlignment: Text.AlignVCenter
+                                                        }
+                                                    }
+                                                }
+
+                                                MouseArea {
+                                                    id: recommendationArea
+                                                    anchors.fill: parent
+                                                    anchors.leftMargin: 8; anchors.rightMargin: 8
+                                                    hoverEnabled: true
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    // Opens the Browse-style page, owned or
+                                                    // not: it resolves the pick by name.
+                                                    onClicked: {
+                                                        if (root.padActive) {
+                                                            root.recFocus = sectionColumn.modelData.key
+                                                            sectionGrid.currentIndex = recommendationDelegate.index
+                                                        }
+                                                        if (root.api)
+                                                            root.api.logRecommendationClick(
+                                                                recommendationDelegate.modelData.name,
+                                                                recommendationDelegate.index + 1)
+                                                        launcherStage.aimAt(recommendationDelegate)
+                                                        browseDetails.openForGame(
+                                                            recommendationDelegate.modelData.name,
+                                                            "Recommendations")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            Layout.alignment: Qt.AlignHCenter
+                            visible: root.api && !root.api.isRecommendationLoading
+                                     && root.api.recommendationList
+                                     && root.api.recommendationList.length === 0
+                            text: "NO RECOMMENDATIONS YET"
+                            color: Theme.textGhost
+                            font.pixelSize: 18
+                            font.bold: true
+                            font.letterSpacing: 2
+                        }
+                    }
+                }
+
+                // ── Wishlist ────────────────────────────────────────────────────
+                // Renders entirely from wishlist.json, which stores a metadata
+                // snapshot per entry. Wishlisted games are unowned, so there is no
+                // library row to read — and this way the tab still works with
+                // Postgres stopped and no network.
+                Item {
+                    GridView {
+                        id: wishlistGrid
+                        anchors.fill: parent
+                        clip: true
+                        // Elastic gutters, as on the library grid above.
+                        readonly property int minCellWidth: 280
+                        readonly property int columns:
+                            Math.max(1, Math.floor(wishlistGrid.width / wishlistGrid.minCellWidth))
+
+                        cellWidth: wishlistGrid.width > 0
+                                   ? Math.floor(wishlistGrid.width / wishlistGrid.columns)
+                                   : wishlistGrid.minCellWidth
+                        cellHeight: 440
+                        model: {
+                            const list = root.api && root.api.wishlistGames ? root.api.wishlistGames : []
+                            if (root.searchText.trim() === "")
+                                return list
+                            return list.filter(function(game) {
+                                return root.matchesSearch([game.name])
+                            })
+                        }
+
+                        ScrollBar.vertical: VortexScrollBar { }
+                        WheelScroller { view: wishlistGrid }
+
+                        currentIndex: -1
+
+                        // Same as gameGrid.restoreY, for the same reason: removing
+                        // a game from the wishlist rebuilds wishlistGames.
+                        property real restoreY: -1
+
+                        function restoreScroll() {
+                            if (wishlistGrid.restoreY < 0)
+                                return
+                            wishlistGrid.contentY = Math.max(0, Math.min(
+                                wishlistGrid.restoreY,
+                                wishlistGrid.contentHeight - wishlistGrid.height))
+                        }
+
+                        onContentHeightChanged: wishlistGrid.restoreScroll()
+
+                        onCountChanged: {
+                            wishlistGrid.restoreScroll()
+
+                            if (!root.padActive || wishlistGrid.count === 0)
+                                wishlistGrid.currentIndex = -1
+                            else if (wishlistGrid.currentIndex < 0)
+                                wishlistGrid.currentIndex = 0
+                        }
+
+                        Text {
+                            anchors.centerIn: parent
+                            visible: wishlistGrid.count === 0 && root.searchText.trim() !== ""
+                            text: "NO MATCHES FOR \u201C" + root.searchText.trim() + "\u201D"
+                            width: wishlistGrid.width - 80
+                            horizontalAlignment: Text.AlignHCenter
+                            elide: Text.ElideMiddle
+                            color: Theme.textGhost
+                            font.pixelSize: 16
+                            font.bold: true
+                            font.letterSpacing: 2
+                        }
+
+                        Text {
+                            anchors.centerIn: parent
+                            visible: wishlistGrid.count === 0 && root.searchText.trim() === ""
+                            text: "NOTHING WISHLISTED YET\nOpen a Discover pick and tap Add to Wishlist"
+                            horizontalAlignment: Text.AlignHCenter
+                            color: Theme.textGhost
+                            font.pixelSize: 16
+                            font.bold: true
+                            font.letterSpacing: 2
+                        }
+
+                        delegate: Item {
+                            id: wishlistDelegate
+                            required property var modelData
+                            required property int index
+
+                            readonly property bool highlighted:
+                                (wishlistArea.containsMouse && root.mouseInControl)
+                                || (wishlistDelegate.GridView.isCurrentItem && root.padInControl)
+
+                            // Same card as the library grid: 240x360 art in a
+                            // 240x415 cell, so switching tabs doesn't resize them.
+                            // Padded to 256x431 for the hover scale, as there.
+                            width: 256
+                            height: 431
+
+                            // The search and tab pop-in, as on the library grid above.
+                            transform: Translate { id: wishlistEnterShift }
+                            function popIn() {
+                                const firstShown = Math.floor(wishlistGrid.contentY / wishlistGrid.cellHeight)
+                                                   * wishlistGrid.columns
+                                wishlistEnterPause.duration =
+                                    Math.max(0, Math.min(wishlistDelegate.index - firstShown, 12)) * 40
+                                wishlistEnterAnim.stop()
+                                wishlistDelegate.opacity = 0
+                                wishlistEnterShift.y = 18
+                                wishlistEnterAnim.start()
+                            }
+                            Component.onCompleted: {
+                                if (Date.now() - root.popStamp <= 250)
+                                    wishlistDelegate.popIn()
+                            }
+                            Connections {
+                                target: root
+                                function onPopStampChanged() {
+                                    if (root.activeTab === "Wishlist")
+                                        wishlistDelegate.popIn()
+                                }
+                            }
+                            SequentialAnimation {
+                                id: wishlistEnterAnim
+                                PauseAnimation { id: wishlistEnterPause }
+                                ParallelAnimation {
+                                    NumberAnimation {
+                                        target: wishlistDelegate; property: "opacity"
+                                        to: 1.0; duration: 380; easing.type: Easing.OutCubic
+                                    }
+                                    NumberAnimation {
+                                        target: wishlistEnterShift; property: "y"
+                                        to: 0; duration: 380; easing.type: Easing.OutCubic
+                                    }
+                                }
+                            }
+
+                            CoverGlow {
+                                target: wishlistCard
+                                stage: glowStage
+                                source: wishlistCover
+                                lit: wishlistDelegate.highlighted
+                            }
+
+                            Column {
+                                anchors.centerIn: parent
+                                spacing: 12
+
+                                Rectangle {
+                                    id: wishlistCard
+                                    width: 240
+                                    height: 360
+                                    radius: 8
+                                    color: Theme.bgSurface
+                                    border.width: 2
+                                    border.color: Theme.borderMuted
+                                    clip: true
+                                    // See RoundedCorners.qml.
+                                    layer.enabled: true
+                                    layer.smooth: true
+                                    layer.effect: RoundedCorners { radius: wishlistCard.radius }
+
+                                    Image {
+                                        id: wishlistCover
+                                        anchors.fill: parent
+                                        source: wishlistDelegate.modelData.coverPath || ""
+                                        fillMode: Image.PreserveAspectCrop
+                                        // Same as the recommendation cards.
+                                        sourceSize: root.api
+                                            ? root.api.decodeSize(wishlistCover.source.toString(),
+                                                                  wishlistCard.width, wishlistCard.height,
+                                                                  true, Screen.devicePixelRatio)
+                                            : Qt.size(-1, -1)
+                                        opacity: status === Image.Ready ? 1.0 : 0.0
+                                        Behavior on opacity { NumberAnimation { duration: 250 } }
+                                    }
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        visible: wishlistCover.status !== Image.Ready
+                                        text: "NOT IN LIBRARY"
+                                        color: Theme.textFaint
+                                        font.pixelSize: 12
+                                    }
+
+                                    scale: wishlistDelegate.highlighted ? 1.04 : 1.0
+                                    Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutQuart } }
+                                }
+
+                                Column {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    spacing: 4
+
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        width: 220
+                                        text: wishlistDelegate.modelData.name
+                                        color: wishlistDelegate.highlighted ? Theme.textPrimary : Theme.textBody
+                                        font.pixelSize: 15
+                                        font.weight: Font.DemiBold
+                                        horizontalAlignment: Text.AlignHCenter
+                                        elide: Text.ElideRight
+                                    }
+
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        width: 220
+                                        text: wishlistDelegate.modelData.developer || ""
+                                        color: Theme.textFaint
+                                        font.pixelSize: 11
+                                        horizontalAlignment: Text.AlignHCenter
+                                        elide: Text.ElideRight
+                                    }
+                                }
+                            }
+
+                            MouseArea {
+                                id: wishlistArea
+                                anchors.fill: parent
+                                anchors.margins: 8
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    if (root.padActive)
+                                        wishlistGrid.currentIndex = wishlistDelegate.index
+                                    launcherStage.aimAt(wishlistDelegate)
+                                    browseDetails.openForGame(wishlistDelegate.modelData.name, "Wishlist")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Browse ──────────────────────────────────────────────────────
+                // The whole IGDB catalog rather than the user's own lists. See
+                // BrowsePage.qml; results open BrowseDetails, not GameDetails.
+                BrowsePage {
+                    id: browsePage
+                    igdbConfigured: root.igdbConfigured
+                    padActive: root.padActive
+                    padInControl: root.padInControl
+                    glowStage: glowStage
+                    onOpenRequested: (item, card) => {
+                        launcherStage.aimAt(card)
+                        browseDetails.openFor(item)
+                    }
+                    onSettingsRequested: settingsWindow.open()
+                }
             }
         }
     }

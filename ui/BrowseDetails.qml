@@ -62,9 +62,43 @@ Popup {
     readonly property bool isOwned: browseRoot.fromRecommendation
         ? (!!browseRoot.gameRow && browseRoot.gameRow.matched !== false)
         : browseRoot.owned
+    // Owned on Steam but not installed (the Library's NOT INSTALLED toggle):
+    // not playable, not something to wishlist, but one click from installing.
+    readonly property bool notInstalled:
+        browseRoot.fromRecommendation && !!browseRoot.gameRow
+        && browseRoot.gameRow.notInstalled === true
     readonly property bool isLocalGame:
         browseRoot.fromRecommendation && !!browseRoot.gameRow
         && browseRoot.gameRow.source === "Local"
+
+    // INSTALL asks main.qml for the drive picker, which lives there because
+    // the library cards open it too.
+    signal installRequested(int appid, string name, string cover)
+
+    // The download, once one is under way: see VortexBridge::steamInstalls.
+    readonly property var installStatus:
+        browseRoot.api && browseRoot.steamAppId > 0
+            ? (browseRoot.api.steamInstalls[String(browseRoot.steamAppId)] || null) : null
+    // Still downloading, so the close button beside INSTALLING can stop it.
+    readonly property bool canCancel:
+        !!browseRoot.installStatus && browseRoot.installStatus.state !== "done"
+
+    function cancelInstall() {
+        if (browseRoot.canCancel)
+            browseRoot.api.cancelSteamInstall(browseRoot.steamAppId)
+    }
+
+    readonly property bool isPaused:
+        !!browseRoot.installStatus && browseRoot.installStatus.state === "paused"
+
+    function togglePause() {
+        if (!browseRoot.canCancel)
+            return
+        if (browseRoot.isPaused)
+            browseRoot.api.resumeSteamInstall(browseRoot.steamAppId)
+        else
+            browseRoot.api.pauseSteamInstall(browseRoot.steamAppId)
+    }
 
     // Hearts and the played ledger are keyed on the library's spelling when
     // the game is owned; IGDB's own name otherwise.
@@ -106,6 +140,7 @@ Popup {
         function onPlayedGamesChanged() { browseRoot.playedRevision++; browseRoot.refreshGameRow() }
         function onGameListChanged()    { browseRoot.refreshGameRow() }
         function onRecommendationListChanged() { browseRoot.refreshGameRow() }
+        function onOwnedSteamGamesChanged() { browseRoot.refreshGameRow() }
     }
 
     function findIn(list) {
@@ -120,7 +155,13 @@ Popup {
     // then every list an unowned pick can be found in.
     function findGameRow() {
         if (!browseRoot.api || browseRoot.gameName === "") return null
+        // Owned rows first, installed then not. A game installed once and
+        // since removed (or whose install was cancelled) is still in the
+        // played, favourite or recommendation lists, and those rows carry no
+        // notInstalled flag -- found there first, the page took it for an
+        // unowned pick and offered CHECK ON STEAM instead of INSTALL.
         return browseRoot.findIn(browseRoot.api.gameList)
+            || browseRoot.findIn(browseRoot.api.ownedSteamGames)
             || browseRoot.findIn(browseRoot.api.recommendationList)
             || browseRoot.findIn(browseRoot.api.wishlistGames)
             || browseRoot.findIn(browseRoot.api.favoriteGames)
@@ -143,6 +184,8 @@ Popup {
     readonly property var actions: !browseRoot.fromRecommendation
         ? ["played", "favorite", "wishlist"]
         : browseRoot.isOwned ? ["play", "played", "favorite", "uninstall"]
+        : browseRoot.notInstalled ? (browseRoot.canCancel ? ["install", "pause", "cancel", "played", "favorite"]
+                                                          : ["install", "played", "favorite"])
                              : ["steam", "played", "favorite", "wishlist"]
     property int focusedAction: -1
     readonly property string focusedKey:
@@ -247,6 +290,11 @@ Popup {
     }
     function openSteam() {
         Qt.openUrlExternally(browseRoot.steamUrl)
+    }
+    function install() {
+        if (browseRoot.notInstalled && browseRoot.steamAppId > 0 && !browseRoot.installStatus)
+            browseRoot.installRequested(browseRoot.steamAppId, browseRoot.gameName,
+                                        browseRoot.gameRow ? (browseRoot.gameRow.coverPath || "") : "")
     }
     function togglePlayed() {
         if (browseRoot.actionName === "" || browseRoot.playedState === "tracked") return
@@ -354,6 +402,9 @@ Popup {
         switch (browseRoot.focusedKey) {
         case "play":      browseRoot.play(); break
         case "steam":     browseRoot.openSteam(); break
+        case "install":   browseRoot.install(); break
+        case "pause":     browseRoot.togglePause(); break
+        case "cancel":    browseRoot.cancelInstall(); break
         case "played":    browseRoot.togglePlayed(); break
         case "favorite":  browseRoot.toggleFavorite(); break
         case "wishlist":  browseRoot.toggleWishlist(); break
@@ -455,6 +506,8 @@ Popup {
     width: parent.width * 0.9; height: parent.height * 0.9
     x: (parent.width - width) / 2; y: (parent.height - height) / 2
     modal: true; focus: true
+    // Shaded by the launcher instead; see GameDetails.qml.
+    dim: false
     padding: 0
     closePolicy: Popup.CloseOnPressOutside
 
@@ -463,6 +516,28 @@ Popup {
         radius: 20
         border.color: Theme.borderQuiet
         border.width: 1
+    }
+
+    // The same entrance as GameDetails.qml, which explains it.
+    property int enterDelay: 0
+
+    enter: Transition {
+        SequentialAnimation {
+            PropertyAction { property: "opacity"; value: 0.0 }
+            PropertyAction { property: "scale"; value: 1.06 }
+            PauseAnimation { duration: browseRoot.enterDelay }
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; to: 1.0; duration: 260; easing.type: Easing.OutCubic }
+                NumberAnimation { property: "scale"; to: 1.0; duration: 420; easing.type: Easing.OutQuint }
+            }
+        }
+    }
+
+    exit: Transition {
+        ParallelAnimation {
+            NumberAnimation { property: "opacity"; to: 0.0; duration: 180; easing.type: Easing.InCubic }
+            NumberAnimation { property: "scale"; to: 0.97; duration: 180; easing.type: Easing.InCubic }
+        }
     }
 
     // ── Reusable bits ───────────────────────────────────────────────────────
@@ -505,6 +580,10 @@ Popup {
         property color glyphColor: action.labelColor
         property string iconSource: ""
         property int iconSize: 22
+        // Runs the game card's download sweep across the button.
+        property bool sweeping: false
+        // Keeps the focus ring drawn, focused or not.
+        property bool outlined: false
         signal triggered()
 
         readonly property bool hovered: actionArea.containsMouse
@@ -517,12 +596,30 @@ Popup {
         opacity: action.available ? 1.0 : 0.55
         color: action.active ? action.activeColor
                              : (action.emphasized ? action.hoverColor : action.restColor)
-        border.width: action.emphasized || (action.focused && browseRoot.padInControl) ? 3 : 0
+        border.width: action.emphasized || action.outlined
+                      || (action.focused && browseRoot.padInControl) ? 3 : 0
         border.color: action.ringColor
         scale: action.emphasized ? 1.06 : 1.0
 
         Behavior on color { ColorAnimation { duration: 150 } }
         Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
+
+        // Inside the focus ring and under the label, so neither is crossed
+        // out by the line, and masked to the button's rounded corners, which
+        // a clip alone would leave square. The mask is a layer, so it is only
+        // switched on while the sweep runs.
+        LightSweep {
+            anchors.fill: parent
+            anchors.margins: action.border.width
+            visible: action.sweeping
+            running: action.sweeping
+            // Narrower than the card's 16px, which is heavy on a 50px-tall
+            // button, but mostly white core, with a 3px blue fringe behind it.
+            lineWidth: 10
+            coreWidth: 7
+            layer.enabled: action.sweeping
+            layer.effect: RoundedCorners { radius: Math.max(0, action.radius - action.border.width) }
+        }
 
         Row {
             id: actionRow
@@ -604,20 +701,46 @@ Popup {
                 // bannerUrl and logoUrl -- SteamGridDB, else Steam's CDN for a
                 // Steam game -- and IGDB's own banner only once that lookup
                 // has finished without one; the cover holds the page meanwhile.
+                //
+                // A not-installed Steam game is the exception. Its row's art is
+                // Steam's CDN, so it takes the bridge's lookup like a Browse
+                // result -- SteamGridDB, then Steam -- with its row's own Steam
+                // art only where SteamGridDB answered with none. Until it has
+                // answered the hero is left empty, cover and all, so Steam's
+                // art is never shown only to be replaced. Art under Images/
+                // from an earlier install is SteamGridDB's already and stays
+                // first.
                 FrostedHero {
                     id: heroBanner
                     readonly property var row: browseRoot.fromRecommendation ? browseRoot.gameRow : null
+                    readonly property bool lookupFirst: browseRoot.notInstalled
+                    readonly property bool lookupWaiting:
+                        heroBanner.lookupFirst && browseRoot.details.artPending === true
+
+                    function rowArt(path) {
+                        if (!path) return ""
+                        if (!heroBanner.lookupFirst || String(path).startsWith("file:")) return path
+                        return ""
+                    }
+                    function steamArt(path) {
+                        return (heroBanner.lookupFirst && !heroBanner.lookupWaiting && path) ? path : ""
+                    }
 
                     width: parent.width
                     height: Math.max(460, Math.round(body.height * 0.6))
-                    heroSource: (heroBanner.row && heroBanner.row.heroPath)
+                    heroSource: heroBanner.rowArt(heroBanner.row && heroBanner.row.heroPath)
                                 || browseRoot.details.bannerUrl
+                                || heroBanner.steamArt(heroBanner.row && heroBanner.row.heroPath)
                                 || (browseRoot.details.artPending ? "" : browseRoot.details.heroUrl)
-                                || browseRoot.details.coverUrl || ""
-                    logoSource: (heroBanner.row && heroBanner.row.logoPath)
-                                || browseRoot.details.logoUrl || ""
-                    coverSource: (heroBanner.row && heroBanner.row.coverPath)
-                                 || browseRoot.details.coverUrl || ""
+                                || (heroBanner.lookupWaiting ? "" : browseRoot.details.coverUrl)
+                                || ""
+                    logoSource: heroBanner.rowArt(heroBanner.row && heroBanner.row.logoPath)
+                                || browseRoot.details.logoUrl
+                                || heroBanner.steamArt(heroBanner.row && heroBanner.row.logoPath)
+                                || ""
+                    coverSource: heroBanner.lookupWaiting ? ""
+                                 : (heroBanner.row && heroBanner.row.coverPath)
+                                   || browseRoot.details.coverUrl || ""
 
                     Text {
                         id: titleText
@@ -663,6 +786,124 @@ Popup {
                                 labelColor: browseRoot.gameLaunching || quitHot ? Theme.textPrimary : Theme.textInverse
                                 focused: browseRoot.focusedKey === "play"
                                 onTriggered: browseRoot.play()
+                            }
+
+                            // Owned, not installed: the launcher's drive
+                            // picker, then the download's progress in place.
+                            ActionButton {
+                                visible: browseRoot.actions.indexOf("install") >= 0
+                                iconSource: "assets/steam.png"
+                                label: {
+                                    const s = browseRoot.installStatus
+                                    if (!s) return "INSTALL"
+                                    if (s.state === "done") return "INSTALLED"
+                                    if (s.state === "paused") return "PAUSED " + s.percent + "%"
+                                    if (s.state === "downloading") return "INSTALLING " + s.percent + "%"
+                                    return "STARTING…"
+                                }
+                                restColor: Theme.steamBg
+                                hoverColor: Theme.steamBgPressed
+                                ringColor: Theme.steamAccent
+                                // The same sweep as the game's card while it
+                                // downloads; still while paused.
+                                sweeping: browseRoot.canCancel && !browseRoot.isPaused
+                                          && !(browseRoot.api && browseRoot.api.reduceMotion)
+                                // Ringed for as long as the download is under
+                                // way, paused included, not just under focus.
+                                outlined: browseRoot.canCancel
+                                focused: browseRoot.focusedKey === "install"
+                                onTriggered: browseRoot.install()
+                            }
+
+                            // Pauses the download, then resumes it: the close
+                            // button's twin, between the progress and the close
+                            // button. Two bars while it runs, the play triangle
+                            // while it is paused.
+                            Rectangle {
+                                id: pauseButton
+                                readonly property bool focused: browseRoot.focusedKey === "pause"
+                                readonly property bool emphasized:
+                                    (pauseArea.containsMouse && browseRoot.mouseInControl)
+                                    || (pauseButton.focused && browseRoot.padInControl)
+
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: browseRoot.notInstalled && browseRoot.canCancel
+                                width: 44; height: 44; radius: 10
+                                color: pauseButton.emphasized ? "#B32A2A2A" : "#80000000"
+                                border.width: pauseButton.emphasized ? 2 : 1
+                                border.color: pauseButton.emphasized ? Theme.focusRing : Theme.borderControl
+                                scale: pauseButton.emphasized ? 1.1 : 1.0
+
+                                Behavior on color { ColorAnimation { duration: 150 } }
+                                Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
+
+                                // Pause: two white bars in close.png's 20x20 box.
+                                Row {
+                                    anchors.centerIn: parent
+                                    spacing: 6
+                                    visible: !browseRoot.isPaused
+                                    Rectangle { width: 6; height: 18; radius: 1.5; color: "white" }
+                                    Rectangle { width: 6; height: 18; radius: 1.5; color: "white" }
+                                }
+                                // Play: the white triangle, nudged right so its
+                                // weight sits in the middle.
+                                Image {
+                                    anchors.centerIn: parent
+                                    anchors.horizontalCenterOffset: 1
+                                    visible: browseRoot.isPaused
+                                    width: 20; height: 20
+                                    source: "assets/play_hover.png"
+                                    sourceSize.width: 40
+                                    sourceSize.height: 40
+                                    fillMode: Image.PreserveAspectFit
+                                    smooth: true
+                                }
+                                MouseArea {
+                                    id: pauseArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: browseRoot.togglePause()
+                                }
+                            }
+
+                            // Cancels the download: the same close button as
+                            // GameDetails' own, right beside its progress.
+                            Rectangle {
+                                id: cancelButton
+                                readonly property bool focused: browseRoot.focusedKey === "cancel"
+                                readonly property bool emphasized:
+                                    (cancelArea.containsMouse && browseRoot.mouseInControl)
+                                    || (cancelButton.focused && browseRoot.padInControl)
+
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: browseRoot.notInstalled && browseRoot.canCancel
+                                width: 44; height: 44; radius: 10
+                                color: cancelButton.emphasized ? "#B32A2A2A" : "#80000000"
+                                border.width: cancelButton.emphasized ? 2 : 1
+                                border.color: cancelButton.emphasized ? Theme.focusRing : Theme.borderControl
+                                scale: cancelButton.emphasized ? 1.1 : 1.0
+
+                                Behavior on color { ColorAnimation { duration: 150 } }
+                                Behavior on scale { NumberAnimation { duration: 150; easing.type: Easing.OutQuart } }
+
+                                // White X, decoded at twice the drawn size.
+                                Image {
+                                    anchors.centerIn: parent
+                                    width: 20; height: 20
+                                    source: "assets/close.png"
+                                    sourceSize.width: 40
+                                    sourceSize.height: 40
+                                    fillMode: Image.PreserveAspectFit
+                                    smooth: true
+                                }
+                                MouseArea {
+                                    id: cancelArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: browseRoot.cancelInstall()
+                                }
                             }
 
                             ActionButton {

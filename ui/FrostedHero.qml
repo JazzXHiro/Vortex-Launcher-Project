@@ -185,21 +185,29 @@ Rectangle {
         onFinished: hero.finishCrossfade()
     }
 
-    // Where the band starts. The blur begins just above the title (blurLead)
-    // and builds up over blurFade, so it is fully frosted a little way into
-    // the band and has no edge of its own.
+    // Where the band starts. The blur begins at the top of the title and
+    // builds up all the way to the banner's foot, so it is only fully frosted
+    // under the actions and has no edge of its own. Started any higher, it
+    // smeared the art well above the band, which looked off on banners with
+    // detail low in the frame.
     readonly property real bandTop: hero.height - band.height
-    readonly property int blurLead: 40
-    readonly property int blurFade: 100
-    readonly property real fadeTop: hero.bandTop - hero.blurLead
-    readonly property real fadeEnd: hero.fadeTop + hero.blurFade
+    readonly property real fadeTop: hero.bandTop
+    readonly property real fadeEnd: hero.height
+    readonly property real blurFade: Math.max(1, hero.fadeEnd - hero.fadeTop)
+
+    // The scrim that darkens the band for its text keeps to its own, higher
+    // span: the title still needs it even where the art above is left sharp.
+    readonly property real shadeTop: hero.bandTop - 40
+    readonly property real shadeEnd: hero.shadeTop + 100
 
     // How many strengths of blur the fade is built from. Each is a little
     // stronger than the last and starts a little lower, so the art goes soft
     // gradually instead of crossfading from sharp straight to fully frosted,
-    // which reads as a seam.
-    readonly property int blurSteps: 5
-    readonly property real blurStep: hero.blurFade / (hero.blurSteps + 1)
+    // which reads as a seam. Each ramps in over blurOverlap steps, so several
+    // strengths are always blending at any height.
+    readonly property int blurSteps: 7
+    readonly property int blurOverlap: 3
+    readonly property real blurStep: hero.blurFade / (hero.blurSteps + hero.blurOverlap - 1)
 
     // A y inside the banner as a gradient position.
     function frac(y) {
@@ -288,7 +296,7 @@ Rectangle {
     }
 
     // The progressive frost: one layer per blur strength, weakest first. Each
-    // fades in over two steps starting one step below the last, so
+    // fades in over blurOverlap steps starting one step below the last, so
     // neighbouring strengths overlap and blend, and all of them are solid by
     // fadeEnd.
     Repeater {
@@ -297,19 +305,27 @@ Rectangle {
             id: frostLayer
             required property int index
             readonly property real rampStart: hero.fadeTop + frostLayer.index * hero.blurStep
-            readonly property real rampEnd: Math.min(hero.fadeEnd, frostLayer.rampStart + 2 * hero.blurStep)
+            readonly property real rampEnd: Math.min(hero.fadeEnd, frostLayer.rampStart + hero.blurOverlap * hero.blurStep)
+            function at(t) {
+                return hero.frac(frostLayer.rampStart + t * (frostLayer.rampEnd - frostLayer.rampStart))
+            }
 
             anchors.fill: parent
 
-            // Clear above this layer's ramp, solid below it.
+            // Clear above this layer's ramp, solid below it. Smoothstepped
+            // rather than linear, so each layer eases in and out of its ramp
+            // and no strength starts or tops out on a visible line.
             Rectangle {
                 id: frostMask
                 anchors.fill: parent
                 visible: false
                 layer.enabled: true
                 gradient: Gradient {
-                    GradientStop { position: hero.frac(frostLayer.rampStart); color: "transparent" }
-                    GradientStop { position: hero.frac(frostLayer.rampEnd); color: "white" }
+                    GradientStop { position: frostLayer.at(0.0);  color: "transparent" }
+                    GradientStop { position: frostLayer.at(0.25); color: Qt.rgba(1, 1, 1, 0.156) }
+                    GradientStop { position: frostLayer.at(0.5);  color: Qt.rgba(1, 1, 1, 0.5) }
+                    GradientStop { position: frostLayer.at(0.75); color: Qt.rgba(1, 1, 1, 0.844) }
+                    GradientStop { position: frostLayer.at(1.0);  color: "white" }
                 }
             }
 
@@ -358,17 +374,21 @@ Rectangle {
     }
 
     // Darkens the band for the text on it and melts its foot into the panel,
-    // so the page below continues with no seam. Eased in over the same
-    // distance as the blur, gently at first.
+    // so the page below continues with no seam. Eased in gently from a little
+    // above the title, so it has no starting line either.
     Rectangle {
         anchors.fill: parent
         gradient: Gradient {
-            GradientStop { position: hero.frac(hero.fadeTop); color: "transparent" }
+            GradientStop { position: hero.frac(hero.shadeTop); color: "transparent" }
             GradientStop {
-                position: hero.frac(hero.fadeTop + hero.blurFade * 0.5)
-                color: Qt.alpha(Theme.bgPanel, 0.15)
+                position: hero.frac(hero.shadeTop + (hero.shadeEnd - hero.shadeTop) * 0.35)
+                color: Qt.alpha(Theme.bgPanel, 0.06)
             }
-            GradientStop { position: hero.frac(hero.fadeEnd); color: Qt.alpha(Theme.bgPanel, 0.55) }
+            GradientStop {
+                position: hero.frac(hero.shadeTop + (hero.shadeEnd - hero.shadeTop) * 0.7)
+                color: Qt.alpha(Theme.bgPanel, 0.25)
+            }
+            GradientStop { position: hero.frac(hero.shadeEnd); color: Qt.alpha(Theme.bgPanel, 0.5) }
             GradientStop { position: 1.0; color: Theme.bgPanel }
         }
     }

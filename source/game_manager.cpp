@@ -1194,28 +1194,43 @@ bool is_riot_client_stem(const std::wstring &stem) {
 //
 // isClient, when set, names the store's own lobby processes in installDir;
 // they are never game time, but hold the session open between runs.
-LocalSession watch_store_session(const fs::path &installDir,
-                                 const std::string &store,
-                                 bool (*isClient)(const std::wstring &),
-                                 const std::function<void()> &onStarted) {
+//
+// isStoreApp, when set, recognises the store app itself wherever it runs (the
+// Riot Client lives outside every game's folder). Until the game first comes
+// up, the startup window does not run out while it is open: it may be
+// patching, signing in or waiting on Vanguard -- VALORANT once took 2m 25s.
+LocalSession watch_store_session(
+    const fs::path &installDir, const std::string &store,
+    bool (*isClient)(const std::wstring &),
+    const std::function<bool(const DirProcess &)> &isStoreApp,
+    const std::function<void()> &onStarted) {
   LocalSession session;
   session.started = true;
 
   // The store signs in and syncs before it starts anything -- 13s warm and
   // over 40s cold for Apex in the EA app, far past run_local_session's grace
-  // -- so the wait for the game is as long as monitor_steam_session's.
-  const int kStartupTimeoutSeconds = 120;
+  // -- so the wait for the game is as long as monitor_steam_session's. It
+  // only applies once the store app has gone; see isStoreApp.
+  const int kStartupTimeoutSeconds = 180;
   // A game that closes and comes straight back, say to apply a setting, is
-  // still the same session.
+  // still the same session. The same grace covers a store app restarting
+  // itself after an update.
   const int kRestartGraceSeconds = 10;
 
   GameDirs gameDirs;
   GameDirs *const knownGameDirs =
       find_game_dir(installDir, gameDirs).empty() ? nullptr : &gameDirs;
-  const auto poll = [&](bool &clientUp) -> std::string {
+  const std::wstring installPrefix = dir_prefix(installDir);
+  const auto poll = [&](bool &clientUp, bool &storeUp) -> std::string {
     clientUp = false;
+    storeUp = false;
     std::string game;
-    for (const DirProcess &p : procs_in_dir(installDir)) {
+    for (const DirProcess &p : all_procs()) {
+      if (!under(p, installPrefix)) {
+        if (isStoreApp && isStoreApp(p))
+          storeUp = true;
+        continue;
+      }
       if (isClient && isClient(fs::path(p.lower).stem().wstring())) {
         clientUp = true;
         continue;
@@ -1229,6 +1244,8 @@ LocalSession watch_store_session(const fs::path &installDir,
 
   const std::time_t launchedAt = std::time(nullptr);
   std::time_t lastSeen = 0;
+  std::time_t launcherLastSeen = launchedAt;
+  bool waitNoted = false;
   bool notified = false;
   bool inGame = false;
   std::time_t segStart = 0;
@@ -1238,9 +1255,12 @@ LocalSession watch_store_session(const fs::path &installDir,
   for (;;) {
     const std::time_t now = std::time(nullptr);
     bool clientUp = false;
-    const std::string game = poll(clientUp);
+    bool storeUp = false;
+    const std::string game = poll(clientUp, storeUp);
     if (!game.empty() || clientUp)
       lastSeen = now;
+    if (clientUp || storeUp)
+      launcherLastSeen = now;
     if (!game.empty()) {
       if (!inGame) {
         inGame = true;
@@ -1275,10 +1295,22 @@ LocalSession watch_store_session(const fs::path &installDir,
     if (!inGame) {
       if (session.segments.empty()) {
         if (now - launchedAt >= kStartupTimeoutSeconds) {
-          vlog::line("Play", "the " + store + " did not start the game within " +
-                                 std::to_string(kStartupTimeoutSeconds) +
-                                 "s -- nothing recorded");
-          break;
+          if (now - launcherLastSeen < kRestartGraceSeconds) {
+            if (!waitNoted)
+              vlog::line("Play", "the " + store + " is still open after " +
+                                     std::to_string(kStartupTimeoutSeconds) +
+                                     "s -- still waiting for the game");
+            waitNoted = true;
+          } else {
+            vlog::line("Play", "the " + store + " did not start the game " +
+                                   (waitNoted ? std::string("before it closed")
+                                              : "within " +
+                                                    std::to_string(
+                                                        kStartupTimeoutSeconds) +
+                                                    "s") +
+                                   " -- nothing recorded");
+            break;
+          }
         }
       } else if (now - lastSeen >= kRestartGraceSeconds) {
         break;
@@ -1301,7 +1333,12 @@ LocalSession run_ea_session(const std::string &contentId,
                          contentId + ")");
   if (!launch_ea_game(contentId))
     return session;
-  session = watch_store_session(installDir, "EA app", nullptr, onStarted);
+  session = watch_store_session(
+      installDir, "EA app", nullptr,
+      [](const DirProcess &p) {
+        return fs::path(p.lower).filename() == L"eadesktop.exe";
+      },
+      onStarted);
 #else
   std::cout << "[MOCK] Linux: Skipping EA launch for " << contentId << "\n";
   (void)installDir;
@@ -1319,8 +1356,13 @@ LocalSession run_riot_session(const RiotGame &game,
                          " --launch-patchline=" + game.patchline + ")");
   if (!launch_riot_game(game))
     return session;
-  session = watch_store_session(game.installDir, "Riot Client",
-                                is_riot_client_stem, onStarted);
+  // Everything the Riot Client runs -- RiotClientServices.exe, its UX -- lives
+  // in the folder clientExe is in.
+  const std::wstring clientPrefix = dir_prefix(game.clientExe.parent_path());
+  session = watch_store_session(
+      game.installDir, "Riot Client", is_riot_client_stem,
+      [&clientPrefix](const DirProcess &p) { return under(p, clientPrefix); },
+      onStarted);
 #else
   std::cout << "[MOCK] Linux: Skipping Riot launch for " << game.product << "\n";
   (void)onStarted;

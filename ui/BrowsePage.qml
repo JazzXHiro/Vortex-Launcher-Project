@@ -23,7 +23,8 @@ Item {
     // tab's grid: the new-releases rail, or the search results grid.
     readonly property Item grid: page.showingNew ? newRail : browseGrid
 
-    signal openRequested(var item)
+    // card is the delegate clicked, so the details page can open from it.
+    signal openRequested(var item, Item card)
     signal settingsRequested()
 
     function focusSearch() {
@@ -33,8 +34,8 @@ Item {
     readonly property string query: searchBox.text.trim()
     readonly property var results: page.api && page.api.browseResults ? page.api.browseResults : []
     readonly property bool searching: !!page.api && page.api.browseSearching
-    // Below the search threshold the rail of new releases replaces the grid.
-    readonly property bool showingNew: page.query.length < 2
+    // With the box empty the rail of new releases replaces the grid.
+    readonly property bool showingNew: page.query.length === 0
     readonly property var newReleases:
         page.api && page.api.browseNewReleases ? page.api.browseNewReleases : []
     readonly property bool newLoading: !!page.api && page.api.browseNewReleasesLoading
@@ -79,15 +80,14 @@ Item {
     // there is no reason to send them in the first place.
     Timer {
         id: debounce
-        interval: 400
+        interval: 250
         onTriggered: page.runSearch()
     }
 
     function runSearch() {
         debounce.stop()
         if (!page.api) return
-        // One letter matches half the catalog and tells IGDB nothing.
-        if (page.query.length < 2)
+        if (page.query.length === 0)
             page.api.clearBrowse()
         else
             page.api.searchCatalog(page.query)
@@ -507,7 +507,7 @@ Item {
                 onClicked: {
                     if (page.padActive)
                         resultDelegate.view.currentIndex = resultDelegate.index
-                    page.openRequested(resultDelegate.modelData)
+                    page.openRequested(resultDelegate.modelData, resultDelegate)
                 }
             }
         }

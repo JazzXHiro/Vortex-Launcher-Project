@@ -139,6 +139,9 @@ Images/
 /name_overrides.txt
 /launcher_exes.txt
 /launcher_imports.txt
+/playtime_edits.txt
+/steam_owned_cache.json
+/owned_steam_art.json
 
 # =========================
 # User-specific CMake configuration

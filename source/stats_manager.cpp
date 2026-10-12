@@ -432,6 +432,68 @@ static bool rekey_lines(const fs::path& path, const std::string& old_prefix,
     return true;
 }
 
+static fs::path get_playtime_edits_path() {
+    return g_base_dir.empty() ? fs::path("playtime_edits.txt")
+                              : (g_base_dir / "playtime_edits.txt");
+}
+
+long long set_manual_playtime(const std::string& game_key, const std::string& game_name,
+                              long long target_active_seconds) {
+    if (game_key.empty()) return 0;
+    target_active_seconds = std::max(0LL, target_active_seconds);
+
+    auto stats = load_stats();
+    // Zero on a game with no row is already true; a row of zeros would only
+    // make it look played.
+    if (target_active_seconds == 0 && stats.find(game_key) == stats.end())
+        return 0;
+    StatEntry &entry = stats[game_key];
+
+    // What Vortex watched, and the part of it that was actually played. The
+    // baseline is everything else, so it is the only figure an edit may set.
+    const long long watched        = std::max(0LL, entry.time - entry.baseline);
+    const long long watched_active = std::max(0LL, watched - entry.idle);
+
+    entry.baseline = std::max(0LL, target_active_seconds - watched_active);
+    entry.time     = watched + entry.baseline;
+    if (!game_name.empty())
+        entry.name = game_name;
+    save_stats(stats);
+
+    // One stamp per key: the latest edit replaces the one before it.
+    const fs::path path = get_playtime_edits_path();
+    const std::string prefix = game_key + "|";
+    rekey_lines(path, prefix, prefix, true);
+    const bool fresh = !fs::exists(path);
+    std::ofstream out(path, std::ios::app);
+    if (out.is_open()) {
+        if (fresh)
+            out << "# Vortex Playtime Edits\n"
+                   "# Format: GAME_KEY|EDITED_AT_EPOCH -- playtime last set by hand\n";
+        out << prefix << static_cast<long long>(std::time(nullptr)) << "\n";
+    }
+
+    return watched_active + entry.baseline;
+}
+
+std::time_t manual_edit_time(const std::string& game_key) {
+    std::ifstream file(get_playtime_edits_path());
+    const std::string prefix = game_key + "|";
+    std::time_t latest = 0;
+    std::string line;
+    // The latest stamp, not the first: a rekey onto a key that already had
+    // one leaves both lines.
+    while (std::getline(file, line)) {
+        if (line.compare(0, prefix.size(), prefix) != 0) continue;
+        try {
+            latest = std::max(latest, static_cast<std::time_t>(
+                                          std::stoll(line.substr(prefix.size()))));
+        } catch (...) {
+        }
+    }
+    return latest;
+}
+
 bool rekey_play_stats(const std::string& old_key, const std::string& new_key,
                       const std::string& new_name) {
     if (old_key.empty() || new_key.empty()) return false;
@@ -476,6 +538,10 @@ bool rekey_play_stats(const std::string& old_key, const std::string& new_key,
     // marked keeps its own line and the old one goes.
     if (rekey_lines(get_launcher_imports_path(), old_key + "|", new_key + "|",
                     launcher_history_imported(new_key)))
+        changed = true;
+
+    // The manual edit stamp follows the hours it dates.
+    if (rekey_lines(get_playtime_edits_path(), old_key + "|", new_key + "|"))
         changed = true;
 
     return changed;
